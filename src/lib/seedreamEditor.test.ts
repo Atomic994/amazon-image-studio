@@ -108,6 +108,14 @@ describe('Seedream editor params', () => {
 })
 
 describe('Seedream editor history recovery', () => {
+  it('does not let another source image running on the same engine block the current source', () => {
+    const a = editorTask({ id: 'a-running', status: 'running', inputImageIds: ['A'], imageEditContext: { engine: 'home', sourceImageId: 'A', referenceImageIds: [], userInstruction: 'edit A' } })
+    const b = editorTask({ id: 'b-done', createdAt: 0, inputImageIds: ['B'], imageEditContext: { engine: 'home', sourceImageId: 'B', referenceImageIds: [], userInstruction: 'edit B' } })
+    expect(findLatestImageEditorTask([a, b], 'home', null, 'B')?.id).toBe('b-done')
+    expect(findLatestImageEditorTask([a], 'home', 'a-running', 'B')).toBeNull()
+    expect(findLatestImageEditorTask([a, b], 'home', null, 'A')?.status).toBe('running')
+    expect(findLatestImageEditorTask([a], 'home', null, null)).toBeNull()
+  })
   it('keeps a preferred task when it belongs to the active engine', () => {
     const preferred = editorTask({ id: 'preferred', createdAt: 1 })
     const newer = editorTask({ id: 'newer', createdAt: 2 })

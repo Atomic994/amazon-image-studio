@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type MouseEvent as ReactMouseEvent } from 'react'
-import { addImageFromFile, createCompressedInputImageFromFile, ensureImageCached, submitTask, useStore } from '../store'
+import { addImageFromFile, createCompressedInputImageFromFile, ensureImageCached, resolveInputImagesForRequest, submitTask, useStore } from '../store'
 import { getAmazonPlannerProfile, getHomeApiProfile, isAliyunQwenImageProfile, isOfficialDeepSeekPlannerProfile, validateApiProfile } from '../lib/apiProfiles'
 import { getInputImageLimitForSettings } from '../lib/paramCompatibility'
 import {
@@ -68,6 +68,10 @@ import { DEFAULT_PARAMS } from '../types'
 import type { AmazonPlannerSession, AmazonUploadedStyleReference, CustomStyleReference, StyleReferenceEditState } from '../types'
 import StyleReferenceEditorModal from './StyleReferenceEditorModal'
 import StylePaletteLegend from './StylePaletteLegend'
+import PlannerRunLog from './PlannerRunLog'
+import { usePlannerRunLog } from '../hooks/usePlannerRunLog'
+import { formatPlannerLogForCopy } from '../lib/plannerRunLog'
+import { copyTextToClipboard } from '../lib/clipboard'
 import { ChevronLeftIcon, ChevronRightIcon, CloseIcon, CopyIcon, EditIcon, EyeIcon, HistoryIcon, PhotoIcon, PlusIcon, RefreshIcon, TrashIcon } from './icons'
 
 const FIELD_CLASS = 'ios-field w-full px-3 py-2 text-sm text-gray-800 placeholder:text-gray-400 dark:text-gray-100 dark:placeholder:text-gray-500'
@@ -399,7 +403,7 @@ function getAmazonListingPlannerChecks(
   ]
 }
 
-export default function AmazonPlanner() {
+export default function AmazonPlanner({ isActive = true }: { isActive?: boolean }) {
   const prompt = useStore((s) => s.prompt)
   const inputImages = useStore((s) => s.inputImages)
   const settings = useStore((s) => s.settings)
@@ -459,7 +463,7 @@ export default function AmazonPlanner() {
   const [currentPlannerSessionId, setCurrentPlannerSessionId] = useState<string | null>(null)
   const [showPlannerHistory, setShowPlannerHistory] = useState(false)
   const [isPlanning, setIsPlanning] = useState(false)
-  const [plannerProgress, setPlannerProgress] = useState('')
+  const plannerLog = usePlannerRunLog()
   const [plannerError, setPlannerError] = useState('')
   const [isPreparingReferencePayload, setIsPreparingReferencePayload] = useState(false)
   const [referencePayloadNotice, setReferencePayloadNotice] = useState('')
@@ -712,6 +716,7 @@ export default function AmazonPlanner() {
     : ''
 
   useEffect(() => {
+    if (!isActive) return
     if (!currentActionFilled) {
       lastAppliedStyleImageIdRef.current = null
       return
@@ -732,6 +737,7 @@ export default function AmazonPlanner() {
       },
     })
   }, [
+    isActive,
     activePrompt,
     aPlusType,
     currentActionFilled,
@@ -1467,11 +1473,21 @@ export default function AmazonPlanner() {
     const controller = new AbortController()
     plannerAbortControllerRef.current = controller
     setIsPlanning(true)
-    setPlannerProgress('正在准备产品参考图…')
+    plannerLog.start({
+      model: plannerProfile.model,
+      apiMode: plannerApiLabel,
+      totalPlans: plannerMode === 'aplus' ? aPlusSpecs.length : listingImageCount,
+      referenceCount: inputImages.length,
+      mode: plannerMode === 'aplus' ? 'A+' : 'Listing',
+      apiKey: plannerProfile.apiKey,
+    })
     setPlannerError('')
     try {
       const currentMarketplaceId = marketplaceId
-      const referencePayload = await prepareReferencePayloadForRequest(inputImages.map((image) => image.dataUrl), controller.signal)
+      const resolvedReferences = await resolveInputImagesForRequest(inputImages, controller.signal)
+      const referencePayload = await prepareReferencePayloadForRequest(resolvedReferences.map((image) => image.dataUrl), controller.signal)
+      if (controller.signal.aborted || plannerAbortControllerRef.current !== controller) return
+      plannerLog.add(`产品参考图已准备（${referencePayload.dataUrls.length} 张），开始请求策划`)
       const result = await callAmazonPlannerApi({
         listingText,
         baseDraft: draft,
@@ -1484,28 +1500,26 @@ export default function AmazonPlanner() {
         aPlusModuleSpecs: aPlusSpecs,
         aPlusGenerationTier: resolutionTier,
         signal: controller.signal,
-        onProgress: ({ phase, attempt, maxAttempts }) => {
+        onProgress: (progress) => {
           if (plannerAbortControllerRef.current !== controller || controller.signal.aborted) return
-          const messages = {
-            connecting: attempt === 1 ? '正在等待 AI 开始策划…' : `正在重新请求策划（${attempt}/${maxAttempts}）…`,
-            receiving: '正在接收 AI 策划内容…',
-            retrying: `接口暂时未完成响应，即将重试（${attempt}/${maxAttempts}）…`,
-            fallback: '接口不支持流式，正在切换兼容模式…',
-          }
-          setPlannerProgress(messages[phase])
+          plannerLog.progress(progress)
         },
       })
       if (controller.signal.aborted) return
       applyPlannerResult(result, plannerMode === 'aplus' ? 'A+ AI 策划' : 'AI 策划')
+      plannerLog.finish('success', `策划完成，已生成 ${result.mode === 'aplus' ? result.aPlusPlans.length : result.plans.length} 份完整方案`)
     } catch (err) {
-      if (controller.signal.aborted || isAbortError(err)) return
+      if (controller.signal.aborted || isAbortError(err)) {
+        if (plannerAbortControllerRef.current === controller) plannerLog.finish('stopped', '本次 AI 策划已取消')
+        return
+      }
       setPlannerError(getPlannerFailureDetail(err))
+      plannerLog.finish('error', `策划失败：${err instanceof Error ? err.message : String(err)}`)
       showToast('AI 策划失败，请查看详情', 'error')
     } finally {
       if (plannerAbortControllerRef.current === controller) {
         plannerAbortControllerRef.current = null
         setIsPlanning(false)
-        setPlannerProgress('')
       }
     }
   }
@@ -1516,7 +1530,7 @@ export default function AmazonPlanner() {
     controller.abort()
     plannerAbortControllerRef.current = null
     setIsPlanning(false)
-    setPlannerProgress('')
+    plannerLog.finish('stopped', '用户点击停止，本次 AI 策划已取消')
     showToast('AI 策划已停止', 'info')
   }
 
@@ -1813,6 +1827,9 @@ export default function AmazonPlanner() {
     setAPlusModuleSpecsByType(restoredAPlusModuleSpecsByType)
     setListingText(session.listingText)
     setInputImages(restoredReferences)
+    if (restoredReferences.length < session.referenceImageIds.length) {
+      showToast(`历史参考图只恢复了 ${restoredReferences.length}/${session.referenceImageIds.length} 张，缺失原图请重新上传`, 'info')
+    }
     setDraft(fromSessionDraft(session.draft))
     setSeriesStyleGuides(session.seriesStyleGuides)
     setSelectedStylePresetId(restoredStyleReference ? restoredStyleReference.presetId : nextStylePresetId)
@@ -2187,11 +2204,11 @@ export default function AmazonPlanner() {
             <div className="mt-3 rounded-[var(--ios-radius-md)] bg-[hsl(var(--ios-blue-tint))] px-3 py-2 text-xs leading-relaxed text-[hsl(var(--primary))]">
               AI策划使用设置中的策划配置，生图配置保持不变。
             </div>
-            {isPlanning && plannerProgress && (
-              <div role="status" aria-live="polite" className="mt-3 text-xs leading-relaxed text-[hsl(var(--primary))]">
-                {plannerProgress}
-              </div>
-            )}
+            <PlannerRunLog state={plannerLog.state} onCopy={() => {
+              void copyTextToClipboard(formatPlannerLogForCopy(plannerLog.state))
+                .then(() => showToast('策划日志已复制', 'success'))
+                .catch(() => showToast('复制日志失败，请手动选择日志内容', 'error'))
+            }} />
             {plannerUsesOfficialDeepSeek && (
               <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:border-amber-400/25 dark:bg-amber-400/10 dark:text-amber-100">
                 {DEEPSEEK_PLANNER_NOTICE}

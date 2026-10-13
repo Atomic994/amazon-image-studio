@@ -26,6 +26,8 @@ import {
 } from './listingPlanner'
 import { assertSuccessfulStreamEvent, isEventStreamResponse, looksLikeServerSentEvents, readJsonServerSentEvents, readJsonServerSentEventText, ServerSentEventError } from './serverSentEvents'
 import type { SizeTier } from './size'
+import { createPlannerPlanCounter, type PlannerApiProgress } from './plannerProgress'
+export type { PlannerApiProgress } from './plannerProgress'
 
 interface PlannerApiPayload {
   product?: {
@@ -60,12 +62,6 @@ export interface PlannerApiResult {
   plans: AmazonImagePlan[]
   aPlusPlans: AmazonAPlusPlan[]
   aPlusType?: APlusContentType
-}
-
-export interface PlannerApiProgress {
-  phase: 'connecting' | 'receiving' | 'retrying' | 'fallback'
-  attempt: number
-  maxAttempts: number
 }
 
 const MAX_PLANNER_ATTEMPTS = 3
@@ -344,24 +340,34 @@ function getPlannerTextFromEvent(event: Record<string, unknown>): string {
   return ''
 }
 
-function createPlannerStreamCollector(onReceiving?: () => void) {
+function createPlannerStreamCollector(
+  field: 'imagePlans' | 'aPlusPlans',
+  onReceiving?: (stats: { receivedChars: number; completedPlans: number }) => void,
+  onThinking?: () => void,
+) {
   let completedText = ''
   let outputItemText = ''
   let doneText = ''
   let deltaText = ''
   let completed = false
-  let receiving = false
+  const counter = createPlannerPlanCounter(field)
 
-  const notifyReceiving = () => {
-    if (receiving) return
-    receiving = true
-    onReceiving?.()
+  const appendDelta = (text: string) => {
+    if (!text) return
+    deltaText += text
+    onReceiving?.(counter.append(text))
+  }
+  const notifySnapshot = (text: string) => {
+    if (text) onReceiving?.(createPlannerPlanCounter(field).append(text))
   }
   const onEvent = (event: Record<string, unknown>): void | false => {
     const type = getStringValue(event, 'type')
     if (type === 'response.output_text.delta') {
-      deltaText += getStringValue(event, 'delta') ?? ''
-      if (deltaText) notifyReceiving()
+      appendDelta(getStringValue(event, 'delta') ?? '')
+      return
+    }
+    if (type?.startsWith('response.reasoning') || (type === 'response.output_item.added' && isRecordValue(event.item) && event.item.type === 'reasoning')) {
+      onThinking?.()
       return
     }
 
@@ -370,12 +376,12 @@ function createPlannerStreamCollector(onReceiving?: () => void) {
     if (Array.isArray(event.choices)) {
       const choice = event.choices.find((item) => isRecordValue(item) && item.index === 0) ?? event.choices[0]
       if (!isRecordValue(choice)) return
+      if (isRecordValue(choice.delta) && (choice.delta.reasoning_content || choice.delta.reasoning)) onThinking?.()
       if (isRecordValue(choice.delta) && typeof choice.delta.content === 'string') {
-        deltaText += choice.delta.content
-        if (deltaText) notifyReceiving()
+        appendDelta(choice.delta.content)
       } else if (isRecordValue(choice.message) && typeof choice.message.content === 'string') {
         completedText = choice.message.content
-        if (completedText) notifyReceiving()
+        notifySnapshot(completedText)
       }
       const finishReason = getStringValue(choice, 'finish_reason')
       if (finishReason && finishReason !== 'stop') {
@@ -389,7 +395,7 @@ function createPlannerStreamCollector(onReceiving?: () => void) {
     }
 
     const text = getPlannerTextFromEvent(event)
-    if (text) notifyReceiving()
+    if (type) notifySnapshot(text)
     if (type === 'response.completed') {
       completedText = text
       completed = true
@@ -397,7 +403,7 @@ function createPlannerStreamCollector(onReceiving?: () => void) {
     }
     else if (type === 'response.output_item.done') outputItemText = text
     else if (type === 'response.output_text.done' || type === 'response.content_part.done') doneText = text
-    else if (!type) deltaText += text
+    else if (!type) appendDelta(text)
   }
   return {
     onEvent,
@@ -421,10 +427,15 @@ function truncateForError(text: string): string {
   return `${trimmed.slice(0, 1200)}...`
 }
 
-async function readPlannerResponseText(response: Response, signal: AbortSignal, onReceiving?: () => void): Promise<string> {
+async function readPlannerResponseText(
+  response: Response,
+  signal: AbortSignal,
+  field: 'imagePlans' | 'aPlusPlans',
+  callbacks: { onReceiving: (stats: { receivedChars: number; completedPlans: number }) => void; onThinking: () => void; onActivity: () => void },
+): Promise<string> {
   if (isEventStreamResponse(response)) {
-    const collector = createPlannerStreamCollector(onReceiving)
-    await readJsonServerSentEvents(response, collector.onEvent, { signal, onDone: collector.onDone })
+    const collector = createPlannerStreamCollector(field, callbacks.onReceiving, callbacks.onThinking)
+    await readJsonServerSentEvents(response, collector.onEvent, { signal, onDone: collector.onDone, onActivity: callbacks.onActivity })
     return collector.getText()
   }
 
@@ -432,8 +443,8 @@ async function readPlannerResponseText(response: Response, signal: AbortSignal, 
   if (!rawText.trim()) throw new Error('AI 策划接口返回空内容')
 
   if (looksLikeServerSentEvents(rawText)) {
-    const collector = createPlannerStreamCollector(onReceiving)
-    await readJsonServerSentEventText(rawText, collector.onEvent, { signal, onDone: collector.onDone })
+    const collector = createPlannerStreamCollector(field, callbacks.onReceiving, callbacks.onThinking)
+    await readJsonServerSentEventText(rawText, collector.onEvent, { signal, onDone: collector.onDone, onActivity: callbacks.onActivity })
     return collector.getText()
   }
 
@@ -460,7 +471,7 @@ async function readPlannerResponseText(response: Response, signal: AbortSignal, 
   }
   const text = extractResponseText(payload)
   if (!text) throw new Error('AI 策划接口未返回文本内容')
-  onReceiving?.()
+  callbacks.onReceiving(createPlannerPlanCounter(field).append(text))
   return text
 }
 
@@ -908,10 +919,15 @@ export async function callAmazonPlannerApi(options: {
   // One budget covers connection, body reads, retries, and backoff together.
   const linked = createLinkedAbortController(timeoutSeconds, options.signal)
   const signal = linked.controller.signal
+  const totalPlans = mode === 'aplus' ? aPlusModuleSpecs.length : listingImageCount
+  const field = mode === 'aplus' ? 'aPlusPlans' : 'imagePlans'
   try {
     for (let attempt = 1; attempt <= MAX_PLANNER_ATTEMPTS; attempt++) {
       signal.throwIfAborted()
-      options.onProgress?.({ phase: 'connecting', attempt, maxAttempts: MAX_PLANNER_ATTEMPTS })
+      const emit = (progress: Omit<PlannerApiProgress, 'attempt' | 'maxAttempts' | 'totalPlans'>) => {
+        options.onProgress?.({ ...progress, attempt, maxAttempts: MAX_PLANNER_ATTEMPTS, totalPlans })
+      }
+      emit({ phase: 'connecting', receivedChars: 0, completedPlans: 0 })
       try {
         const response = await fetch(url, {
           method: 'POST',
@@ -925,10 +941,31 @@ export async function callAmazonPlannerApi(options: {
           body: JSON.stringify(body),
         })
         if (!response.ok) throw await readPlannerHttpError(response)
-        const text = await readPlannerResponseText(response, signal, () => {
-          options.onProgress?.({ phase: 'receiving', attempt, maxAttempts: MAX_PLANNER_ATTEMPTS })
+        emit({ phase: 'connected', httpStatus: response.status })
+        let lastEmissionAt = 0
+        let lastActivityAt = 0
+        let lastCompletedPlans = -1
+        let lastPhase = ''
+        const report = (phase: 'receiving' | 'thinking', stats?: { receivedChars: number; completedPlans: number }) => {
+          const now = Date.now()
+          if (phase === lastPhase && (!stats || stats.completedPlans === lastCompletedPlans) && now - lastEmissionAt < 1000) return
+          lastEmissionAt = now
+          lastPhase = phase
+          lastCompletedPlans = stats?.completedPlans ?? lastCompletedPlans
+          emit({ phase, ...stats })
+        }
+        const text = await readPlannerResponseText(response, signal, field, {
+          onReceiving: (stats) => report('receiving', stats),
+          onThinking: () => report('thinking'),
+          onActivity: () => {
+            const now = Date.now()
+            if (now - lastActivityAt < 1000) return
+            lastActivityAt = now
+            emit({ phase: 'activity' })
+          },
         })
         signal.throwIfAborted()
+        emit({ phase: 'validating', ...createPlannerPlanCounter(field).append(text) })
         const payload = parsePlannerPayload(text)
         return mode === 'aplus'
           ? normalizeAPlusPlannerApiPayload(payload, aPlusType, aPlusGenerationTier, aPlusModuleSpecs, marketplaceId)
@@ -942,13 +979,14 @@ export async function callAmazonPlannerApi(options: {
           const message = err instanceof Error ? err.message : String(err)
           throw new Error(`${message}\n\nAI 策划已尝试 ${attempt} 次，接口仍未成功返回完整结果。`)
         }
-        options.onProgress?.({ phase: streamUnsupported ? 'fallback' : 'retrying', attempt: attempt + 1, maxAttempts: MAX_PLANNER_ATTEMPTS })
+        const delayMs = err instanceof PlannerHttpError ? err.retryAfterMs : undefined
+        const retryDelayMs = streamUnsupported ? 0 : delayMs ?? 1000 * 2 ** (attempt - 1)
+        options.onProgress?.({ phase: streamUnsupported ? 'fallback' : 'retrying', attempt: attempt + 1, maxAttempts: MAX_PLANNER_ATTEMPTS, totalPlans, retryDelayMs, message: err instanceof Error ? err.message : String(err) })
         if (streamUnsupported) {
           // Fall back only for an explicit unsupported-stream error, never for a timeout.
           body.stream = false
         } else {
-          const delayMs = err instanceof PlannerHttpError ? err.retryAfterMs : undefined
-          await waitForPlannerRetry(delayMs ?? 1000 * 2 ** (attempt - 1), signal)
+          await waitForPlannerRetry(retryDelayMs, signal)
         }
       }
     }

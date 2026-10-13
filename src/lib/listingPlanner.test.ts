@@ -386,7 +386,9 @@ describe('planner streaming and transient failure recovery', () => {
     const [url, init] = (fetchMock.mock.calls as unknown as [string, RequestInit][])[0]!
     expect(url).toBe('https://relay.example.com:81/v1/chat/completions')
     expect(JSON.parse(String(init.body))).toMatchObject({ model, stream: true, response_format: { type: 'json_object' } })
-    expect(onProgress.mock.calls.map(([progress]) => progress.phase)).toEqual(['connecting', 'receiving'])
+    expect(onProgress.mock.calls.map(([progress]) => progress.phase)).toEqual(expect.arrayContaining(['connecting', 'connected', 'thinking', 'receiving', 'validating']))
+    expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'validating', completedPlans: 7, totalPlans: 7, receivedChars: JSON.stringify(payload).length }))
+    expect(JSON.stringify(onProgress.mock.calls)).not.toContain('Do not put reasoning in the JSON.')
     expect(vi.getTimerCount()).toBe(0)
   })
 
@@ -424,7 +426,7 @@ describe('planner streaming and transient failure recovery', () => {
     expect((await resultPromise).parsed.title).toBe('Recovered planner')
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).stream)).toEqual([true, true])
-    expect(onProgress).toHaveBeenCalledWith({ phase: 'retrying', attempt: 2, maxAttempts: 3 })
+    expect(onProgress).toHaveBeenCalledWith(expect.objectContaining({ phase: 'retrying', attempt: 2, maxAttempts: 3, message: 'HTTP 504: openai_error', retryDelayMs: 1000 }))
     expect(vi.getTimerCount()).toBe(0)
   })
 

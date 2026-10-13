@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { initStore } from './store'
 import { useStore } from './store'
 import { buildSettingsFromUrlParams, clearUrlSettingParams, hasUrlSettingParams } from './lib/urlSettings'
@@ -31,6 +31,19 @@ function getAppViewFromHash(): AppView {
 export default function App() {
   const setSettings = useStore((s) => s.setSettings)
   const [view, setView] = useState<AppView>(getAppViewFromHash)
+  const currentView = useRef(view)
+  const scrollPositions = useRef<Record<AppView, number>>({ home: 0, editor: 0, tagger: 0 })
+  const mounted = useRef(false)
+  const changeView = useCallback((next: AppView) => {
+    if (currentView.current === next) return
+    scrollPositions.current[currentView.current] = window.scrollY
+    currentView.current = next
+    setView(next)
+  }, [])
+  useLayoutEffect(() => {
+    if (!mounted.current) { mounted.current = true; return }
+    window.scrollTo({ top: scrollPositions.current[view], behavior: 'instant' })
+  }, [view])
   useDockerApiUrlMigrationNotice()
   useGlobalClickSuppression()
 
@@ -57,7 +70,7 @@ export default function App() {
       if (window.location.hash.replace(/^#\/?/, '') === 'seedream-pro') {
         window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#/editor`)
       }
-      setView(getAppViewFromHash())
+      changeView(getAppViewFromHash())
     }
     syncViewFromLocation()
     window.addEventListener('hashchange', syncViewFromLocation)
@@ -66,7 +79,7 @@ export default function App() {
       window.removeEventListener('hashchange', syncViewFromLocation)
       window.removeEventListener('popstate', syncViewFromLocation)
     }
-  }, [])
+  }, [changeView])
 
   useEffect(() => {
     const preventPageImageDrag = (e: DragEvent) => {
@@ -80,7 +93,7 @@ export default function App() {
   }, [])
 
   const navigate = (nextView: AppView) => {
-    setView(nextView)
+    changeView(nextView)
     if (nextView === 'editor' || nextView === 'tagger') {
       const hash = `#/${nextView}`
       if (window.location.hash !== hash) window.location.hash = `/${nextView}`
@@ -96,17 +109,13 @@ export default function App() {
       <Header activeView={view} onNavigate={navigate} />
       <main data-home-main data-drag-select-surface className={view === 'home' ? 'home-main-with-dock pb-48 lg:pb-10' : 'pb-10'}>
         <div className={`safe-area-x mx-auto lg:!px-6 ${view === 'editor' ? 'max-w-[96rem]' : 'max-w-7xl'}`}>
-          {view === 'editor' ? (
-            <ImageEditorPage />
-          ) : view === 'tagger' ? (
-            <SyntheticPerformerTaggerPage />
-          ) : (
-            <>
-              <AmazonPlanner />
-              <SearchBar />
-              <TaskGrid />
-            </>
-          )}
+          {/* Keep the planner mounted so navigation preserves its in-progress work and selection. */}
+          <div hidden={view !== 'home'}>
+            <AmazonPlanner isActive={view === 'home'} />
+            {view === 'home' && <><SearchBar /><TaskGrid /></>}
+          </div>
+          {view === 'editor' && <ImageEditorPage />}
+          {view === 'tagger' && <SyntheticPerformerTaggerPage />}
         </div>
       </main>
       {view === 'home' && <InputBar />}

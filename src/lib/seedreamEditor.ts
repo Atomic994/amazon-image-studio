@@ -56,10 +56,12 @@ export function findLatestImageEditorTask(
   tasks: TaskRecord[],
   engine: ImageEditorEngine,
   preferredTaskId?: string | null,
+  sourceImageId?: string | null,
 ) {
   const candidates = tasks.filter((task) => (
     (task.category?.workflow === 'seedream-edit' || Boolean(task.imageEditContext)) &&
-    getImageEditorTaskEngine(task) === engine
+    getImageEditorTaskEngine(task) === engine &&
+    (sourceImageId === undefined || (task.imageEditContext?.sourceImageId ?? task.inputImageIds[0]) === sourceImageId)
   ))
   const preferred = preferredTaskId
     ? candidates.find((task) => task.id === preferredTaskId)

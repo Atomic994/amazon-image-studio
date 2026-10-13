@@ -58,6 +58,7 @@ import { getChangedParams, getInputImageLimitForSettings, normalizeParamsForSett
 import { prepareReferenceImageAndMaskPayload, prepareReferenceImagePayload, type PlannerReferenceImagePayload } from './lib/referenceImagePayload'
 import { getTaskHistoryCategory } from './lib/taskHistory'
 import { isAmazonListingMainSlot } from './lib/listingPlanner'
+import { collectPlannerImageReferences } from './lib/plannerImageReferences'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
 
 // ===== Image cache =====
@@ -610,6 +611,7 @@ export function getPersistedState(state: AppState) {
       ? { ...galleryInputDraft, inputImages: galleryInputDraft.inputImages.map((img) => ({ id: img.id, dataUrl: '' })) }
       : null,
     seedreamEditorDraft: state.seedreamEditorDraft,
+    imageEditorDrafts: state.imageEditorDrafts,
     agentConversations: state.agentConversations,
     activeAgentConversationId: state.activeAgentConversationId,
     agentInputDrafts: getPersistableAgentInputDrafts(state),
@@ -667,6 +669,7 @@ export function mergePersistedState(persistedState: unknown, currentState: AppSt
     appMode,
     galleryInputDraft: galleryInputDraft && !isEmptyAgentInputDraft(galleryInputDraft) ? galleryInputDraft : null,
     seedreamEditorDraft: normalizeSeedreamEditorDraft(persisted.seedreamEditorDraft),
+    imageEditorDrafts: normalizeImageEditorDrafts(persisted.imageEditorDrafts, persisted.seedreamEditorDraft),
     agentConversations,
     activeAgentConversationId,
     agentInputDrafts,
@@ -713,6 +716,11 @@ interface AppState {
   setMaskEditorImageId: (id: string | null) => void
   galleryInputDraft: AgentInputDraft | null
   seedreamEditorDraft: SeedreamEditorDraft
+  imageEditorDrafts: Record<string, SeedreamEditorDraft>
+  editorSubmittingImageIds: string[]
+  selectImageEditorSource: (imageId: string) => void
+  updateImageEditorDraft: (imageId: string, patch: Partial<SeedreamEditorDraft>) => void
+  setEditorSubmitting: (imageId: string, submitting: boolean) => void
   setSeedreamEditorDraft: (patch: Partial<SeedreamEditorDraft>) => void
   resetSeedreamEditorDraft: () => void
 
@@ -827,6 +835,8 @@ function isImageReferencedByState(state: AppState, imageId: string) {
   if (state.inputImages.some((img) => img.id === imageId)) return true
   if (state.galleryInputDraft?.inputImages.some((img) => img.id === imageId)) return true
   if (state.seedreamEditorDraft.sourceImageId === imageId || state.seedreamEditorDraft.referenceImageIds.includes(imageId)) return true
+  if (Object.values(state.imageEditorDrafts).some((draft) => draft.sourceImageId === imageId || draft.referenceImageIds.includes(imageId))) return true
+  if (collectPlannerImageReferences([], state.settings).has(imageId)) return true
   if (Object.values(state.agentInputDrafts).some((draft) => draft.inputImages.some((img) => img.id === imageId))) return true
   if (state.tasks.some((task) =>
     task.inputImageIds.includes(imageId) ||
@@ -853,13 +863,15 @@ function isImageReferencedByState(state: AppState, imageId: string) {
 }
 
 export async function deleteImageIfUnreferenced(imageId: string) {
-  imageCache.delete(imageId)
-  thumbnailCache.delete(imageId)
-  thumbnailBackfillIds.delete(imageId)
-  thumbnailBackfillRunningIds.delete(imageId)
-  thumbnailSubscribers.delete(imageId)
   if (isImageReferencedByState(useStore.getState(), imageId)) return
   try {
+    const sessions = await getAllAmazonPlannerSessions()
+    if (collectPlannerImageReferences(sessions, useStore.getState().settings).has(imageId) || isImageReferencedByState(useStore.getState(), imageId)) return
+    imageCache.delete(imageId)
+    thumbnailCache.delete(imageId)
+    thumbnailBackfillIds.delete(imageId)
+    thumbnailBackfillRunningIds.delete(imageId)
+    thumbnailSubscribers.delete(imageId)
     await deleteImage(imageId)
   } catch {
     // 清理是内存/存储优化，失败不影响替换结果。
@@ -1199,15 +1211,52 @@ export const useStore = create<AppState>()(
       },
       galleryInputDraft: null,
       seedreamEditorDraft: { ...DEFAULT_SEEDREAM_EDITOR_DRAFT },
-      setSeedreamEditorDraft: (patch) => set((state) => ({
-        seedreamEditorDraft: normalizeSeedreamEditorDraft({
+      imageEditorDrafts: {},
+      editorSubmittingImageIds: [],
+      setSeedreamEditorDraft: (patch) => set((state) => {
+        const next = normalizeSeedreamEditorDraft({
           ...state.seedreamEditorDraft,
           ...patch,
           updatedAt: Date.now(),
-        }),
+        })
+        const imageEditorDrafts = { ...state.imageEditorDrafts }
+        if (state.seedreamEditorDraft.sourceImageId) imageEditorDrafts[state.seedreamEditorDraft.sourceImageId] = state.seedreamEditorDraft
+        if (next.sourceImageId) imageEditorDrafts[next.sourceImageId] = next
+        return { seedreamEditorDraft: next, imageEditorDrafts }
+      }),
+      selectImageEditorSource: (imageId) => set((state) => {
+        if (!imageId || state.seedreamEditorDraft.sourceImageId === imageId) return state
+        const previous = state.seedreamEditorDraft
+        const next = normalizeSeedreamEditorDraft(state.imageEditorDrafts[imageId] ?? {
+          ...DEFAULT_SEEDREAM_EDITOR_DRAFT,
+          engine: previous.engine,
+          resolution: previous.resolution,
+          sourceImageId: imageId,
+          referenceImageIds: previous.referenceImageIds.filter((id) => id !== imageId),
+          updatedAt: Date.now(),
+        })
+        return { seedreamEditorDraft: next, imageEditorDrafts: {
+          ...state.imageEditorDrafts,
+          ...(previous.sourceImageId ? { [previous.sourceImageId]: previous } : {}),
+          [imageId]: next,
+        } }
+      }),
+      updateImageEditorDraft: (imageId, patch) => set((state) => {
+        const current = state.seedreamEditorDraft.sourceImageId === imageId ? state.seedreamEditorDraft : state.imageEditorDrafts[imageId]
+        if (!current) return state
+        const next = normalizeSeedreamEditorDraft({ ...current, ...patch, sourceImageId: imageId, updatedAt: Date.now() })
+        return { imageEditorDrafts: { ...state.imageEditorDrafts, [imageId]: next },
+          ...(state.seedreamEditorDraft.sourceImageId === imageId ? { seedreamEditorDraft: next } : {}) }
+      }),
+      setEditorSubmitting: (imageId, submitting) => set((state) => ({
+        editorSubmittingImageIds: submitting
+          ? [...new Set([...state.editorSubmittingImageIds, imageId])]
+          : state.editorSubmittingImageIds.filter((id) => id !== imageId),
       })),
       resetSeedreamEditorDraft: () => set({
         seedreamEditorDraft: { ...DEFAULT_SEEDREAM_EDITOR_DRAFT, updatedAt: Date.now() },
+        imageEditorDrafts: {},
+        editorSubmittingImageIds: [],
       }),
 
       // Params
@@ -1597,6 +1646,19 @@ export function normalizeSeedreamEditorDraft(value: unknown): SeedreamEditorDraf
   }
 }
 
+function normalizeImageEditorDrafts(value: unknown, activeDraft?: unknown): Record<string, SeedreamEditorDraft> {
+  const drafts: Record<string, SeedreamEditorDraft> = {}
+  if (isRecord(value)) {
+    for (const [id, raw] of Object.entries(value)) {
+      const draft = normalizeSeedreamEditorDraft(raw)
+      if (draft.sourceImageId === id) drafts[id] = draft
+    }
+  }
+  const active = normalizeSeedreamEditorDraft(activeDraft)
+  if (active.sourceImageId) drafts[active.sourceImageId] = active
+  return drafts
+}
+
 export function getTaskApiProfile(settings: AppSettings, task: TaskRecord): ApiProfile | null {
   const normalized = normalizeSettings(settings)
   const provider = task.apiProvider
@@ -1856,7 +1918,8 @@ export async function initStore() {
   }
 
   // 收集所有任务引用的图片 id
-  const referencedIds = new Set<string>()
+  const plannerSessions = await getAllAmazonPlannerSessions()
+  const referencedIds = collectPlannerImageReferences(plannerSessions, useStore.getState().settings)
   const state = useStore.getState()
   const persistedInputImages = state.inputImages
   const galleryInputDraft = state.galleryInputDraft
@@ -1884,7 +1947,7 @@ export async function initStore() {
   const imageIds = await getAllImageIds()
   const referencedImageIds: string[] = []
   for (const imgId of imageIds) {
-    if (referencedIds.has(imgId)) {
+    if (referencedIds.has(imgId) || isImageReferencedByState(useStore.getState(), imgId)) {
       referencedImageIds.push(imgId)
     } else {
       await deleteImage(imgId)
@@ -1892,7 +1955,7 @@ export async function initStore() {
   }
   scheduleThumbnailBackfill(referencedImageIds)
 
-  const availableImageIds = new Set(imageIds)
+  const availableImageIds = new Set(referencedImageIds)
   const restoredSeedreamDraft = normalizeSeedreamEditorDraft({
     ...seedreamEditorDraft,
     sourceImageId: seedreamEditorDraft.sourceImageId && availableImageIds.has(seedreamEditorDraft.sourceImageId)
@@ -2016,6 +2079,25 @@ export interface SubmitTaskWithInputRequest {
   maskImageId?: string | null
 }
 
+/** Resolve persisted IDs to actual image bytes, preserving order and repairing a live preview's missing record. */
+export async function resolveInputImagesForRequest(images: InputImage[], signal?: AbortSignal): Promise<InputImage[]> {
+  const resolved: InputImage[] = []
+  for (let index = 0; index < images.length; index++) {
+    signal?.throwIfAborted()
+    const image = images[index]
+    const stored = await getImage(image.id)
+    const dataUrl = stored?.dataUrl || image.dataUrl || getCachedImage(image.id)
+    signal?.throwIfAborted()
+    if (!dataUrl) throw new Error(`第 ${index + 1} 张参考图的原图已不存在，请重新上传后重试`)
+    if (!stored?.dataUrl) {
+      await putImage({ ...stored, id: image.id, dataUrl, source: stored?.source ?? 'upload', createdAt: stored?.createdAt ?? Date.now() })
+    }
+    cacheImage(image.id, dataUrl)
+    resolved.push({ id: image.id, dataUrl })
+  }
+  return resolved
+}
+
 /** 使用指定配置和输入创建任务，不读取或修改首页输入状态。 */
 export async function submitTaskWithInput(request: SubmitTaskWithInputRequest): Promise<string | null> {
   const state = useStore.getState()
@@ -2050,19 +2132,12 @@ export async function submitTaskWithInput(request: SubmitTaskWithInputRequest): 
     return null
   }
 
-  const storedImages: InputImage[] = []
+  let storedImages: InputImage[]
   const imageIdMap = new Map<string, string>()
   try {
-    for (const image of request.inputImages) {
-      const dataUrl = image.dataUrl || await ensureImageCached(image.id)
-      if (!dataUrl) throw new Error('输入图片已不存在')
-      const existing = await getImage(image.id)
-      if (!existing) {
-        await putImage({ id: image.id, dataUrl, source: 'upload', createdAt: Date.now() })
-      }
-      cacheImage(image.id, dataUrl)
+    storedImages = await resolveInputImagesForRequest(request.inputImages)
+    for (const image of storedImages) {
       imageIdMap.set(image.id, image.id)
-      storedImages.push({ id: image.id, dataUrl })
     }
   } catch (error) {
     state.showToast(error instanceof Error ? error.message : String(error), 'error')
@@ -2494,6 +2569,15 @@ function addInputDraftReferencedImageIds(target: Set<string>, draft: AgentInputD
 function addSeedreamEditorDraftReferencedImageIds(target: Set<string>, draft = useStore.getState().seedreamEditorDraft) {
   if (draft.sourceImageId) target.add(draft.sourceImageId)
   for (const id of draft.referenceImageIds) target.add(id)
+  for (const saved of Object.values(useStore.getState().imageEditorDrafts)) {
+    if (saved.sourceImageId) target.add(saved.sourceImageId)
+    for (const id of saved.referenceImageIds) target.add(id)
+  }
+}
+
+async function addPlannerReferencedImageIds(target: Set<string>) {
+  const sessions = await getAllAmazonPlannerSessions()
+  for (const id of collectPlannerImageReferences(sessions, useStore.getState().settings)) target.add(id)
 }
 
 function addTaskReferencedImageIds(target: Set<string>, task: TaskRecord) {
@@ -2512,6 +2596,7 @@ async function deleteUnreferencedImageIds(imageIds: Iterable<string>) {
 
   const { tasks, inputImages, galleryInputDraft } = useStore.getState()
   const stillUsed = new Set<string>()
+  await addPlannerReferencedImageIds(stillUsed)
   for (const task of tasks) addTaskReferencedImageIds(stillUsed, task)
   addAgentReferencedImageIds(stillUsed)
   addInputDraftReferencedImageIds(stillUsed, galleryInputDraft)
@@ -4019,7 +4104,21 @@ export async function retryTask(task: TaskRecord) {
   useStore.getState().setTasks([newTask, ...latestTasks])
   await putTask(newTask)
 
-  if (isImageEdit) useStore.getState().setSeedreamEditorDraft({ engine: editorEngine, latestTaskId: taskId })
+  if (isImageEdit) {
+    const state = useStore.getState()
+    const sourceImageId = task.imageEditContext?.sourceImageId ?? task.inputImageIds[0]
+    if (sourceImageId) {
+      if (!state.imageEditorDrafts[sourceImageId] && state.seedreamEditorDraft.sourceImageId !== sourceImageId) {
+        useStore.setState({ imageEditorDrafts: { ...state.imageEditorDrafts, [sourceImageId]: normalizeSeedreamEditorDraft({
+          ...DEFAULT_SEEDREAM_EDITOR_DRAFT, sourceImageId, engine: editorEngine,
+          instruction: task.imageEditContext?.userInstruction ?? task.prompt,
+          referenceImageIds: task.imageEditContext?.referenceImageIds ?? [],
+        }) } })
+      }
+      if (!useStore.getState().seedreamEditorDraft.sourceImageId) useStore.getState().selectImageEditorSource(sourceImageId)
+      useStore.getState().updateImageEditorDraft(sourceImageId, { engine: editorEngine, latestTaskId: taskId })
+    }
+  }
 
   void executeTask(taskId)
 }
@@ -4045,13 +4144,7 @@ function getSeedreamEditorResolutionFromSize(size: string): SeedreamEditorDraft[
 export function openImageInSeedreamEditor(imageId: string) {
   if (!imageId) return
   const state = useStore.getState()
-  state.setSeedreamEditorDraft({
-    sourceImageId: imageId,
-    referenceImageIds: state.seedreamEditorDraft.referenceImageIds.filter((id) => id !== imageId),
-    instruction: '',
-    annotations: [],
-    latestTaskId: null,
-  })
+  state.selectImageEditorSource(imageId)
   navigateToSeedreamEditor()
   state.showToast('已在图片编辑中打开', 'success')
 }
@@ -4064,13 +4157,14 @@ export function openSeedreamTaskInEditor(task: TaskRecord) {
     return
   }
   const state = useStore.getState()
-  const keepAnnotations = state.seedreamEditorDraft.sourceImageId === sourceImageId && state.seedreamEditorDraft.latestTaskId === task.id
+  const remembered = state.seedreamEditorDraft.sourceImageId === sourceImageId ? state.seedreamEditorDraft : state.imageEditorDrafts[sourceImageId]
+  const keepAnnotations = remembered?.latestTaskId === task.id
   state.setSeedreamEditorDraft({
     engine: context?.engine ?? (task.apiProvider === 'volcengine' ? 'seedream' : 'home'),
     sourceImageId,
     referenceImageIds: (context?.referenceImageIds ?? []).filter((id) => id !== sourceImageId).slice(0, MAX_SEEDREAM_REFERENCE_IMAGES),
     instruction: context?.userInstruction ?? task.prompt,
-    annotations: keepAnnotations ? state.seedreamEditorDraft.annotations : [],
+    annotations: keepAnnotations ? remembered!.annotations : [],
     resolution: getSeedreamEditorResolutionFromSize(task.params.size),
     latestTaskId: task.id,
   })
@@ -4197,8 +4291,9 @@ export async function removeMultipleTasks(taskIds: string[]) {
     await dbDeleteTask(id)
   }
 
-  // 找出其他任务仍引用的图片
+  // 找出任务、编辑草稿和策划历史仍引用的图片。
   const stillUsed = new Set<string>()
+  await addPlannerReferencedImageIds(stillUsed)
   for (const t of remaining) {
     addTaskReferencedImageIds(stillUsed, t)
   }
@@ -4241,8 +4336,9 @@ export async function removeTask(task: TaskRecord) {
   }
   await dbDeleteTask(task.id)
 
-  // 找出其他任务仍引用的图片
+  // 找出任务、编辑草稿和策划历史仍引用的图片。
   const stillUsed = new Set<string>()
+  await addPlannerReferencedImageIds(stillUsed)
   for (const t of remaining) {
     addTaskReferencedImageIds(stillUsed, t)
   }

@@ -49,6 +49,7 @@ type JsonServerSentEventHandler = (event: Record<string, unknown>) => void | fal
 interface ServerSentEventReadOptions {
   signal?: AbortSignal
   onDone?: () => void
+  onActivity?: () => void
 }
 
 function parseServerSentEventBlock(block: string): string | null {
@@ -97,6 +98,7 @@ export async function readJsonServerSentEventText(
   const normalized = text.replace(/\r\n/g, '\n')
   for (const block of normalized.split(/\n\n+/)) {
     options.signal?.throwIfAborted()
+    if (block.trim()) options.onActivity?.()
     if (block.trim() && !await processServerSentEventBlock(block, onEvent, options)) break
   }
 }
@@ -120,6 +122,7 @@ export async function readJsonServerSentEvents(
       const { value, done } = await reader.read()
       options.signal?.throwIfAborted()
       if (done) break
+      if (value.length) options.onActivity?.()
       buffer += decoder.decode(value, { stream: true })
 
       let separator = buffer.match(/\r?\n\r?\n/)

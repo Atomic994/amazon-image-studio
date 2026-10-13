@@ -1,7 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate'
 import { DEFAULT_PARAMS } from './types'
-import { createDefaultFalProfile, createDefaultOpenAIProfile, createDefaultVolcengineProfile, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, normalizeSettings } from './lib/apiProfiles'
+import { createDefaultFalProfile, createDefaultOpenAIProfile, createDefaultVolcengineProfile, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, getHomeApiProfile, normalizeSettings } from './lib/apiProfiles'
 import type { AgentConversation, AmazonPlannerSession, ExportData, StoredImage, StoredImageThumbnail, TaskRecord } from './types'
 import { getSelectedImageMentionLabel } from './lib/promptImageMentions'
 vi.mock('./lib/db', () => {
@@ -92,13 +92,122 @@ vi.mock('./lib/agentApi', () => ({
     }
   }),
 }))
-import { clearAmazonPlannerSessions, clearImages, getAllAmazonPlannerSessions, putAmazonPlannerSession, putImage } from './lib/db'
+import { clearAmazonPlannerSessions, clearImages, clearTasks as clearStoredTasks, getAllAmazonPlannerSessions, getImage, putAmazonPlannerSession, putImage } from './lib/db'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
 import { callImageApi } from './lib/api'
-import { cleanStaleAgentInputDrafts, clearData, editOutputs, exportData, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, markInterruptedOpenAIRunningTasks, mergePersistedState, openSeedreamTaskInEditor, regenerateAgentAssistantMessage, removeTask, retryTask, reuseConfig, submitAgentMessage, submitTask, submitTaskWithInput, useStore } from './store'
+import { cleanStaleAgentInputDrafts, clearData, deleteImageIfUnreferenced, editOutputs, ensureImageCached, exportData, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, mergePersistedState, openSeedreamTaskInEditor, regenerateAgentAssistantMessage, removeTask, resolveInputImagesForRequest, retryTask, reuseConfig, submitAgentMessage, submitTask, submitTaskWithInput, useStore } from './store'
 
 const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
 const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
+
+describe('independent editor workspaces and restored references', () => {
+  beforeEach(async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('window', { requestIdleCallback: () => 0 })
+    await clearStoredTasks()
+    await clearAmazonPlannerSessions()
+    await clearImages()
+    useStore.getState().resetSeedreamEditorDraft()
+    useStore.setState({ settings: settingsWithConfiguredImageProfile(), tasks: [], inputImages: [], galleryInputDraft: null,
+      agentConversations: [], agentInputDrafts: {}, prompt: '', params: { ...DEFAULT_PARAMS }, pendingTaskCategory: null,
+      reusedTaskApiProfileId: null, reusedTaskApiProfileName: null, reusedTaskApiProfileMissing: false, showToast: vi.fn() })
+    vi.mocked(callImageApi).mockReset().mockResolvedValue({ images: ['data:image/png;base64,result'], actualParams: {} })
+  })
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals() })
+
+  it('restores each image’s instruction, annotations, references and latest result after switching or rehydrating', () => {
+    const state = useStore.getState()
+    state.selectImageEditorSource('workspace-A')
+    state.setSeedreamEditorDraft({ instruction: 'Edit A', referenceImageIds: ['reference-A'], latestTaskId: 'task-A', annotations: [{ id: 'box-A', kind: 'rectangle', color: '#ff0000', width: 0.006, points: [{ x: 0.1, y: 0.2 }, { x: 0.3, y: 0.4 }] }] })
+    state.selectImageEditorSource('workspace-B')
+    state.setSeedreamEditorDraft({ instruction: 'Edit B', referenceImageIds: ['reference-B'], latestTaskId: 'task-B' })
+    state.updateImageEditorDraft('workspace-A', { latestTaskId: 'task-A-submitted-later' })
+    expect(useStore.getState().seedreamEditorDraft).toMatchObject({ sourceImageId: 'workspace-B', instruction: 'Edit B', latestTaskId: 'task-B' })
+    state.updateImageEditorDraft('workspace-A', { referenceImageIds: ['reference-A', 'reference-A-uploaded-later'] })
+    expect(useStore.getState().seedreamEditorDraft.referenceImageIds).toEqual(['reference-B'])
+    state.selectImageEditorSource('workspace-A')
+    expect(useStore.getState().seedreamEditorDraft).toMatchObject({ instruction: 'Edit A', referenceImageIds: ['reference-A', 'reference-A-uploaded-later'], latestTaskId: 'task-A-submitted-later', annotations: [{ id: 'box-A' }] })
+    state.selectImageEditorSource('workspace-A')
+    expect(useStore.getState().seedreamEditorDraft.annotations).toHaveLength(1)
+    const restored = mergePersistedState(getPersistedState(useStore.getState()), useStore.getState())
+    expect(restored.imageEditorDrafts['workspace-B']?.instruction).toBe('Edit B')
+    expect(restored.imageEditorDrafts['workspace-A']?.annotations[0]?.id).toBe('box-A')
+  })
+
+  it('submits B while A is still running and keeps each request and result attached to its own source', async () => {
+    const a = { id: 'concurrent-source-A', dataUrl: 'data:image/png;base64,sourceA' }
+    const b = { id: 'concurrent-source-B', dataUrl: 'data:image/png;base64,sourceB' }
+    await putImage({ ...a, source: 'upload', createdAt: 1 })
+    await putImage({ ...b, source: 'upload', createdAt: 2 })
+    const finishes: Array<(value: { images: string[] }) => void> = []
+    vi.mocked(callImageApi).mockImplementation(() => new Promise((resolve) => { finishes.push(resolve) }))
+    const profile = getHomeApiProfile(useStore.getState().settings)
+    const submit = (source: typeof a, instruction: string) => submitTaskWithInput({ apiProfileId: profile.id, prompt: instruction, inputImages: [source], params: { ...DEFAULT_PARAMS }, category: { workflow: 'seedream-edit' }, imageEditContext: { engine: 'home', sourceImageId: source.id, referenceImageIds: [], userInstruction: instruction } })
+    useStore.getState().selectImageEditorSource(a.id)
+    const taskA = await submit(a, 'Edit A only')
+    useStore.getState().updateImageEditorDraft(a.id, { latestTaskId: taskA })
+    useStore.getState().selectImageEditorSource(b.id)
+    const taskB = await submit(b, 'Edit B only')
+    useStore.getState().updateImageEditorDraft(b.id, { latestTaskId: taskB })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(vi.mocked(callImageApi).mock.calls.map(([options]) => options.inputImageDataUrls)).toEqual([[a.dataUrl], [b.dataUrl]])
+    expect(useStore.getState().tasks.filter((task) => task.status === 'running')).toHaveLength(2)
+    expect(useStore.getState().seedreamEditorDraft).toMatchObject({ sourceImageId: b.id, latestTaskId: taskB })
+    finishes[1]!({ images: ['data:image/png;base64,editedB'] })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useStore.getState().tasks.find((task) => task.id === taskB)?.status).toBe('done')
+    expect(useStore.getState().tasks.find((task) => task.id === taskA)?.status).toBe('running')
+    finishes[0]!({ images: ['data:image/png;base64,editedA'] })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(useStore.getState().tasks.find((task) => task.id === taskA)?.status).toBe('done')
+  })
+
+  it('preserves references stored only in planner history when initialization removes unused images', async () => {
+    await putImage({ id: 'history-only-reference', dataUrl: 'data:image/png;base64,history-product', source: 'upload', createdAt: 1 })
+    await putImage({ id: 'history-only-style', dataUrl: 'data:image/png;base64,history-style', source: 'upload', createdAt: 1 })
+    await putImage({ id: 'real-orphan-image', dataUrl: 'data:image/png;base64,orphan', source: 'upload', createdAt: 1 })
+    await putAmazonPlannerSession(amazonPlannerSession({ referenceImageIds: ['history-only-reference'], selectedStyleReferenceImageId: 'history-only-style' }))
+    await initStore()
+    expect(await getImage('history-only-reference')).toBeDefined()
+    expect(await getImage('history-only-style')).toBeDefined()
+    expect(await getImage('real-orphan-image')).toBeUndefined()
+    await deleteImageIfUnreferenced('history-only-reference')
+    expect(await getImage('history-only-reference')).toBeDefined()
+  })
+
+  it('sends restored reference bytes even when the persisted draft contains only an ID and an empty URL', async () => {
+    const source = { id: 'restored-reference-bytes', dataUrl: 'data:image/png;base64,persisted-real-reference' }
+    await putImage({ ...source, source: 'upload', createdAt: 1 })
+    useStore.getState().setInputImages([{ id: source.id, dataUrl: '' }])
+    useStore.getState().setPrompt('Generate using the exact reference product')
+    expect(await submitTask()).toBe(true)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(callImageApi).toHaveBeenCalledWith(expect.objectContaining({ inputImageDataUrls: [source.dataUrl] }))
+    const task = useStore.getState().tasks[0]!
+    expect(task.inputImageIds).toEqual([source.id])
+  })
+
+  it('restores a still-visible image record before submitting and never silently drops a missing reference', async () => {
+    const visible = { id: 'visible-reference-repair', dataUrl: 'data:image/png;base64,visible-preview-original' }
+    expect(await resolveInputImagesForRequest([visible])).toEqual([visible])
+    expect((await getImage(visible.id))?.dataUrl).toBe(visible.dataUrl)
+    useStore.getState().setInputImages([{ id: 'unrecoverable-reference-test', dataUrl: '' }])
+    useStore.getState().setPrompt('Do not submit without reference')
+    expect(await submitTask()).toBe(false)
+    expect(callImageApi).not.toHaveBeenCalled()
+  })
+
+  it('keeps sources belonging to inactive editing workspaces during cleanup', async () => {
+    await putImage({ id: 'inactive-workspace-A', dataUrl: 'data:image/png;base64,A', source: 'upload', createdAt: 1 })
+    await putImage({ id: 'active-workspace-B', dataUrl: 'data:image/png;base64,B', source: 'upload', createdAt: 1 })
+    useStore.getState().selectImageEditorSource('inactive-workspace-A')
+    useStore.getState().selectImageEditorSource('active-workspace-B')
+    await initStore()
+    expect(await ensureImageCached('inactive-workspace-A')).toBeTruthy()
+    await deleteImageIfUnreferenced('inactive-workspace-A')
+    expect(await getImage('inactive-workspace-A')).toBeDefined()
+  })
+})
 
 describe('error toast messages', () => {
   it('drops long error detail after the failure title', () => {

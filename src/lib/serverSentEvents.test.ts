@@ -2,6 +2,13 @@ import { describe, expect, it, vi } from 'vitest'
 import { readJsonServerSentEvents, readJsonServerSentEventText, ServerSentEventError } from './serverSentEvents'
 
 describe('JSON server-sent event transport', () => {
+  it('reports heartbeat activity even when no JSON content has arrived', async () => {
+    const activity = vi.fn()
+    const event = vi.fn()
+    await readJsonServerSentEvents(new Response(': keepalive\n\ndata: [DONE]\n\n'), event, { onActivity: activity })
+    expect(activity).toHaveBeenCalled()
+    expect(event).not.toHaveBeenCalled()
+  })
   it('handles UTF-8 characters and CRLF delimiters split at every byte boundary', async () => {
     const bytes = new TextEncoder().encode(': keepalive\r\n\r\nevent: response.output_text.delta\r\ndata: {"delta":"中文 content "}\r\n\r\ndata: [DONE]\r\n\r\n')
     const stream = new ReadableStream<Uint8Array>({

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { canApiProfileGenerateImages, getHomeApiProfile, getSeedreamEditorProfile, isVolcengineSeedreamProModel, validateApiProfile } from '../lib/apiProfiles'
 import { downloadImageIds } from '../lib/downloadImages'
+import { loadImage } from '../lib/canvasImage'
+import { formatPlannerElapsed } from '../lib/plannerRunLog'
 import {
   appendSeedreamQuickAction,
   buildSeedreamEditPrompt,
@@ -257,6 +259,11 @@ function AnnotationSelectionOutline({ annotation, width, height }: { annotation:
 export default function ImageEditorPage() {
   const settings = useStore((state) => state.settings)
   const draft = useStore((state) => state.seedreamEditorDraft)
+  const savedDrafts = useStore((state) => state.imageEditorDrafts)
+  const submittingImageIds = useStore((state) => state.editorSubmittingImageIds)
+  const selectSource = useStore((state) => state.selectImageEditorSource)
+  const updateWorkspace = useStore((state) => state.updateImageEditorDraft)
+  const setEditorSubmitting = useStore((state) => state.setEditorSubmitting)
   const setDraft = useStore((state) => state.setSeedreamEditorDraft)
   const tasks = useStore((state) => state.tasks)
   const streamPreviews = useStore((state) => state.streamPreviews)
@@ -282,12 +289,26 @@ export default function ImageEditorPage() {
   const [undoStack, setUndoStack] = useState<SeedreamAnnotation[][]>([])
   const [redoStack, setRedoStack] = useState<SeedreamAnnotation[][]>([])
   const [pickerMode, setPickerMode] = useState<PickerMode | null>(null)
-  const [submitting, setSubmitting] = useState(false)
+  const [uploadingSource, setUploadingSource] = useState(false)
+  const submitting = Boolean(draft.sourceImageId && submittingImageIds.includes(draft.sourceImageId))
+  const [now, setNow] = useState(Date.now)
 
   const latestTask = useMemo(
-    () => findLatestImageEditorTask(tasks, draft.engine, draft.latestTaskId),
-    [draft.engine, draft.latestTaskId, tasks],
+    () => findLatestImageEditorTask(tasks, draft.engine, draft.latestTaskId, draft.sourceImageId),
+    [draft.engine, draft.latestTaskId, draft.sourceImageId, tasks],
   )
+  const workspaces = useMemo(() => Object.entries(savedDrafts).map(([imageId, saved]) => ({
+    imageId, draft: saved,
+    task: findLatestImageEditorTask(tasks, saved.engine, saved.latestTaskId, imageId),
+    label: tasks.find((task) => task.outputImages.includes(imageId))?.category?.amazonSlot,
+  })), [savedDrafts, tasks])
+  const runningCount = workspaces.filter(({ task }) => task?.status === 'running').length
+  useEffect(() => {
+    if (!runningCount && !submittingImageIds.length) return
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [runningCount, submittingImageIds.length])
   const outputImageId = latestTask?.outputImages[0] ?? null
   const requestedImageIds = [
     ...(draft.sourceImageId ? [draft.sourceImageId] : []),
@@ -379,34 +400,28 @@ export default function ImageEditorPage() {
         ?.getAsFile()
       if (!file) return
       event.preventDefault()
-      void createInputImageFromFile(file).then((image) => {
-        if (image) applySourceImage(image.id)
-      })
+      void uploadSource(file)
     }
     window.addEventListener('paste', handlePaste)
     return () => window.removeEventListener('paste', handlePaste)
   })
 
   const applySourceImage = (imageId: string) => {
-    const previousSourceId = draft.sourceImageId
-    setDraft({
-      sourceImageId: imageId,
-      referenceImageIds: draft.referenceImageIds.filter((id) => id !== imageId),
-      annotations: [],
-      instruction: '',
-      latestTaskId: null,
-    })
-    if (previousSourceId && previousSourceId !== imageId) void deleteImageIfUnreferenced(previousSourceId)
+    selectSource(imageId)
   }
 
   const uploadSource = async (file: File | undefined) => {
-    if (!file) return
-    const image = await createInputImageFromFile(file)
-    if (!image) {
-      showToast('请选择有效的图片文件', 'error')
-      return
+    if (!file || uploadingSource) return
+    setUploadingSource(true)
+    try {
+      const image = await createInputImageFromFile(file)
+      if (!image) { showToast('请选择有效的图片文件', 'error'); return }
+      applySourceImage(image.id)
+    } catch (error) {
+      showToast(`原图载入失败：${error instanceof Error ? error.message : String(error)}`, 'error')
+    } finally {
+      setUploadingSource(false)
     }
-    applySourceImage(image.id)
   }
 
   const addReferenceIds = (ids: string[]) => {
@@ -425,13 +440,20 @@ export default function ImageEditorPage() {
   }
 
   const uploadReferences = async (files: File[]) => {
+    const sourceImageId = draft.sourceImageId
     const remaining = SEEDREAM_EDITOR_REFERENCE_LIMIT - draft.referenceImageIds.length
     if (remaining <= 0) {
       showToast('参考图最多添加 4 张', 'info')
       return
     }
     const images = await Promise.all(files.slice(0, remaining).map(createInputImageFromFile))
-    addReferenceIds(images.filter((image): image is InputImage => image != null).map((image) => image.id))
+    const state = useStore.getState()
+    const owner = sourceImageId && state.seedreamEditorDraft.sourceImageId !== sourceImageId ? state.imageEditorDrafts[sourceImageId] : state.seedreamEditorDraft
+    if (!owner) return
+    const referenceImageIds = [...new Set([...owner.referenceImageIds, ...images.filter((image): image is InputImage => image != null).map((image) => image.id)])]
+      .filter((id) => id !== owner.sourceImageId).slice(0, SEEDREAM_EDITOR_REFERENCE_LIMIT)
+    if (sourceImageId) state.updateImageEditorDraft(sourceImageId, { referenceImageIds })
+    else state.setSeedreamEditorDraft({ referenceImageIds })
     if (files.length > remaining) showToast(`仅添加前 ${remaining} 张参考图`, 'info')
   }
 
@@ -503,7 +525,7 @@ export default function ImageEditorPage() {
   }
 
   const handlePointerDown = (event: ReactPointerEvent<SVGSVGElement>) => {
-    if (event.button !== 0 || !draft.sourceImageId) return
+    if (event.button !== 0 || !draft.sourceImageId || uploadingSource) return
     event.currentTarget.setPointerCapture(event.pointerId)
     if (tool === 'pan') {
       const viewport = canvasViewportRef.current
@@ -607,6 +629,7 @@ export default function ImageEditorPage() {
   }, [adjustZoom, sourceDataUrl])
 
   const generate = async () => {
+    if (uploadingSource) { showToast('正在载入新图片，请稍候', 'info'); return }
     if (profileError || !profile) {
       showToast(profileError ?? '请先配置图片编辑 API', 'error')
       setShowSettings(true, 'api')
@@ -621,11 +644,14 @@ export default function ImageEditorPage() {
       return
     }
 
-    setSubmitting(true)
+    const sourceImageId = draft.sourceImageId
+    if (submitting || isRunning) { showToast('当前图片正在处理，可以添加或切换另一张继续编辑', 'info'); return }
+    setEditorSubmitting(sourceImageId, true)
     let visualGuide: InputImage | null = null
     try {
       const source = imageDataUrls[draft.sourceImageId] ?? await ensureImageCached(draft.sourceImageId)
       if (!source) throw new Error('主图已不存在，请重新选择')
+      const sourceImage = await loadImage(source)
       const referenceImages: InputImage[] = []
       for (const id of draft.referenceImageIds) {
         const dataUrl = imageDataUrls[id] ?? await ensureImageCached(id)
@@ -647,7 +673,7 @@ export default function ImageEditorPage() {
           referenceCount: referenceImages.length,
         }),
         inputImages,
-        params: createImageEditorParams(selectedResolution, profile, dimensions),
+        params: createImageEditorParams(selectedResolution, profile, { width: sourceImage.naturalWidth, height: sourceImage.naturalHeight }),
         category: { workflow: 'seedream-edit' },
         imageEditContext: {
           engine: draft.engine,
@@ -657,13 +683,13 @@ export default function ImageEditorPage() {
           userInstruction: draft.instruction.trim(),
         },
       })
-      if (taskId) setDraft({ latestTaskId: taskId })
+      if (taskId) updateWorkspace(sourceImageId, { latestTaskId: taskId })
       else if (visualGuide) void deleteImageIfUnreferenced(visualGuide.id)
     } catch (error) {
       if (visualGuide) void deleteImageIfUnreferenced(visualGuide.id)
       showToast(error instanceof Error ? error.message : String(error), 'error')
     } finally {
-      setSubmitting(false)
+      setEditorSubmitting(sourceImageId, false)
     }
   }
 
@@ -674,7 +700,7 @@ export default function ImageEditorPage() {
       sourceImageId: outputImageId,
       annotations: [],
       instruction: '',
-      latestTaskId: latestTask?.id ?? null,
+      latestTaskId: null,
     })
     if (previousSourceId && previousSourceId !== outputImageId) void deleteImageIfUnreferenced(previousSourceId)
     window.scrollTo({ top: 0, behavior: 'smooth' })
@@ -824,6 +850,31 @@ export default function ImageEditorPage() {
         </button>
       )}
 
+      <section className="ios-material mb-4 px-4 py-3" aria-label="独立图片编辑工作区">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h3 className="text-sm font-semibold text-gray-900 dark:text-gray-100">图片工作区{runningCount > 0 ? ` · ${runningCount} 张正在生成` : ''}</h3>
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">一张提交后可继续编辑下一张；每张单独保留编辑要求、标注、进度和结果。</p>
+          </div>
+          <div className="flex gap-2">
+            <button type="button" onClick={() => setPickerMode('source')} className="ios-button ios-button-plain h-8 px-3 text-xs font-medium">从历史添加</button>
+            <button type="button" disabled={uploadingSource} onClick={() => sourceInputRef.current?.click()} className="ios-button ios-button-tinted h-8 px-3 text-xs font-semibold disabled:opacity-50">{uploadingSource ? '正在载入原图…' : '添加下一张'}</button>
+          </div>
+        </div>
+        {workspaces.length > 0 && <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
+          {workspaces.map(({ imageId, task, label }, index) => {
+            const preparing = submittingImageIds.includes(imageId)
+            const status = preparing ? '正在准备' : task?.status === 'running' ? `生成中 · ${formatPlannerElapsed(now - task.createdAt)}` : task?.status === 'done' ? '已完成' : task?.status === 'error' ? '失败，可重试' : '待提交'
+            return <button key={imageId} type="button" disabled={uploadingSource} aria-pressed={draft.sourceImageId === imageId} onClick={() => applySourceImage(imageId)} aria-label={`切换编辑图片 ${index + 1}${label ? ` ${label}` : ''}`}
+              className={`flex w-40 shrink-0 items-center gap-2 rounded-xl border p-2 text-left ${draft.sourceImageId === imageId ? 'border-[hsl(var(--primary))] bg-[hsl(var(--ios-blue-tint))]' : 'border-[hsl(var(--separator))] bg-[hsl(var(--surface))]'}`}>
+              <div className="h-12 w-12 shrink-0 overflow-hidden rounded-lg"><HistoryThumbnail imageId={imageId} /></div>
+              <div className="min-w-0"><div className="truncate text-xs font-semibold">{label || `图片 ${index + 1}`}</div>
+                <div className={`mt-1 text-[10px] ${task?.status === 'error' ? 'text-red-600' : task?.status === 'running' || preparing ? 'text-[hsl(var(--primary))]' : 'text-gray-500'}`}>{status}</div></div>
+            </button>
+          })}
+        </div>}
+      </section>
+
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_23rem]">
         <section className="ios-material overflow-hidden">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[hsl(var(--separator))] px-3 py-2.5">
@@ -924,10 +975,10 @@ export default function ImageEditorPage() {
             <label htmlFor="seedream-instruction" className="text-sm font-semibold text-gray-950 dark:text-gray-50">编辑要求</label>
             <div className="mt-2 flex flex-wrap gap-1.5">
               {QUICK_ACTIONS.map((action) => (
-                <button key={action} type="button" onClick={() => setDraft({ instruction: appendSeedreamQuickAction(draft.instruction, action) })} className="ios-button ios-button-tinted min-h-7 px-2.5 py-1 text-xs font-medium">{action}</button>
+                <button key={action} type="button" disabled={uploadingSource} onClick={() => setDraft({ instruction: appendSeedreamQuickAction(draft.instruction, action) })} className="ios-button ios-button-tinted min-h-7 px-2.5 py-1 text-xs font-medium">{action}</button>
               ))}
             </div>
-            <textarea id="seedream-instruction" value={draft.instruction} onChange={(event) => setDraft({ instruction: event.target.value })} rows={6} placeholder="例如：删除红色箭头指向的文字，其余产品结构、光影和背景保持不变。" className="ios-field mt-3 w-full resize-y px-3 py-2.5 text-sm leading-6 text-gray-900 placeholder:text-gray-400 dark:text-gray-100" />
+            <textarea id="seedream-instruction" disabled={uploadingSource} value={draft.instruction} onChange={(event) => setDraft({ instruction: event.target.value })} rows={6} placeholder="例如：删除红色箭头指向的文字，其余产品结构、光影和背景保持不变。" className="ios-field mt-3 w-full resize-y px-3 py-2.5 text-sm leading-6 text-gray-900 placeholder:text-gray-400 dark:text-gray-100" />
 
             <div className="mt-4 flex items-center justify-between gap-3">
               <span className="text-xs font-semibold text-gray-500 dark:text-gray-400">输出分辨率</span>
@@ -945,7 +996,7 @@ export default function ImageEditorPage() {
                 : '固定单张输出 · 保持主图比例'}
             </div>
 
-            <button type="button" onClick={() => void generate()} disabled={submitting || isRunning || !draft.sourceImageId || !draft.instruction.trim() || Boolean(profileError)} className="ios-button ios-button-filled mt-4 flex h-11 w-full items-center justify-center gap-2 px-4 text-sm font-semibold disabled:cursor-not-allowed">
+            <button type="button" onClick={() => void generate()} disabled={uploadingSource || submitting || isRunning || !draft.sourceImageId || !draft.instruction.trim() || Boolean(profileError)} className="ios-button ios-button-filled mt-4 flex h-11 w-full items-center justify-center gap-2 px-4 text-sm font-semibold disabled:cursor-not-allowed">
               {(submitting || isRunning) && <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />}
               {submitting ? '正在准备…' : isRunning ? '正在编辑…' : '开始图片编辑'}
             </button>
@@ -956,8 +1007,8 @@ export default function ImageEditorPage() {
       <section className="ios-material mt-5 overflow-hidden">
         <div className="flex items-center justify-between border-b border-[hsl(var(--separator))] px-4 py-3.5 sm:px-5">
           <div>
-            <h3 className="text-sm font-semibold text-gray-950 dark:text-gray-50">最近结果</h3>
-            <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">运行状态与单张编辑结果</p>
+            <h3 className="text-sm font-semibold text-gray-950 dark:text-gray-50">当前图片的编辑结果</h3>
+            <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">切换上方图片工作区，可查看各自的进度与结果</p>
           </div>
           {latestTask && <span className={`rounded-full px-2 py-1 text-[11px] font-semibold ${latestTask.status === 'done' ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-200' : latestTask.status === 'error' ? 'bg-red-50 text-red-700 dark:bg-red-400/10 dark:text-red-200' : 'bg-blue-50 text-blue-700 dark:bg-blue-400/10 dark:text-blue-200'}`}>{latestTask.status === 'done' ? '已完成' : latestTask.status === 'error' ? '失败' : '运行中'}</span>}
         </div>
