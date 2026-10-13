@@ -55,7 +55,6 @@ const ADD_CUSTOM_PROVIDER_VALUE = '__add_custom_provider__'
 const COPY_IMPORT_URL_OPTIONS_STORAGE_KEY = 'gpt-image-playground.copy-import-url-options'
 const LEGACY_DEFAULT_CHAT_MODEL = 'deepseek-v4-flash'
 const DEEPSEEK_PLANNER_NOTICE = '当前 AI 策划配置为 DeepSeek 官方接口。DeepSeek 策划阶段不会读取参考图，系统会仅用 Listing 文本和你填写的商品信息生成策划；参考图仍会在正式生图时随生图请求发送。请把产品颜色、形状、结构、配件、Logo、套装数量等关键特征写进 Listing 或商品信息中。'
-const WECHAT_OFFICIAL_ACCOUNT_NAME = '阿梨Aria早鸟报'
 
 const DEFAULT_COPY_IMPORT_URL_OPTIONS = {
   includeApiKey: false,
@@ -684,15 +683,6 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
     }
   }
 
-  const copyWechatOfficialAccountName = async () => {
-    try {
-      await copyTextToClipboard(WECHAT_OFFICIAL_ACCOUNT_NAME)
-      showToast('公众号名称已复制', 'success')
-    } catch (err) {
-      showToast(getClipboardFailureMessage('复制公众号名称失败', err), 'error')
-    }
-  }
-
   const confirmCopyProfileImportUrl = (profile: ApiProfile) => {
     setCopyImportUrlProfile(profile)
     setCopyImportUrlOptions(readCopyImportUrlOptions())
@@ -1206,17 +1196,16 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
             </svg>
           </span>
           <span>
-            不会配置？微信搜索公众号
-            <button
-              type="button"
-              onClick={() => void copyWechatOfficialAccountName()}
+            不会配置？去
+            <a
+              href="https://github.com/Atomic994/amazon-image-studio/blob/main/README.md"
+              target="_blank"
+              rel="noopener noreferrer"
               className="mx-1 rounded-sm font-semibold text-[hsl(var(--primary))] underline decoration-transparent underline-offset-2 transition hover:decoration-current focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--primary))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--ios-blue-tint))]"
-              aria-label={`复制公众号名称：${WECHAT_OFFICIAL_ACCOUNT_NAME}`}
-              title="点击复制公众号名称"
             >
-              {WECHAT_OFFICIAL_ACCOUNT_NAME}
-            </button>
-            查看配置教程。
+              GitHub 项目的 README
+            </a>
+            查看详细的配置教程。
           </span>
         </div>
 
@@ -2243,24 +2232,6 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
                   </div>
                 </div>
 
-                <div className="-mx-5 mt-3 shrink-0 border-t border-black/[0.06] bg-white/80 px-5 pb-2 pt-4 backdrop-blur-xl dark:border-white/[0.08] dark:bg-gray-900/80 sm:-mx-6 sm:px-6">
-                  <p className="mx-auto mb-3 max-w-[360px] text-center text-[13px] leading-relaxed text-gray-500 dark:text-gray-400">
-                    本项目的成长离不开每一位用户的使用、反馈、贡献与支持，感谢一路有你。
-                  </p>
-                  <div className="flex flex-wrap items-center justify-center gap-3">
-                    <a
-                      href="https://ifdian.net/a/Aria00"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center justify-center gap-2 whitespace-nowrap rounded-xl bg-gray-100/80 px-5 py-2.5 text-sm font-medium text-gray-700 transition-all hover:bg-gray-200 hover:text-gray-900 dark:bg-white/[0.06] dark:text-gray-300 dark:hover:bg-white/[0.1] dark:hover:text-white"
-                    >
-                      <svg className="h-4 w-4 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z" />
-                      </svg>
-                      赞助阿梨
-                    </a>
-                  </div>
-                </div>
               </div>
             )}
           </div>
