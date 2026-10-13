@@ -270,8 +270,14 @@ function getPlannerFailureDetail(err: unknown): string {
   if (/json_schema|schema|structured|text\.format|response_format|strict/.test(lower)) {
     hints.push('该接口可能不支持当前 JSON 输出参数；Chat Completions 需要支持 response_format=json_object。')
   }
-  if (/failed to fetch|network|cors|load failed|连接|网络|跨域/.test(lower)) {
+  if (/failed to fetch|network|cors|load failed|无法连接|连接失败|网络|跨域/.test(lower)) {
     hints.push('浏览器未能连接到策划接口；请检查网络、跨域设置，或确认部署端 API 代理配置。')
+  }
+  if (/502|503|504|524|openai_error|timeout|timed out|超时|完成前断开/.test(lower)) {
+    hints.push('中转或上游模型可能超时。策划已优先使用流式并自动重试；CLIProxyAPI 请启用 SSE 保活，反向代理请关闭流式缓冲并检查读取超时。只调大网页里的超时不能解决中转网关的超时。')
+  }
+  if (/max_output_tokens|length|输出不完整/.test(lower)) {
+    hints.push('模型输出被截断，未保存不完整的策划。请减少单次策划张数，或检查中转服务的输出长度限制。')
   }
 
   return [message, ...hints].join('\n\n')
@@ -453,6 +459,7 @@ export default function AmazonPlanner() {
   const [currentPlannerSessionId, setCurrentPlannerSessionId] = useState<string | null>(null)
   const [showPlannerHistory, setShowPlannerHistory] = useState(false)
   const [isPlanning, setIsPlanning] = useState(false)
+  const [plannerProgress, setPlannerProgress] = useState('')
   const [plannerError, setPlannerError] = useState('')
   const [isPreparingReferencePayload, setIsPreparingReferencePayload] = useState(false)
   const [referencePayloadNotice, setReferencePayloadNotice] = useState('')
@@ -1460,6 +1467,7 @@ export default function AmazonPlanner() {
     const controller = new AbortController()
     plannerAbortControllerRef.current = controller
     setIsPlanning(true)
+    setPlannerProgress('正在准备产品参考图…')
     setPlannerError('')
     try {
       const currentMarketplaceId = marketplaceId
@@ -1476,6 +1484,16 @@ export default function AmazonPlanner() {
         aPlusModuleSpecs: aPlusSpecs,
         aPlusGenerationTier: resolutionTier,
         signal: controller.signal,
+        onProgress: ({ phase, attempt, maxAttempts }) => {
+          if (plannerAbortControllerRef.current !== controller || controller.signal.aborted) return
+          const messages = {
+            connecting: attempt === 1 ? '正在等待 AI 开始策划…' : `正在重新请求策划（${attempt}/${maxAttempts}）…`,
+            receiving: '正在接收 AI 策划内容…',
+            retrying: `接口暂时未完成响应，即将重试（${attempt}/${maxAttempts}）…`,
+            fallback: '接口不支持流式，正在切换兼容模式…',
+          }
+          setPlannerProgress(messages[phase])
+        },
       })
       if (controller.signal.aborted) return
       applyPlannerResult(result, plannerMode === 'aplus' ? 'A+ AI 策划' : 'AI 策划')
@@ -1487,6 +1505,7 @@ export default function AmazonPlanner() {
       if (plannerAbortControllerRef.current === controller) {
         plannerAbortControllerRef.current = null
         setIsPlanning(false)
+        setPlannerProgress('')
       }
     }
   }
@@ -1497,6 +1516,7 @@ export default function AmazonPlanner() {
     controller.abort()
     plannerAbortControllerRef.current = null
     setIsPlanning(false)
+    setPlannerProgress('')
     showToast('AI 策划已停止', 'info')
   }
 
@@ -2167,6 +2187,11 @@ export default function AmazonPlanner() {
             <div className="mt-3 rounded-[var(--ios-radius-md)] bg-[hsl(var(--ios-blue-tint))] px-3 py-2 text-xs leading-relaxed text-[hsl(var(--primary))]">
               AI策划使用设置中的策划配置，生图配置保持不变。
             </div>
+            {isPlanning && plannerProgress && (
+              <div role="status" aria-live="polite" className="mt-3 text-xs leading-relaxed text-[hsl(var(--primary))]">
+                {plannerProgress}
+              </div>
+            )}
             {plannerUsesOfficialDeepSeek && (
               <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-800 dark:border-amber-400/25 dark:bg-amber-400/10 dark:text-amber-100">
                 {DEEPSEEK_PLANNER_NOTICE}

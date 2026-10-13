@@ -367,6 +367,8 @@ OpenRouter 生图模型不提供 OpenAI `/images/generations` 路径，应用会
 
 DeepSeek 示例：API URL 填 `https://api.deepseek.com`，API 接口选择 `Chat Completions (/chat/completions)`，模型填 `deepseek-v4-flash`。当前 DeepSeek 官方 Chat Completions 接口只接收文本内容，本项目检测到该地址时会自动跳过参考图，仅用 Listing 文本做 AI 策划。
 
+CLIProxyAPI / Codex 中转示例：API URL 填中转地址并保留 `/v1`，接口选择 `Chat Completions`，模型填中转实际提供的名称，例如 `gpt-6-sol` 或 `gpt-6.1-sol`。AI 策划默认使用流式请求，兼容仍返回普通 JSON 的中转；只有接口明确拒绝流式时才切换到非流式。图片生成的传输方式保持原有设置。
+
 ### 3. 反代 / OpenRouter 单连接模式
 
 如果你的反代或 OpenRouter 同一套 API URL / API Key 同时支持生图和聊天策划，可以在设置页顶部把 API 配置模式切到“反代或 OpenRouter 单连接”：
@@ -496,6 +498,33 @@ stop-amazon-image-studio.bat
 ### AI 策划失败
 
 检查“AI 策划配置”是否使用了文本接口，并确认模型不是图片生成模型。DeepSeek 请使用 `Chat Completions (/chat/completions)`；当前 DeepSeek 官方接口不接收参考图，本项目会自动跳过参考图。部分图片中转接口只开放 `/v1/images`，不支持聊天或 Responses 接口，这种情况下 AI 策划会失败。
+
+遇到 `HTTP 504: openai_error`、502/503、限流或流式连接中断时，应用会在配置的超时预算内最多请求 3 次（首次请求 + 2 次重试），以 1 秒、2 秒间隔重试；有 `Retry-After` 时优先使用该值，最多等待 30 秒。认证错误、无效请求、模型输出截断和 JSON 格式错误会直接显示详情。等待、接收和重试期间都可以点击“停止”，未完成的结果不会写入策划历史。
+
+策划一次需要返回多张图的中文说明、英文提示词和负面提示词，通常比短对话耗时更长。原先强制 `stream: false`，中转要等整套结果生成完才返回，容易触发网关的读取或空闲超时。[OpenAI 流式文档](https://developers.openai.com/api/docs/guides/streaming-responses)说明了长输出的流式传输方式。当前 Cloudflare 配置只托管前端静态资源，策划请求由浏览器直接发送到 API URL；网站部署在 Cloudflare 不代表 504 一定来自网站的 Worker，还需检查 CPA 上游及其反向代理。
+
+如果更新后仍有超时，请检查 CLIProxyAPI 服务端的 SSE 保活。根据 CPA 配置版本选择对应结构，以下配置用于中转服务器的配置文件，不是本项目的 `wrangler.jsonc`。
+
+使用 `config-version: 8` 的 CPA：
+
+```yaml
+requests:
+  streaming:
+    keepalive-seconds: 15
+    bootstrap-retries: 1
+    send-keepalive-before-ft: true
+```
+
+使用旧版根级配置的 CPA：
+
+```yaml
+streaming:
+  keepalive-seconds: 15
+  bootstrap-retries: 1
+  send-keepalive-before-ft: true
+```
+
+`send-keepalive-before-ft` 需要 CPA 版本支持，可在其[官方示例配置](https://github.com/router-for-me/CLIProxyAPI/blob/main/config.example.yaml)中核对；该项让中转在首个内容返回前也发送心跳。其他字段见[官方配置说明](https://help.router-for.me/configuration/options)。若使用 Nginx 或其他反向代理，还应关闭 SSE 响应缓冲，检查读取超时是否足够。单独增加网页里的超时无法延长中转或上游网关自己的超时限制；持续失败时请查看 CPA 请求日志，必要时减少单次策划张数。
 
 ### 生图失败
 

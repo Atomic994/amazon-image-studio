@@ -1,5 +1,5 @@
 import type { ApiProfile } from '../types'
-import { DEFAULT_CHAT_MODEL, DEFAULT_RESPONSES_MODEL, isOfficialDeepSeekPlannerProfile } from './apiProfiles'
+import { DEFAULT_API_TIMEOUT, DEFAULT_CHAT_MODEL, DEFAULT_RESPONSES_MODEL, isOfficialDeepSeekPlannerProfile } from './apiProfiles'
 import { formatAmazonAPlusReferenceMaterial, formatAmazonListingReferenceMaterial } from './amazonKnowledge'
 import {
   getAmazonMarketplace,
@@ -7,7 +7,7 @@ import {
   type AmazonMarketplaceId,
 } from './amazonMarketplaces'
 import { buildApiUrl, readClientDevProxyConfig, shouldUseApiProxy } from './devProxy'
-import { getApiErrorMessage } from './imageApiShared'
+import { createLinkedAbortController } from './imageApiShared'
 import type { AmazonPromptDraft } from './amazonPrompt'
 import {
   DEFAULT_LISTING_IMAGE_COUNT,
@@ -24,7 +24,7 @@ import {
   type AmazonPlannerMode,
   type ListingParseResult,
 } from './listingPlanner'
-import { isEventStreamResponse, looksLikeServerSentEvents, readJsonServerSentEvents, readJsonServerSentEventText } from './serverSentEvents'
+import { assertSuccessfulStreamEvent, isEventStreamResponse, looksLikeServerSentEvents, readJsonServerSentEvents, readJsonServerSentEventText, ServerSentEventError } from './serverSentEvents'
 import type { SizeTier } from './size'
 
 interface PlannerApiPayload {
@@ -60,6 +60,73 @@ export interface PlannerApiResult {
   plans: AmazonImagePlan[]
   aPlusPlans: AmazonAPlusPlan[]
   aPlusType?: APlusContentType
+}
+
+export interface PlannerApiProgress {
+  phase: 'connecting' | 'receiving' | 'retrying' | 'fallback'
+  attempt: number
+  maxAttempts: number
+}
+
+const MAX_PLANNER_ATTEMPTS = 3
+
+class PlannerHttpError extends Error {
+  constructor(message: string, public readonly status: number, public readonly retryAfterMs?: number, public readonly code?: string) {
+    super(message)
+    this.name = 'PlannerHttpError'
+  }
+}
+
+async function readPlannerHttpError(response: Response): Promise<PlannerHttpError> {
+  // Read once: response.json() consumes even a non-JSON gateway error body.
+  const rawText = await response.text()
+  let message = truncateForError(rawText) || response.statusText
+  let code: string | undefined
+  try {
+    const payload: unknown = JSON.parse(rawText)
+    if (isRecordValue(payload)) {
+      const error = payload.error
+      code = isRecordValue(error) ? getStringValue(error, 'code') ?? getStringValue(error, 'type') : undefined
+      message = (isRecordValue(error) ? getStringValue(error, 'message') ?? code : typeof error === 'string' ? error : undefined)
+        ?? getStringValue(payload, 'message') ?? getStringValue(payload, 'detail') ?? message
+    }
+  } catch { /* Plain-text and HTML gateway errors are also useful diagnostics. */ }
+  const retryAfter = response.headers.get('Retry-After')
+  const seconds = retryAfter?.trim() ? Number(retryAfter) : NaN
+  const delay = Number.isFinite(seconds)
+    ? seconds * 1000
+    : retryAfter ? Date.parse(retryAfter) - Date.now() : NaN
+  const retryAfterMs = Number.isFinite(delay) ? Math.min(30_000, Math.max(0, delay)) : undefined
+  return new PlannerHttpError(`HTTP ${response.status}: ${message}`, response.status, retryAfterMs, code)
+}
+
+function isRetryablePlannerError(error: unknown): boolean {
+  if (error instanceof PlannerHttpError) {
+    if (/insufficient_quota|invalid_api_key|authentication|permission/i.test(error.code ?? '')) return false
+    return [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524].includes(error.status)
+  }
+  if (error instanceof ServerSentEventError) {
+    if (/insufficient_quota|invalid_api_key|authentication|permission/i.test(error.code ?? '')) return false
+    return /^(server_error|internal_server_error|openai_error|rate_limit_exceeded|rate_limit_error|overloaded_error|stream_disconnected|empty_response)$/.test(error.code ?? '')
+      || /\b(?:408|429|500|502|503|504|524)\b|openai_error|timed? out|timeout|overloaded|temporarily unavailable|stream disconnected/i.test(error.message)
+  }
+  return error instanceof Error && /failed to fetch|fetch failed|networkerror|network request failed|load failed|terminated|connection reset/i.test(error.message)
+}
+
+function waitForPlannerRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted()
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+      reject(signal.reason)
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, delayMs)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 const PRODUCT_SCHEMA = {
@@ -277,54 +344,71 @@ function getPlannerTextFromEvent(event: Record<string, unknown>): string {
   return ''
 }
 
-async function readPlannerTextFromSseResponse(response: Response): Promise<string> {
+function createPlannerStreamCollector(onReceiving?: () => void) {
   let completedText = ''
   let outputItemText = ''
   let doneText = ''
   let deltaText = ''
+  let completed = false
+  let receiving = false
 
-  await readJsonServerSentEvents(response, (event) => {
+  const notifyReceiving = () => {
+    if (receiving) return
+    receiving = true
+    onReceiving?.()
+  }
+  const onEvent = (event: Record<string, unknown>): void | false => {
     const type = getStringValue(event, 'type')
     if (type === 'response.output_text.delta') {
       deltaText += getStringValue(event, 'delta') ?? ''
+      if (deltaText) notifyReceiving()
+      return
+    }
+
+    // Chat deltas must retain whitespace, including chunks containing only a space.
+    // Reasoning deltas are not part of the JSON answer.
+    if (Array.isArray(event.choices)) {
+      const choice = event.choices.find((item) => isRecordValue(item) && item.index === 0) ?? event.choices[0]
+      if (!isRecordValue(choice)) return
+      if (isRecordValue(choice.delta) && typeof choice.delta.content === 'string') {
+        deltaText += choice.delta.content
+        if (deltaText) notifyReceiving()
+      } else if (isRecordValue(choice.message) && typeof choice.message.content === 'string') {
+        completedText = choice.message.content
+        if (completedText) notifyReceiving()
+      }
+      const finishReason = getStringValue(choice, 'finish_reason')
+      if (finishReason && finishReason !== 'stop') {
+        throw new ServerSentEventError(`AI 策划输出未正常完成：${finishReason}`, finishReason)
+      }
+      if (finishReason === 'stop') {
+        completed = true
+        return false
+      }
       return
     }
 
     const text = getPlannerTextFromEvent(event)
-    if (!text) return
-
-    if (type === 'response.completed') completedText = text
-    else if (type === 'response.output_item.done') outputItemText = text
-    else if (type === 'response.output_text.done' || type === 'response.content_part.done') doneText = text
-    else if (!type) deltaText += text
-  })
-
-  return completedText.trim() || outputItemText.trim() || doneText.trim() || deltaText.trim()
-}
-
-async function readPlannerTextFromSseText(rawText: string): Promise<string> {
-  let completedText = ''
-  let outputItemText = ''
-  let doneText = ''
-  let deltaText = ''
-
-  await readJsonServerSentEventText(rawText, (event) => {
-    const type = getStringValue(event, 'type')
-    if (type === 'response.output_text.delta') {
-      deltaText += getStringValue(event, 'delta') ?? ''
-      return
+    if (text) notifyReceiving()
+    if (type === 'response.completed') {
+      completedText = text
+      completed = true
+      return false
     }
-
-    const text = getPlannerTextFromEvent(event)
-    if (!text) return
-
-    if (type === 'response.completed') completedText = text
     else if (type === 'response.output_item.done') outputItemText = text
     else if (type === 'response.output_text.done' || type === 'response.content_part.done') doneText = text
     else if (!type) deltaText += text
-  })
-
-  return completedText.trim() || outputItemText.trim() || doneText.trim() || deltaText.trim()
+  }
+  return {
+    onEvent,
+    onDone: () => { completed = true },
+    getText: () => {
+      if (!completed) throw new ServerSentEventError('AI 策划流式连接在完成前断开，未收到完成标记', 'stream_disconnected')
+      const text = completedText.trim() || outputItemText.trim() || doneText.trim() || deltaText.trim()
+      if (!text) throw new ServerSentEventError('AI 策划流式接口未返回文本内容', 'empty_response')
+      return text
+    }
+  }
 }
 
 function isJsonContentType(contentType: string): boolean {
@@ -337,20 +421,20 @@ function truncateForError(text: string): string {
   return `${trimmed.slice(0, 1200)}...`
 }
 
-async function readPlannerResponseText(response: Response): Promise<string> {
+async function readPlannerResponseText(response: Response, signal: AbortSignal, onReceiving?: () => void): Promise<string> {
   if (isEventStreamResponse(response)) {
-    const text = await readPlannerTextFromSseResponse(response)
-    if (!text) throw new Error('AI 策划流式接口未返回文本内容')
-    return text
+    const collector = createPlannerStreamCollector(onReceiving)
+    await readJsonServerSentEvents(response, collector.onEvent, { signal, onDone: collector.onDone })
+    return collector.getText()
   }
 
   const rawText = await response.text()
   if (!rawText.trim()) throw new Error('AI 策划接口返回空内容')
 
   if (looksLikeServerSentEvents(rawText)) {
-    const text = await readPlannerTextFromSseText(rawText)
-    if (!text) throw new Error('AI 策划流式接口未返回文本内容')
-    return text
+    const collector = createPlannerStreamCollector(onReceiving)
+    await readJsonServerSentEventText(rawText, collector.onEvent, { signal, onDone: collector.onDone })
+    return collector.getText()
   }
 
   const contentType = response.headers.get('Content-Type')?.toLowerCase() ?? ''
@@ -366,8 +450,17 @@ async function readPlannerResponseText(response: Response): Promise<string> {
     throw new Error(`AI 策划接口返回了无法解析的 JSON：${message}\n\n${truncateForError(rawText)}`)
   }
 
+  if (isRecordValue(payload)) {
+    assertSuccessfulStreamEvent(payload)
+    if (Array.isArray(payload.choices)) {
+      const choice = payload.choices[0]
+      const reason = isRecordValue(choice) ? getStringValue(choice, 'finish_reason') : undefined
+      if (reason && reason !== 'stop') throw new ServerSentEventError(`AI 策划输出未正常完成：${reason}`, reason)
+    }
+  }
   const text = extractResponseText(payload)
   if (!text) throw new Error('AI 策划接口未返回文本内容')
+  onReceiving?.()
   return text
 }
 
@@ -743,6 +836,7 @@ export async function callAmazonPlannerApi(options: {
   aPlusModuleSpecs?: Array<Partial<AmazonAPlusModuleSpec>>
   aPlusGenerationTier?: SizeTier
   signal?: AbortSignal
+  onProgress?: (progress: PlannerApiProgress) => void
 }): Promise<PlannerApiResult> {
   const model = options.model?.trim() || options.profile.model.trim() || (options.profile.apiMode === 'chat' ? DEFAULT_CHAT_MODEL : DEFAULT_RESPONSES_MODEL)
   const mode = options.mode ?? 'listing'
@@ -766,19 +860,10 @@ export async function callAmazonPlannerApi(options: {
   const referenceImageDataUrls = isDeepSeekPlannerProfile
     ? []
     : options.referenceImageDataUrls ?? []
-  const response = await fetch(
-    useChatCompletions
-      ? buildApiUrl(options.profile.baseUrl, 'chat/completions', proxyConfig, useApiProxy, { prefixV1: false })
-      : buildApiUrl(options.profile.baseUrl, 'responses', proxyConfig, useApiProxy),
-    {
-    method: 'POST',
-    signal: options.signal,
-    headers: {
-      Authorization: `Bearer ${options.profile.apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    cache: 'no-store',
-    body: JSON.stringify(useChatCompletions
+  const url = useChatCompletions
+    ? buildApiUrl(options.profile.baseUrl, 'chat/completions', proxyConfig, useApiProxy, { prefixV1: false })
+    : buildApiUrl(options.profile.baseUrl, 'responses', proxyConfig, useApiProxy)
+  const body = useChatCompletions
       ? {
           model,
           messages: [
@@ -797,7 +882,7 @@ export async function callAmazonPlannerApi(options: {
             },
           ],
           response_format: { type: 'json_object' },
-          stream: false,
+          stream: true,
         }
       : {
           model,
@@ -816,19 +901,65 @@ export async function callAmazonPlannerApi(options: {
               schema,
             },
           },
-          stream: false,
-        },
-    ),
-    },
-  )
-
-  if (!response.ok) {
-    const message = await getApiErrorMessage(response)
-    throw new Error(`HTTP ${response.status}: ${message}`)
+          stream: true,
+        }
+  const timeoutSeconds = Number.isFinite(options.profile.timeout) && options.profile.timeout > 0
+    ? options.profile.timeout : DEFAULT_API_TIMEOUT
+  // One budget covers connection, body reads, retries, and backoff together.
+  const linked = createLinkedAbortController(timeoutSeconds, options.signal)
+  const signal = linked.controller.signal
+  try {
+    for (let attempt = 1; attempt <= MAX_PLANNER_ATTEMPTS; attempt++) {
+      signal.throwIfAborted()
+      options.onProgress?.({ phase: 'connecting', attempt, maxAttempts: MAX_PLANNER_ATTEMPTS })
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          signal,
+          headers: {
+            Authorization: `Bearer ${options.profile.apiKey}`,
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream, application/json',
+          },
+          cache: 'no-store',
+          body: JSON.stringify(body),
+        })
+        if (!response.ok) throw await readPlannerHttpError(response)
+        const text = await readPlannerResponseText(response, signal, () => {
+          options.onProgress?.({ phase: 'receiving', attempt, maxAttempts: MAX_PLANNER_ATTEMPTS })
+        })
+        signal.throwIfAborted()
+        const payload = parsePlannerPayload(text)
+        return mode === 'aplus'
+          ? normalizeAPlusPlannerApiPayload(payload, aPlusType, aPlusGenerationTier, aPlusModuleSpecs, marketplaceId)
+          : normalizeListingPlannerApiPayload(payload, listingImageCount, marketplaceId)
+      } catch (err) {
+        signal.throwIfAborted()
+        const streamUnsupported = body.stream && err instanceof PlannerHttpError && [400, 422].includes(err.status)
+          && /stream/i.test(err.message) && /not support|unsupported|not allowed|must be false/i.test(err.message)
+        if (!streamUnsupported && !isRetryablePlannerError(err)) throw err
+        if (attempt === MAX_PLANNER_ATTEMPTS) {
+          const message = err instanceof Error ? err.message : String(err)
+          throw new Error(`${message}\n\nAI 策划已尝试 ${attempt} 次，接口仍未成功返回完整结果。`)
+        }
+        options.onProgress?.({ phase: streamUnsupported ? 'fallback' : 'retrying', attempt: attempt + 1, maxAttempts: MAX_PLANNER_ATTEMPTS })
+        if (streamUnsupported) {
+          // Fall back only for an explicit unsupported-stream error, never for a timeout.
+          body.stream = false
+        } else {
+          const delayMs = err instanceof PlannerHttpError ? err.retryAfterMs : undefined
+          await waitForPlannerRetry(delayMs ?? 1000 * 2 ** (attempt - 1), signal)
+        }
+      }
+    }
+    throw new Error('AI 策划接口未返回结果')
+  } catch (err) {
+    if (options.signal?.aborted) throw options.signal.reason ?? err
+    if (signal.aborted) {
+      throw new Error(`AI 策划请求超时（${timeoutSeconds} 秒，包含自动重试）。请检查中转服务的流式保活和上游响应，或减少单次策划张数。`)
+    }
+    throw err
+  } finally {
+    linked.cleanup()
   }
-  const text = await readPlannerResponseText(response)
-  const payload = parsePlannerPayload(text)
-  return mode === 'aplus'
-    ? normalizeAPlusPlannerApiPayload(payload, aPlusType, aPlusGenerationTier, aPlusModuleSpecs, marketplaceId)
-    : normalizeListingPlannerApiPayload(payload, listingImageCount, marketplaceId)
 }

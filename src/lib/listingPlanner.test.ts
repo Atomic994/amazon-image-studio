@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   DEFAULT_CHAT_MODEL,
   DEFAULT_IMAGES_MODEL,
@@ -36,6 +36,7 @@ const SAMPLE_LISTING = [
 ].join('\n')
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
 })
 
@@ -344,6 +345,278 @@ function createAPlusPayloadFromSpecs(specs: ReturnType<typeof getAPlusModuleSpec
   }
 }
 
+function createPlannerRequest(apiMode: 'chat' | 'responses' = 'chat', model = 'gpt-6.1-sol') {
+  return {
+    listingText: SAMPLE_LISTING,
+    baseDraft: DEFAULT_AMAZON_PROMPT_DRAFT,
+    profile: createDefaultOpenAIProfile({ baseUrl: 'https://relay.example.com:81/v1', apiKey: 'test-key', apiMode, model }),
+  }
+}
+
+function createSseResponse(events: unknown[], contentType = 'text/event-stream') {
+  return new Response(events.map((event) => `data: ${event === '[DONE]' ? event : JSON.stringify(event)}\r\n\r\n`).join(''), {
+    headers: { 'Content-Type': contentType },
+  })
+}
+
+function createChatPlannerResponse(title = 'Recovered planner') {
+  return createSseResponse([
+    { choices: [{ index: 0, delta: { content: JSON.stringify(createApiPayload(title)) }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+    '[DONE]',
+  ])
+}
+
+describe('planner streaming and transient failure recovery', () => {
+  beforeEach(() => { vi.useFakeTimers() })
+
+  it.each(['gpt-6-sol', 'gpt-6.1-sol'])('streams Chat Completions with %s and preserves spaces and Chinese split across deltas', async (model) => {
+    const payload = createApiPayload('Cold for 24 hours 保温杯')
+    const events = JSON.stringify(payload).split(/( )/).map((content) => ({ choices: [{ index: 0, delta: { content }, finish_reason: null }] }))
+    const fetchMock = vi.fn(async () => createSseResponse([
+      { choices: [{ index: 0, delta: { reasoning_content: 'Do not put reasoning in the JSON.' } }] },
+      ...events,
+      '[DONE]',
+    ]))
+    vi.stubGlobal('fetch', fetchMock)
+    const onProgress = vi.fn()
+    const result = await callAmazonPlannerApi({ ...createPlannerRequest('chat', model), onProgress })
+    expect(result.parsed.title).toBe(payload.product.title)
+    expect(result.plans).toEqual(payload.imagePlans)
+    const [url, init] = (fetchMock.mock.calls as unknown as [string, RequestInit][])[0]!
+    expect(url).toBe('https://relay.example.com:81/v1/chat/completions')
+    expect(JSON.parse(String(init.body))).toMatchObject({ model, stream: true, response_format: { type: 'json_object' } })
+    expect(onProgress.mock.calls.map(([progress]) => progress.phase)).toEqual(['connecting', 'receiving'])
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('uses the Responses completed snapshot without duplicating deltas and done events', async () => {
+    const text = JSON.stringify(createApiPayload('Responses streamed plan'))
+    vi.stubGlobal('fetch', vi.fn(async () => createSseResponse([
+      { type: 'response.created', response: { status: 'in_progress' } },
+      { type: 'response.output_text.delta', delta: text.slice(0, 30) },
+      { type: 'response.output_text.delta', delta: text.slice(30) },
+      { type: 'response.output_text.done', text },
+      { type: 'response.output_item.done', item: { content: [{ type: 'output_text', text }] } },
+      { type: 'response.completed', response: { status: 'completed', output_text: text } },
+    ])))
+    const result = await callAmazonPlannerApi(createPlannerRequest('responses'))
+    expect(result.parsed.title).toBe('Responses streamed plan')
+    expect(result.plans).toHaveLength(7)
+  })
+
+  it('accepts SSE returned with a JSON content type by a relay', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => createSseResponse([
+      { choices: [{ index: 0, delta: { content: JSON.stringify(createApiPayload('Mislabeled SSE')) } }] },
+      '[DONE]',
+    ], 'application/json')))
+    expect((await callAmazonPlannerApi(createPlannerRequest())).parsed.title).toBe('Mislabeled SSE')
+  })
+
+  it('recovers from HTTP 504 openai_error while keeping the request streamed', async () => {
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'openai_error' } }), { status: 504 }))
+      .mockImplementationOnce(async () => createChatPlannerResponse())
+    vi.stubGlobal('fetch', fetchMock)
+    const onProgress = vi.fn()
+    const resultPromise = callAmazonPlannerApi({ ...createPlannerRequest(), onProgress })
+    await vi.advanceTimersByTimeAsync(1000)
+    expect((await resultPromise).parsed.title).toBe('Recovered planner')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).stream)).toEqual([true, true])
+    expect(onProgress).toHaveBeenCalledWith({ phase: 'retrying', attempt: 2, maxAttempts: 3 })
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('honors Retry-After for rate limiting', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('rate limited', { status: 429, headers: { 'Retry-After': '5' } }))
+      .mockImplementationOnce(async () => createChatPlannerResponse())
+    vi.stubGlobal('fetch', fetchMock)
+    const pending = callAmazonPlannerApi(createPlannerRequest())
+    await vi.advanceTimersByTimeAsync(4999)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await pending
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('recovers from a transient network connection failure', async () => {
+    const fetchMock = vi.fn().mockRejectedValueOnce(new TypeError('Failed to fetch')).mockImplementationOnce(async () => createChatPlannerResponse())
+    vi.stubGlobal('fetch', fetchMock)
+    const pending = callAmazonPlannerApi(createPlannerRequest())
+    await vi.advanceTimersByTimeAsync(1000)
+    expect((await pending).parsed.title).toBe('Recovered planner')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('recovers A+ planning from a gateway timeout with a complete streamed module set', async () => {
+    const payload = createAPlusPayload('A+S', 'Recovered A+ plan', 'ExampleBrand')
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response('openai_error', { status: 504 }))
+      .mockResolvedValueOnce(createSseResponse([
+        { choices: [{ delta: { content: JSON.stringify(payload) }, finish_reason: 'stop' }] },
+      ]))
+    vi.stubGlobal('fetch', fetchMock)
+    const pending = callAmazonPlannerApi({ ...createPlannerRequest(), mode: 'aplus', aPlusType: 'standard' })
+    await vi.advanceTimersByTimeAsync(1000)
+    const result = await pending
+    expect(result.parsed.title).toBe('Recovered A+ plan')
+    expect(result.aPlusPlans).toHaveLength(payload.aPlusPlans.length)
+    expect(result.aPlusPlans[0]?.uploadSize).toBe('970x300')
+  })
+
+  it('handles relay error envelopes returned with HTTP 200', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'openai_error', message: 'Temporary upstream failure' } })))
+      .mockImplementationOnce(async () => createChatPlannerResponse())
+    vi.stubGlobal('fetch', fetchMock)
+    const pending = callAmazonPlannerApi(createPlannerRequest())
+    await vi.advanceTimersByTimeAsync(1000)
+    await pending
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('stops after three failures and preserves a plain-text gateway error', async () => {
+    const fetchMock = vi.fn(async () => new Response('Gateway timed out at upstream', { status: 504 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const assertion = expect(callAmazonPlannerApi(createPlannerRequest())).rejects.toThrow('HTTP 504: Gateway timed out at upstream\n\nAI 策划已尝试 3 次')
+    await vi.advanceTimersByTimeAsync(3000)
+    await assertion
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each([400, 401, 403, 404])('does not retry non-transient HTTP %s errors', async (status) => {
+    const fetchMock = vi.fn(async () => new Response('invalid request', { status }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(callAmazonPlannerApi(createPlannerRequest())).rejects.toThrow(`HTTP ${status}`)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('does not retry exhausted quota even with HTTP 429', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: { code: 'insufficient_quota', message: 'Quota exhausted' } }), { status: 429 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(callAmazonPlannerApi(createPlannerRequest())).rejects.toThrow('Quota exhausted')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls back to JSON only when the endpoint explicitly rejects streaming', async () => {
+    const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'stream is not supported' } }), { status: 400 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(createApiPayload('Compatible endpoint')) }, finish_reason: 'stop' }] })))
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await callAmazonPlannerApi(createPlannerRequest())
+    expect(result.parsed.title).toBe('Compatible endpoint')
+    expect(fetchMock.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).stream)).toEqual([true, false])
+  })
+
+  it('discards a failed Responses stream even when it already contains valid planning JSON', async () => {
+    const failedStream = createSseResponse([
+      { type: 'response.output_text.delta', delta: JSON.stringify(createApiPayload('Discard this plan')) },
+      { type: 'response.failed', response: { status: 'failed', error: { code: 'openai_error', message: 'Upstream temporarily unavailable' } } },
+    ])
+    const fetchMock = vi.fn().mockResolvedValueOnce(failedStream).mockResolvedValueOnce(createSseResponse([
+      { type: 'response.completed', response: { output_text: JSON.stringify(createApiPayload('Complete retry')) } },
+    ]))
+    vi.stubGlobal('fetch', fetchMock)
+    const pending = callAmazonPlannerApi(createPlannerRequest('responses'))
+    await vi.advanceTimersByTimeAsync(1000)
+    expect((await pending).parsed.title).toBe('Complete retry')
+    expect(failedStream.body?.locked).toBe(false)
+  })
+
+  it('retries a stream that closes without a terminal event instead of accepting partial output', async () => {
+    const fetchMock = vi.fn().mockImplementationOnce(async () => createSseResponse([
+      { choices: [{ delta: { content: JSON.stringify(createApiPayload('Unconfirmed plan')) } }] },
+    ])).mockImplementationOnce(async () => createChatPlannerResponse('Confirmed plan'))
+    vi.stubGlobal('fetch', fetchMock)
+    const pending = callAmazonPlannerApi(createPlannerRequest())
+    await vi.advanceTimersByTimeAsync(1000)
+    expect((await pending).parsed.title).toBe('Confirmed plan')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['length', 'content_filter'])('rejects Chat output ending with %s without retrying', async (finishReason) => {
+    const fetchMock = vi.fn(async () => createSseResponse([
+      { choices: [{ delta: { content: JSON.stringify(createApiPayload()) }, finish_reason: finishReason }] },
+    ]))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(callAmazonPlannerApi(createPlannerRequest())).rejects.toThrow(finishReason)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('surfaces incomplete Responses output instead of parsing it as a successful plan', async () => {
+    const fetchMock = vi.fn(async () => createSseResponse([
+      { type: 'response.incomplete', response: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output_text: JSON.stringify(createApiPayload()) } },
+    ]))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(callAmazonPlannerApi(createPlannerRequest('responses'))).rejects.toThrow('max_output_tokens')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not retry a malformed planner JSON answer', async () => {
+    const fetchMock = vi.fn(async () => createSseResponse([{ choices: [{ delta: { content: '{not JSON' }, finish_reason: 'stop' }] }]))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(callAmazonPlannerApi(createPlannerRequest())).rejects.toBeInstanceOf(SyntaxError)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('allows cancellation during backoff without sending another request', async () => {
+    const controller = new AbortController()
+    const fetchMock = vi.fn(async () => new Response('openai_error', { status: 504 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const pending = callAmazonPlannerApi({ ...createPlannerRequest(), signal: controller.signal })
+    const assertion = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    await vi.advanceTimersByTimeAsync(0)
+    controller.abort()
+    await assertion
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('cancels and unlocks a stalled stream immediately when the user stops planning', async () => {
+    const controller = new AbortController()
+    const cancel = vi.fn()
+    const stream = new ReadableStream<Uint8Array>({ cancel })
+    const fetchMock = vi.fn(async () => new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const assertion = expect(callAmazonPlannerApi({ ...createPlannerRequest(), signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
+    await vi.advanceTimersByTimeAsync(0)
+    controller.abort()
+    await assertion
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(stream.locked).toBe(false)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('uses one timeout budget across retries and reports timeout as an error', async () => {
+    const cancel = vi.fn()
+    const request = createPlannerRequest()
+    request.profile.timeout = 2
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response('openai_error', { status: 504 }))
+      .mockImplementationOnce(async () => new Response(new ReadableStream({ cancel }), { headers: { 'Content-Type': 'text/event-stream' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const assertion = expect(callAmazonPlannerApi(request)).rejects.toThrow('AI 策划请求超时（2 秒，包含自动重试）')
+    await vi.advanceTimersByTimeAsync(2000)
+    await assertion
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(cancel).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('does not issue a request with an already cancelled signal', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(callAmazonPlannerApi({ ...createPlannerRequest(), signal: controller.signal })).rejects.toMatchObject({ name: 'AbortError' })
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+})
+
 describe('callAmazonPlannerApi', () => {
   it('uses Responses API planning with JSON schema and attached reference images', async () => {
     const apiPayload = createApiPayload()
@@ -371,8 +644,10 @@ describe('callAmazonPlannerApi', () => {
 
     const [url, init] = fetchMock.mock.calls[0]!
     expect(url).toBe('https://api.example.com/v1/responses')
-    expect(init?.signal).toBe(controller.signal)
+    expect(init?.signal).toBeInstanceOf(AbortSignal)
+    expect(init?.signal?.aborted).toBe(false)
     const body = JSON.parse(String(init?.body))
+    expect(body.stream).toBe(true)
     expect(body.instructions).toContain('The application only fixes the slot count and order')
     expect(body.instructions).toContain('Target marketplace: 美国站 (Amazon.com, locale en-US).')
     expect(body.instructions).toContain('on-image US-English copy')
@@ -670,6 +945,7 @@ describe('callAmazonPlannerApi', () => {
       image_url: { url: 'data:image/png;base64,ref-chat' },
     })
     expect(body.response_format).toEqual({ type: 'json_object' })
+    expect(body.stream).toBe(true)
     expect(result.parsed.title).toBe('Chat planned tumbler')
     expect(result.marketplaceId).toBe('us')
     expect(result.plans).toHaveLength(7)
