@@ -4,26 +4,26 @@
 
 它适合用来把产品标题、五点描述、卖点文案和参考图，整理成 Amazon Listing 图片或 A+ Content 图片策划，并逐张生成图片。
 
-项目仓库：[Ali-Aria/amazon-image-studio](https://github.com/Ali-Aria/amazon-image-studio)
+项目仓库：[Atomic994/amazon-image-studio](https://github.com/Atomic994/amazon-image-studio)，当前版本由 Atomic994 维护。
 
 ## 开源说明
 
 > [!IMPORTANT]
 > **开源与第三方收费说明**
 >
-> 亚马逊图片工作台是免费开源软件，请以本项目的 [GitHub 仓库](https://github.com/Ali-Aria/amazon-image-studio) 作为官方核验入口。本项目采用 MIT License，允许商业使用、分发和售卖软件副本，但必须保留版权与许可声明。
+> 本项目基于开源软件修改，请以当前版本的 [GitHub 仓库](https://github.com/Atomic994/amazon-image-studio) 作为核验入口。本项目采用 MIT License，允许商业使用、分发和售卖软件副本，但必须保留版权与许可声明。
 >
-> 第三方收取的费用只代表其自行提供的部署、定制、培训或技术支持，不代表购买了本软件、获得独家授权，也不代表 Ali-Aria 官方服务。请警惕“官方付费版”“独家授权版”“买断后永久官方更新”等误导性表述。
+> 第三方收取的费用只代表其自行提供的部署、定制、培训或技术支持，不代表购买了本软件、获得独家授权，也不代表 Atomic994 提供或认可的服务。请警惕“官方付费版”“独家授权版”“买断后永久官方更新”等误导性表述。
 >
-> 如发现冒充官方、删除署名或隐瞒开源来源的售卖行为，请通过 [GitHub Issues](https://github.com/Ali-Aria/amazon-image-studio/issues) 反馈。
+> 如发现冒充官方、删除署名或隐瞒开源来源的售卖行为，请通过 [GitHub Issues](https://github.com/Atomic994/amazon-image-studio/issues) 反馈。
 
-本仓库公开的是前端应用源码、Amazon 图片策划逻辑、Prompt 模板、知识文档、本地启动脚本和部署配置，采用 [MIT License](LICENSE) 发布。
+本仓库包含前端应用源码、Amazon 图片策划逻辑、Prompt 模板、知识文档、本地启动脚本和部署配置，采用 [MIT License](LICENSE)。
 
 需要注意：
 
 - Codex / Claude Code / OpenClaw 只是可选的安装助手，不是项目运行依赖；不用 AI 编程工具也可以按下面的手动方式本地运行。
 - 在线体验和本地应用都不会内置 API Key。生成图片和 AI 策划需要使用者填写自己的 OpenAI、火山方舟或兼容接口 Key，并自行承担调用费用。
-- `package.json` 中的 `"private": true` 仅用于防止误发布到 npm，不代表 GitHub 仓库私有，也不影响源码开源。
+- `package.json` 中的 `"private": true` 仅用于防止误发布到 npm，不会自动改变 GitHub 仓库的可见性或许可证。
 
 ## 更新日志
 
@@ -196,7 +196,7 @@
 
 ## 在线体验
 
-- 体验地址：[https://ali-aria.github.io/amazon-image-studio/](https://ali-aria.github.io/amazon-image-studio/)
+- 上游版本体验地址：[https://ali-aria.github.io/amazon-image-studio/](https://ali-aria.github.io/amazon-image-studio/)；当前版本请打开自己的 Cloudflare 部署地址。
 - 打开在线体验不需要 Codex；Codex 只是一种可选的本地安装方式。
 - 在线体验不会内置 API Key；生成图片和 AI 策划都需要在右上角设置中填写你自己的 OpenAI 或兼容接口 Key。
 - “安装为应用”也可以用于本地版，但它不会自动启动本地服务；以后每次启动本地应用前，请先运行项目目录中的 `start-amazon-image-studio.bat`。
@@ -246,14 +246,14 @@ npm --version
 如果你要把项目发给别人使用，最简单的方式是直接发 GitHub 仓库链接：
 
 ```text
-https://github.com/Ali-Aria/amazon-image-studio
+https://github.com/Atomic994/amazon-image-studio
 ```
 
 对方可以在 Codex、Claude Code、Claw Code 或其它 AI 编程工具里粘贴下面这段话：
 
 ```text
 请把这个 GitHub 项目安装到我的本地电脑并启动：
-https://github.com/Ali-Aria/amazon-image-studio
+https://github.com/Atomic994/amazon-image-studio
 
 要求：
 1. 先确认本机已经安装 Node.js 20 LTS 或更新版本和 npm。
@@ -271,7 +271,7 @@ https://github.com/Ali-Aria/amazon-image-studio
 先把仓库下载到本地：
 
 ```powershell
-git clone https://github.com/Ali-Aria/amazon-image-studio.git
+git clone https://github.com/Atomic994/amazon-image-studio.git
 cd amazon-image-studio
 ```
 
@@ -566,7 +566,7 @@ dist/
 Install command: npm ci
 Build command: npm run build
 Output directory: dist
-Node.js version: 20
+Node.js version: 22
 ```
 
 ### GitHub Pages
@@ -585,30 +585,80 @@ Node.js version: 20
 
 项目的 Vite `base` 已设置为 `./`，可以部署在 `https://<username>.github.io/amazon-image-studio/` 这类子路径下。
 
-当前仓库的 GitHub Pages 体验地址：
+GitHub Pages 部署后的地址格式：
 
 ```text
-https://ali-aria.github.io/amazon-image-studio/
+https://<username>.github.io/amazon-image-studio/
 ```
 
-### Cloudflare Pages
+### Cloudflare（Workers / Pages）
 
-连接 GitHub 仓库后，按以下方式配置：
+#### 1. 部署方式与项目结构
+
+本项目支持 **Workers 静态资源部署**和 **Pages 部署**，任选一种即可。已经部署成功的项目可以继续使用现有方式；查看 Cloudflare 的 `Workers & Pages` 项目列表即可确认项目类型。
+
+Cloudflare 负责托管构建后的网页，AI 请求由浏览器直接发送到页面设置里的 API URL。当前配置无需额外部署应用后端或数据库，也无需把模型 API Key 写进仓库或 Cloudflare 构建变量；部署完成后在网页设置中填写连接信息。
+
+在 GitHub 仓库中，以下文件直接位于根目录：
 
 ```text
-Framework preset: Vite
-Build command: npm run build
-Build output directory: dist
-Node.js version: 20
+amazon-image-studio/
+├─ package.json        # 构建与部署命令
+├─ package-lock.json   # 依赖锁定文件
+├─ wrangler.jsonc      # Workers 静态资源配置
+├─ src/                # 应用源码
+└─ public/             # 静态资源
 ```
 
-如果使用 Cloudflare Workers 静态资源部署，也可以使用仓库中的 `wrangler.jsonc`，先执行：
+构建后生成 `dist/`。Cloudflare 的 **Root directory（根目录）留空，使用仓库根目录**；若界面要求填写，可填 `.`。不要填写电脑上的 `amazon-image-studio-main` 文件夹名，也不要把根目录设为 `src` 或 `dist`。
 
-```powershell
-npm run build
-```
+#### 2. 构建参数
 
-再按你的 Cloudflare 账号配置运行 Wrangler 部署。
+| 配置项 | Workers 静态资源部署 | Pages 部署 |
+| --- | --- | --- |
+| GitHub 仓库 | `Atomic994/amazon-image-studio` | `Atomic994/amazon-image-studio` |
+| 生产分支 | `main` | `main` |
+| 项目名称 | `amazon-image-studio`，须与 `wrangler.jsonc` 的 `name` 一致 | 可自定义，例如 `amazon-image-studio` |
+| 根目录 | 留空，使用仓库根目录 | 留空，使用仓库根目录 |
+| Framework preset（框架预设） | 使用仓库现有 `wrangler.jsonc` | 有 Vite 则选 Vite；没有则选 None，手动填写下面的命令和目录 |
+| Build command（构建命令） | `npm run build` | `npm run build` |
+| Deploy command（部署命令） | `npx wrangler deploy` | 无需填写，由 Pages 发布构建产物 |
+| Build output directory（构建输出目录） | 已在 `wrangler.jsonc` 的 `assets.directory` 中设置为 `./dist` | `dist` |
+| 构建环境变量 | `NODE_VERSION` = `22` | `NODE_VERSION` = `22` |
+
+Cloudflare 会自动安装项目依赖。Workers 的构建命令生成 `dist/`，随后部署命令读取 `wrangler.jsonc` 并上传静态资源；Pages 则直接发布配置的输出目录。本项目的 Workers 配置还启用了单页应用回退，以支持前端页面导航。Workers 控制台分别填写构建和部署命令即可，不需要把包含构建步骤的 `npm run deploy:cf` 再重复填入部署命令。参数定义见 [Workers 构建配置](https://developers.cloudflare.com/workers/ci-cd/builds/configuration/)和 [Pages Git 部署说明](https://developers.cloudflare.com/pages/get-started/git-integration/)。
+
+#### 3. 在 Cloudflare 控制台部署
+
+**连接 GitHub 仓库**
+
+1. 登录 [Cloudflare 控制台](https://dash.cloudflare.com/)，选择自己的账号，进入 `Workers & Pages`。
+2. 在连接 GitHub 时选择 `Atomic994` 账号，按提示安装或授权 `Cloudflare Workers and Pages` 应用。
+3. 仓库授权可以选择 `Only select repositories`，并选中 `amazon-image-studio`。公开和私有仓库都可以用于部署；私有仓库需要保留这项读取授权。
+4. 如已经安装过应用，可打开 [GitHub 应用安装设置](https://github.com/settings/installations)，找到 `Cloudflare Workers and Pages → Configure → Repository access`，确认该仓库已选中并保存。这里授权的是 Cloudflare 读取仓库，不需要把仓库改成公开。授权入口见 [Cloudflare GitHub 集成说明](https://developers.cloudflare.com/workers/ci-cd/builds/git-integration/github-integration/)。
+
+**方式 A：Workers 静态资源部署**
+
+1. 在 `Workers & Pages` 中点击 `Create application（创建应用）`，在 `Import a repository（导入仓库）` 旁点击 `Get started`。
+2. 选择 GitHub 账号 `Atomic994`，再选择 `amazon-image-studio` 仓库。
+3. 项目名称填写 `amazon-image-studio`，生产分支选择 `main`，根目录留空。若已有 Worker 使用其他名称，应先让仓库 `wrangler.jsonc` 中的 `name` 与已有项目名称一致。
+4. 构建命令填写 `npm run build`，部署命令填写 `npx wrangler deploy`。本仓库已有静态资源配置，无需另外创建 Worker 脚本。
+5. 在构建变量中添加 `NODE_VERSION`，值为 `22`。已有项目的入口通常为 `Settings → Build / Builds → Build Variables and Secrets`；这是构建环境版本设置。
+6. 点击 `Save and Deploy（保存并部署）`，等待安装依赖、构建和发布完成。
+7. 成功后打开控制台提供的 `https://amazon-image-studio.<你的子域名>.workers.dev` 地址，确认网页能正常加载。
+
+已有 Worker 如需连接仓库，打开该项目的 `Settings → Build / Builds → Connect`，选择同一仓库并按上表配置即可。控制台名称与配置文件名称应保持一致，详见 [Workers Git 连接步骤](https://developers.cloudflare.com/workers/ci-cd/builds/)中的名称要求。
+
+**方式 B：Pages 部署**
+
+1. 在 `Workers & Pages` 中点击 `Create application → Pages → Connect to Git`。
+2. 选择 GitHub 账号 `Atomic994` 和 `amazon-image-studio` 仓库，进入 `Begin setup`。
+3. 填写 Pages 项目名称，生产分支选择 `main`，根目录留空。
+4. 框架预设有 Vite 则选择 Vite，否则选择 None；构建命令填写 `npm run build`，构建输出目录填写 `dist`。
+5. 在构建环境变量中添加 `NODE_VERSION`，值为 `22`；如分别显示 Production 和 Preview 环境，两边使用相同的版本。
+6. 点击 `Save and Deploy`。部署完成后打开控制台提供的 `https://<你的 Pages 项目名称>.pages.dev` 地址，确认网页能正常加载。
+
+部署页面的字段名称可能随控制台版本略有变化，以“构建命令、部署命令、输出目录、根目录”的含义对应填写。Node.js 版本设置可参考 [Workers 构建环境说明](https://developers.cloudflare.com/workers/ci-cd/builds/build-image/)。
 
 ### Vercel
 
@@ -628,6 +678,6 @@ npm run build
 
 本项目源码以 [MIT License](LICENSE) 发布。开源范围包括前端源码、Prompt 模板、内置知识文档、本地启动脚本和部署配置；不包含 OpenAI、ChatGPT、Codex 或任何第三方模型服务本身，也不附带 API Key 或免费调用额度。
 
-本项目基于 MIT 许可的 [GPT Image Playground](https://github.com/CookSleep/gpt_image_playground) 修改，原作者为 CookSleep。
+当前版本由 Atomic994 维护，基于 Ali-Aria 的亚马逊图片工作台版本继续修改；原始基础项目为 MIT 许可的 [GPT Image Playground](https://github.com/CookSleep/gpt_image_playground)，原作者为 CookSleep。
 
 请保留应用内“关于”页中的原项目署名与 MIT 许可声明。

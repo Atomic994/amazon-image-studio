@@ -46,7 +46,7 @@ import Select from './Select'
 import { Sheet, useSheetDrag } from './Sheet'
 import { Checkbox } from './Checkbox'
 import ViewportTooltip from './ViewportTooltip'
-import { ChevronDownIcon, CloseIcon, CopyIcon, EditIcon, PlusIcon, TrashIcon, ExportIcon, ImportIcon, LinkIcon, PhotoIcon } from './icons'
+import { ChevronDownIcon, CloseIcon, CopyIcon, EditIcon, PlusIcon, TrashIcon, ExportIcon, ImportIcon, LinkIcon, PhotoIcon, GithubIcon } from './icons'
 
 function newId(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
@@ -2166,25 +2166,17 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
                   > 本站点基于开源项目 [GPT Image Playground](https://github.com/CookSleep/gpt_image_playground) ([MIT](https://github.com/CookSleep/gpt_image_playground/blob/main/LICENSE)) 修改。
                 */}
                 <a
-                  href="https://github.com/Ali-Aria/amazon-image-studio"
+                  href="https://github.com/Atomic994/amazon-image-studio"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="group flex flex-col items-center outline-none"
                 >
-                  <div className="mb-5 h-[88px] w-[88px] overflow-hidden rounded-full border border-gray-200/80 bg-white shadow-sm transition-transform group-hover:scale-[1.02] dark:border-white/[0.12]">
-                    <img
-                      src={`${import.meta.env.BASE_URL}aria-avatar.png`}
-                      alt="Ali-Aria 头像"
-                      width={88}
-                      height={88}
-                      loading="lazy"
-                      decoding="async"
-                      className="h-full w-full object-cover"
-                    />
+                  <div className="mb-5 flex h-[88px] w-[88px] items-center justify-center overflow-hidden rounded-full border border-gray-200/80 bg-white text-gray-800 shadow-sm transition-transform group-hover:scale-[1.02] dark:border-white/[0.12] dark:bg-gray-900 dark:text-gray-100">
+                    <GithubIcon className="h-12 w-12" aria-hidden="true" />
                   </div>
                   <h4 className="text-[17px] font-bold text-gray-800 dark:text-gray-100">亚马逊图片工作台</h4>
                   <p className="mt-1.5 text-[13px] text-gray-500 transition-colors group-hover:text-gray-700 dark:text-gray-400 dark:group-hover:text-gray-300">
-                    @Ali-Aria
+                    当前维护者 @Atomic994
                   </p>
                 </a>
 
@@ -2198,9 +2190,9 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
                   </h5>
                   <div className="mt-3 space-y-3 text-[13px] leading-6 text-gray-600 dark:text-gray-300">
                     <p>
-                      亚马逊图片工作台是免费开源软件，请以本页链接的 GitHub 仓库作为官方核验入口。本项目采用{' '}
+                      当前版本由 Atomic994 维护，请以本页链接的 GitHub 仓库作为版本核验入口。本项目采用{' '}
                       <a
-                        href="https://github.com/Ali-Aria/amazon-image-studio/blob/main/LICENSE"
+                        href="https://github.com/Atomic994/amazon-image-studio/blob/main/LICENSE"
                         target="_blank"
                         rel="noopener noreferrer"
                         className="font-medium text-[hsl(var(--primary))] underline-offset-2 transition hover:underline"
@@ -2210,7 +2202,7 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
                       ，允许商业使用、分发和售卖软件副本，但必须保留版权与许可声明。
                     </p>
                     <p>
-                      第三方收取的费用只代表其自行提供的部署、定制、培训或技术支持，不代表购买了本软件、获得独家授权，也不代表 Ali-Aria 官方服务。请警惕“官方付费版”“独家授权版”“买断后永久官方更新”等误导性表述。
+                      第三方收取的费用只代表其自行提供的部署、定制、培训或技术支持，不代表购买了本软件、获得独家授权，也不代表 Atomic994 提供或认可的服务。请警惕“官方付费版”“独家授权版”“买断后永久官方更新”等误导性表述。
                     </p>
                     <p>
                       如发现冒充官方、删除署名或隐瞒开源来源的售卖行为，请通过 GitHub Issues 反馈。
@@ -2218,15 +2210,15 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
                   </div>
                   <div className="mt-4 flex flex-col gap-2 min-[430px]:flex-row">
                     <a
-                      href="https://github.com/Ali-Aria/amazon-image-studio"
+                      href="https://github.com/Atomic994/amazon-image-studio"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="inline-flex min-h-10 flex-1 items-center justify-center whitespace-nowrap rounded-xl bg-[hsl(var(--primary))] px-4 py-2.5 text-sm font-semibold text-white transition hover:opacity-90 active:translate-y-px"
                     >
-                      查看官方仓库
+                      查看项目仓库
                     </a>
                     <a
-                      href="https://github.com/Ali-Aria/amazon-image-studio/issues"
+                      href="https://github.com/Atomic994/amazon-image-studio/issues"
                       target="_blank"
                       rel="noopener noreferrer"
                       className="inline-flex min-h-10 flex-1 items-center justify-center whitespace-nowrap rounded-xl border border-blue-200/80 bg-white/70 px-4 py-2.5 text-sm font-semibold text-gray-700 transition hover:bg-white active:translate-y-px dark:border-blue-400/20 dark:bg-white/[0.06] dark:text-gray-200 dark:hover:bg-white/[0.1]"
@@ -2237,7 +2229,7 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
                 </section>
 
                 <p className="mb-2 max-w-[420px] text-center text-[12px] leading-relaxed text-gray-400 dark:text-gray-500">
-                  本站点基于开源项目{' '}
+                  本站点基于 Ali-Aria 的亚马逊图片工作台版本及开源项目{' '}
                   <a
                     href="https://github.com/CookSleep/gpt_image_playground"
                     target="_blank"

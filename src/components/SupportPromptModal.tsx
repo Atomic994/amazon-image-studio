@@ -74,7 +74,7 @@ export default function SupportPromptModal() {
             赞助阿梨
           </a>
           <a
-            href="https://github.com/Ali-Aria/amazon-image-studio/issues"
+            href="https://github.com/Atomic994/amazon-image-studio/issues"
             target="_blank"
             rel="noopener noreferrer"
             onClick={dismissSupportPrompt}

@@ -6,11 +6,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Ali-Aria/amazon-image-studio.git"
+    "url": "https://github.com/Atomic994/amazon-image-studio.git"
   },
-  "homepage": "https://ali-aria.github.io/amazon-image-studio/",
+  "homepage": "https://github.com/Atomic994/amazon-image-studio",
   "bugs": {
-    "url": "https://github.com/Ali-Aria/amazon-image-studio/issues"
+    "url": "https://github.com/Atomic994/amazon-image-studio/issues"
   },
   "type": "module",
   "scripts": {
