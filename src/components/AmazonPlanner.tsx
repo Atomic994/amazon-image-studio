@@ -422,6 +422,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   const [styleDensityMode, setStyleDensityMode] = useState<AmazonStyleDensityMode>('rich')
   const [stylePreview, setStylePreview] = useState<StylePreviewState | null>(null)
   const [modulePreviewIndex, setModulePreviewIndex] = useState<number | null>(null)
+  const [showPromptPreview, setShowPromptPreview] = useState(false)
   const [isLoadingStylePreset, setIsLoadingStylePreset] = useState(false)
   const [styleError, setStyleError] = useState('')
   const [customStyleImageDataUrls, setCustomStyleImageDataUrls] = useState<Record<string, string>>({})
@@ -527,6 +528,15 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   const visiblePlanIndex = plannerMode === 'aplus' ? selectedAPlusPlanIndex : selectedPlanIndex
   const actionSlot = plannerMode === 'aplus' ? selectedAPlusPlan?.slot : selectedPlan?.slot
   const actionLabel = plannerMode === 'aplus' ? selectedAPlusPlan?.label : selectedPlan?.label
+  const currentPromptPreview = {
+    slot: actionSlot ?? '',
+    title: plannerMode === 'aplus' && selectedAPlusPlan ? getAPlusModuleDisplayName(selectedAPlusPlan) : actionLabel ?? '提示词预览',
+    uploadSize: plannerMode === 'aplus' ? selectedAPlusPlan?.uploadSize ?? '' : '',
+    generationSize: targetSize,
+    content: plannerMode === 'aplus' && selectedAPlusText.trim()
+      ? `${activePlanPreview}\n\n### A+ 外部文案\n\n${selectedAPlusText}`
+      : activePlanPreview,
+  }
   const showStickyActions = plannerMode === 'aplus' ? aPlusPlansWithSizes.length > 0 : imagePlans.length > 0
   const actionDisabled = plannerMode === 'aplus' ? !selectedAPlusPlan : !activePrompt.trim()
   const submitDisabled = actionDisabled || (styleReferenceRequired && !hasStyleReference) || styleReferenceLimitExceeded
@@ -638,6 +648,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     if (!isActive) {
       setStylePreview(null)
       setModulePreviewIndex(null)
+      setShowPromptPreview(false)
     }
   }, [isActive])
 
@@ -1953,13 +1964,13 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
 
   return (
     <>
-    {stylePreview && isActive && !styleEditor && modulePreviewIndex === null && <StyleHoverPreview preview={stylePreview} />}
-    {modulePreviewIndex !== null && isActive && (
+    {stylePreview && isActive && !styleEditor && modulePreviewIndex === null && !showPromptPreview && <StyleHoverPreview preview={stylePreview} />}
+    {(modulePreviewIndex !== null || showPromptPreview) && isActive && (
       <APlusModulePreviewModal
-        modules={modulePreviews}
-        initialIndex={modulePreviewIndex}
+        modules={showPromptPreview ? [currentPromptPreview] : modulePreviews}
+        initialIndex={showPromptPreview ? 0 : modulePreviewIndex ?? 0}
         profile={plannerProfile}
-        onClose={() => setModulePreviewIndex(null)}
+        onClose={() => { setModulePreviewIndex(null); setShowPromptPreview(false) }}
       />
     )}
     {styleEditor && (
@@ -2623,9 +2634,6 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                       return (
                         <div
                           key={preset.id}
-                          onMouseEnter={(event) => updateStylePreview(preset, event)}
-                          onMouseMove={(event) => updateStylePreview(preset, event)}
-                          onMouseLeave={() => setStylePreview(null)}
                           className={`min-w-0 overflow-hidden rounded-xl border text-left transition ${isSelected ? 'border-violet-400 bg-violet-50 ring-2 ring-violet-500/15 dark:border-violet-300/70 dark:bg-violet-500/10' : 'border-gray-200 bg-white hover:bg-gray-50 dark:border-white/[0.08] dark:bg-gray-900 dark:hover:bg-white/[0.05]'}`}
                         >
                           <button
@@ -2634,7 +2642,14 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                             className="block w-full text-left"
                           >
                             <div className="aspect-square bg-gray-100 dark:bg-white/[0.04]">
-                              <img src={assetUrl} alt={preset.label} className="h-full w-full object-cover" />
+                              <img
+                                src={assetUrl}
+                                alt={preset.label}
+                                className="h-full w-full object-cover"
+                                onMouseEnter={(event) => updateStylePreview(preset, event)}
+                                onMouseMove={(event) => updateStylePreview(preset, event)}
+                                onMouseLeave={() => setStylePreview(null)}
+                              />
                             </div>
                             <div className="p-2">
                               <div className="flex items-center justify-between gap-2">
@@ -2714,9 +2729,6 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                       return (
                         <div
                           key={customStyle.id}
-                          onMouseEnter={(event) => updateCustomStylePreview(customStyle, event)}
-                          onMouseMove={(event) => updateCustomStylePreview(customStyle, event)}
-                          onMouseLeave={() => setStylePreview(null)}
                           className={`min-w-0 overflow-hidden rounded-xl border text-left transition ${isSelected ? 'border-violet-400 bg-violet-50 ring-2 ring-violet-500/15 dark:border-violet-300/70 dark:bg-violet-500/10' : 'border-gray-200 bg-white hover:bg-gray-50 dark:border-white/[0.08] dark:bg-gray-900 dark:hover:bg-white/[0.05]'}`}
                         >
                           <button
@@ -2726,7 +2738,14 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                           >
                             <div className="aspect-square bg-gray-100 dark:bg-white/[0.04]">
                               {imageUrl ? (
-                                <img src={imageUrl} alt={meta.label} className="h-full w-full object-cover" />
+                                <img
+                                  src={imageUrl}
+                                  alt={meta.label}
+                                  className="h-full w-full object-cover"
+                                  onMouseEnter={(event) => updateCustomStylePreview(customStyle, event)}
+                                  onMouseMove={(event) => updateCustomStylePreview(customStyle, event)}
+                                  onMouseLeave={() => setStylePreview(null)}
+                                />
                               ) : (
                                 <div className="flex h-full items-center justify-center text-xs text-gray-400">加载中</div>
                               )}
@@ -2789,9 +2808,6 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                       return (
                         <div
                           key={uploadedStyle.id}
-                          onMouseEnter={(event) => updateUploadedStylePreview(uploadedStyle, event)}
-                          onMouseMove={(event) => updateUploadedStylePreview(uploadedStyle, event)}
-                          onMouseLeave={() => setStylePreview(null)}
                           className={`min-w-0 overflow-hidden rounded-xl border text-left transition ${isSelected ? 'border-violet-400 bg-violet-50 ring-2 ring-violet-500/15 dark:border-violet-300/70 dark:bg-violet-500/10' : 'border-gray-200 bg-white hover:bg-gray-50 dark:border-white/[0.08] dark:bg-gray-900 dark:hover:bg-white/[0.05]'}`}
                         >
                           <button
@@ -2801,7 +2817,14 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                           >
                             <div className="flex h-[168px] items-center justify-center bg-gray-100 p-2 dark:bg-white/[0.04]">
                               {imageUrl ? (
-                                <img src={imageUrl} alt={uploadedStyle.title} className="max-h-full max-w-full object-contain" />
+                                <img
+                                  src={imageUrl}
+                                  alt={uploadedStyle.title}
+                                  className="max-h-full max-w-full object-contain"
+                                  onMouseEnter={(event) => updateUploadedStylePreview(uploadedStyle, event)}
+                                  onMouseMove={(event) => updateUploadedStylePreview(uploadedStyle, event)}
+                                  onMouseLeave={() => setStylePreview(null)}
+                                />
                               ) : (
                                 <div className="text-xs text-gray-400">加载中</div>
                               )}
@@ -3104,12 +3127,25 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
               </div>
             ))}
           </div>
-          <div className="ios-group mt-4 p-4">
-            <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="ios-group mt-4 p-4" data-testid="prompt-preview-panel">
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
               <span className="text-xs font-semibold text-gray-500 dark:text-gray-400">
                 Prompt Preview{plannerMode === 'aplus' && selectedAPlusPlan ? ` · ${selectedAPlusPlan.slot}` : selectedPlan ? ` · ${selectedPlan.slot}` : ''}
               </span>
-              <span className="text-xs text-gray-400">{targetSize} / {generationParamLabel}</span>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs text-gray-400">{targetSize} / {generationParamLabel}</span>
+                <button
+                  type="button"
+                  onClick={() => { setStylePreview(null); setShowPromptPreview(true) }}
+                  disabled={!activePlanPreview.trim()}
+                  aria-label="预览当前 Prompt Preview 内容"
+                  title={activePlanPreview.trim() ? '预览完整策划和提示词，可在弹窗中翻译为中文' : '请先生成策划并选择图片位或模块'}
+                  className="inline-flex h-8 items-center gap-1 rounded-lg border border-gray-200 bg-white px-2.5 text-xs font-semibold text-gray-700 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/[0.08] dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                >
+                  <EyeIcon className="h-3.5 w-3.5" />
+                  预览
+                </button>
+              </div>
             </div>
             <textarea
               value={plannerMode === 'aplus' && !selectedAPlusPlan

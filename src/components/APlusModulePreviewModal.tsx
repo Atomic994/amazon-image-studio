@@ -123,7 +123,7 @@ export default function APlusModulePreviewModal({ modules, initialIndex, profile
       <div className="flex items-start justify-between gap-3 border-b border-gray-100 px-4 py-3 dark:border-white/[0.08]">
         <div className="min-w-0">
           <h2 id="module-preview-title" className="break-words text-base font-semibold text-gray-900 dark:text-gray-100">{module?.slot} · {module?.title}</h2>
-          <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">上传 {module?.uploadSize} · 生成 {module?.generationSize}</div>
+          <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">{module?.uploadSize ? `上传 ${module.uploadSize} · ` : ''}生成 {module?.generationSize}</div>
         </div>
         <button ref={closeButtonRef} type="button" onClick={close} className={`${BUTTON} w-8 border-0 px-0`} aria-label="关闭模块预览" title="关闭"><CloseIcon className="h-4 w-4" /></button>
       </div>
@@ -134,11 +134,11 @@ export default function APlusModulePreviewModal({ modules, initialIndex, profile
         </div>
         <button type="button" onClick={busy ? cancel : () => void translate()} className={BUTTON} title={profile ? `使用 AI 策划模型 ${profile.model}` : '未配置 AI 策划模型'}>{busy ? '停止翻译' : '翻译为中文'}</button>
         <button type="button" onClick={() => void copy()} className={BUTTON}><CopyIcon className="h-3.5 w-3.5" />复制</button>
-        <div className="ml-auto flex items-center gap-1.5">
+        {modules.length > 1 && <div className="ml-auto flex items-center gap-1.5">
           <button type="button" onClick={() => navigate(index - 1)} disabled={index <= 0} className={`${BUTTON} w-8 px-0`} aria-label="上一个模块" title="上一个模块"><ChevronLeftIcon className="h-4 w-4" /></button>
           <span className="min-w-10 text-center text-xs tabular-nums text-gray-500">{index + 1}/{modules.length}</span>
           <button type="button" onClick={() => navigate(index + 1)} disabled={index >= modules.length - 1} className={`${BUTTON} w-8 px-0`} aria-label="下一个模块" title="下一个模块"><ChevronRightIcon className="h-4 w-4" /></button>
-        </div>
+        </div>}
       </div>
       {busy && <div role="status" className="px-4 pt-3 text-xs text-blue-600 dark:text-blue-300">正在翻译 · {profile?.model}</div>}
       {error && <div role="alert" className="break-words px-4 pt-3 text-xs text-red-600 dark:text-red-300">{error}</div>}
