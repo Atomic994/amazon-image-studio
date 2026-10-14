@@ -18,6 +18,7 @@ import Toast from './components/Toast'
 import MaskEditorModal from './components/MaskEditorModal'
 import ImageContextMenu from './components/ImageContextMenu'
 import { useGlobalClickSuppression } from './lib/clickSuppression'
+import { previewTranslationCache } from './lib/previewTranslationCache'
 
 export type AppView = 'home' | 'editor' | 'tagger'
 
@@ -61,6 +62,7 @@ export default function App() {
       window.history.replaceState(null, '', nextUrl)
     }
 
+    previewTranslationCache.cleanup()
     initStore()
     useStore.getState().setAppMode('gallery')
   }, [setSettings])

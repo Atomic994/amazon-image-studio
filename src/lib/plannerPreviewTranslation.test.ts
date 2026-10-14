@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createDefaultAmazonPlannerProfile } from './apiProfiles'
 import { translatePlannerPreviewText } from './listingPlannerApi'
 import type { ApiProfile } from '../types'
+import type { PlannerApiProgress } from './plannerProgress'
 
 const source = '## A+L01\nUse 970x300. Brand: Example.\n### Prompt\nCreate a detailed product image.'
 function profile(apiMode: 'chat' | 'responses' = 'chat'): ApiProfile {
@@ -36,6 +37,7 @@ describe('module translation through the configured planner LLM', () => {
   })
 
   it('reads streamed translation, preserves whitespace and never includes reasoning', async () => {
+    const progress: PlannerApiProgress[] = []
     vi.stubGlobal('fetch', vi.fn(async () => sse([
       { choices: [{ delta: { reasoning_content: 'private reasoning' } }] },
       { choices: [{ delta: { content: '模块' } }] },
@@ -43,7 +45,11 @@ describe('module translation through the configured planner LLM', () => {
       { choices: [{ delta: { content: 'A+L01' } }] },
       { choices: [{ delta: {}, finish_reason: 'stop' }] }, '[DONE]',
     ])))
-    expect(await translatePlannerPreviewText({ text: source, profile: profile() })).toBe('模块 A+L01')
+    expect(await translatePlannerPreviewText({ text: source, profile: profile(), onProgress: (value) => progress.push(value) })).toBe('模块 A+L01')
+    expect(progress.map((value) => value.phase)).toEqual(expect.arrayContaining(['connecting', 'connected', 'thinking', 'receiving', 'validating']))
+    expect(progress[progress.length - 1]).toMatchObject({ phase: 'validating', receivedChars: '模块 A+L01'.length, attempt: 1, maxAttempts: 3 })
+    expect(JSON.stringify(progress)).not.toContain('private reasoning')
+    expect(progress.every((value) => value.completedPlans === undefined)).toBe(true)
   })
 
   it('reads Responses stream without duplicating completed snapshots', async () => {
@@ -55,13 +61,47 @@ describe('module translation through the configured planner LLM', () => {
   })
 
   it('falls back only when the upstream explicitly rejects stream', async () => {
+    const progress: PlannerApiProgress[] = []
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response('{"error":{"message":"stream is not supported"}}', { status: 400 }))
       .mockResolvedValueOnce(jsonResponse('chat'))
     vi.stubGlobal('fetch', fetchMock)
-    await translatePlannerPreviewText({ text: source, profile: profile() })
+    await translatePlannerPreviewText({ text: source, profile: profile(), onProgress: (value) => progress.push(value) })
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(JSON.parse(fetchMock.mock.calls[1]![1].body).stream).toBe(false)
+    expect(progress).toContainEqual(expect.objectContaining({ phase: 'fallback', attempt: 2, retryDelayMs: 0 }))
+  })
+
+  it('reports gateway retry delays and final nonstreamed character counts', async () => {
+    vi.useFakeTimers()
+    const progress: PlannerApiProgress[] = []
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response('{"error":{"message":"openai_error"}}', { status: 504, headers: { 'Retry-After': '2' } }))
+      .mockResolvedValueOnce(jsonResponse('chat', '完整译文'))
+    vi.stubGlobal('fetch', fetchMock)
+    const pending = translatePlannerPreviewText({ text: source, profile: profile(), onProgress: (value) => progress.push(value) })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(progress).toContainEqual(expect.objectContaining({ phase: 'retrying', retryDelayMs: 2000, attempt: 2, message: expect.stringContaining('504') }))
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(await pending).toBe('完整译文')
+    expect(progress[progress.length - 1]).toMatchObject({ phase: 'validating', receivedChars: 4, attempt: 2 })
+  })
+
+  it('stops automatic retries when cancelled while waiting', async () => {
+    vi.useFakeTimers()
+    const progress: PlannerApiProgress[] = []
+    const fetchMock = vi.fn(async () => new Response('{"error":{"message":"openai_error"}}', { status: 504 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new AbortController()
+    const pending = translatePlannerPreviewText({ text: source, profile: profile(), signal: controller.signal, onProgress: (value) => progress.push(value) })
+    const cancelled = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+    await vi.advanceTimersByTimeAsync(0)
+    controller.abort()
+    await cancelled
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(progress[progress.length - 1]?.phase).toBe('retrying')
   })
 
   it('rejects wrong profiles, missing keys and empty content before issuing a request', async () => {

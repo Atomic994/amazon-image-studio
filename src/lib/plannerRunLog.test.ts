@@ -47,4 +47,23 @@ describe('planner run log', () => {
     expect(state.entries[0]?.message).toBe('Event 40')
     expect(new Set(state.entries.map((entry) => entry.id)).size).toBe(160)
   })
+
+  it('tracks translation progress and retries without invented plan counts or credential leaks', () => {
+    let state: PlannerRunLogState = { ...createPlannerRunLog('translation'), status: 'running', startedAt: 0 }
+    state = updatePlannerRunLog(state, { phase: 'thinking', attempt: 1, maxAttempts: 3 }, 1000)
+    state = updatePlannerRunLog(state, { phase: 'receiving', attempt: 1, maxAttempts: 3, receivedChars: 120 }, 2000)
+    state = updatePlannerRunLog(state, { phase: 'retrying', attempt: 2, maxAttempts: 3, retryDelayMs: 1000, message: '504 test-only-key Bearer secret' }, 3000, 'test-only-key')
+    state = updatePlannerRunLog(state, { phase: 'connecting', attempt: 2, maxAttempts: 3 }, 4000)
+    expect(state.receivedChars).toBe(0)
+    state = updatePlannerRunLog(state, { phase: 'validating', attempt: 2, maxAttempts: 3, receivedChars: 500 }, 5000)
+    state = finishPlannerRunLog(state, 'success', '完整译文已保存', 6000)
+    const log = formatPlannerLogForCopy(state)
+    expect(state.label).toBe('翻译已完成')
+    expect(state.receivedChars).toBe(500)
+    expect(log).toContain('AI 翻译运行日志')
+    expect(log).toContain('已接收 120 个字符')
+    expect(log).not.toContain('份方案')
+    expect(log).not.toContain('test-only-key')
+    expect(log).not.toContain('Bearer secret')
+  })
 })

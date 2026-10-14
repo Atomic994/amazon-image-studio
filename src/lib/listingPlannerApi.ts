@@ -838,6 +838,7 @@ export async function translatePlannerPreviewText(options: {
   text: string
   profile: ApiProfile
   signal?: AbortSignal
+  onProgress?: (progress: PlannerApiProgress) => void
 }): Promise<string> {
   const { profile } = options
   if (profile.apiMode !== 'chat' && profile.apiMode !== 'responses') throw new Error('翻译需要 Chat Completions 或 Responses AI 策划配置')
@@ -865,6 +866,10 @@ export async function translatePlannerPreviewText(options: {
   try {
     for (let attempt = 1; attempt <= MAX_PLANNER_ATTEMPTS; attempt++) {
       signal.throwIfAborted()
+      const emit = (progress: Omit<PlannerApiProgress, 'attempt' | 'maxAttempts'>) => {
+        options.onProgress?.({ ...progress, attempt, maxAttempts: MAX_PLANNER_ATTEMPTS })
+      }
+      emit({ phase: 'connecting', receivedChars: 0 })
       try {
         const response = await fetch(url, {
           method: 'POST', signal, cache: 'no-store',
@@ -872,18 +877,39 @@ export async function translatePlannerPreviewText(options: {
           body: JSON.stringify(body),
         })
         if (!response.ok) throw await readPlannerHttpError(response)
+        emit({ phase: 'connected', httpStatus: response.status })
+        let lastEmissionAt = 0
+        let lastActivityAt = 0
+        let lastPhase = ''
+        const report = (phase: 'receiving' | 'thinking', receivedChars?: number) => {
+          const at = Date.now()
+          if (lastPhase === phase && at - lastEmissionAt < 1000) return
+          lastPhase = phase
+          lastEmissionAt = at
+          emit({ phase, receivedChars })
+        }
         const text = await readPlannerResponseText(response, signal, 'aPlusPlans', {
-          onReceiving: () => {}, onThinking: () => {}, onActivity: () => {},
+          onReceiving: (stats) => report('receiving', stats.receivedChars),
+          onThinking: () => report('thinking'),
+          onActivity: () => {
+            const at = Date.now()
+            if (at - lastActivityAt < 1000) return
+            lastActivityAt = at
+            emit({ phase: 'activity' })
+          },
         })
         signal.throwIfAborted()
+        emit({ phase: 'validating', receivedChars: text.length })
         return text
       } catch (err) {
         signal.throwIfAborted()
         const unsupportedStream = body.stream && err instanceof PlannerHttpError && [400, 422].includes(err.status)
           && /stream/i.test(err.message) && /not support|unsupported|not allowed|must be false/i.test(err.message)
         if (attempt === MAX_PLANNER_ATTEMPTS || (!unsupportedStream && !isRetryablePlannerError(err))) throw err
+        const retryDelayMs = unsupportedStream ? 0 : err instanceof PlannerHttpError && err.retryAfterMs != null ? err.retryAfterMs : 1000 * 2 ** (attempt - 1)
+        options.onProgress?.({ phase: unsupportedStream ? 'fallback' : 'retrying', attempt: attempt + 1, maxAttempts: MAX_PLANNER_ATTEMPTS, retryDelayMs, message: err instanceof Error ? err.message : String(err) })
         if (unsupportedStream) body.stream = false
-        else await waitForPlannerRetry(err instanceof PlannerHttpError && err.retryAfterMs != null ? err.retryAfterMs : 1000 * 2 ** (attempt - 1), signal)
+        else await waitForPlannerRetry(retryDelayMs, signal)
       }
     }
     throw new Error('翻译接口未返回内容')

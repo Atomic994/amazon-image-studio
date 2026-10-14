@@ -59,6 +59,7 @@ import { prepareReferenceImageAndMaskPayload, prepareReferenceImagePayload, type
 import { getTaskHistoryCategory } from './lib/taskHistory'
 import { isAmazonListingMainSlot } from './lib/listingPlanner'
 import { collectPlannerImageReferences } from './lib/plannerImageReferences'
+import { previewTranslationCache } from './lib/previewTranslationCache'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
 
 // ===== Image cache =====
@@ -4370,6 +4371,7 @@ export async function clearData(options: ClearOptions = { clearConfig: true, cle
   const { setTasks, clearInputImages, clearMaskDraft, resetSeedreamEditorDraft, setSettings, setParams, showToast } = useStore.getState()
 
   if (options.clearTasks) {
+    previewTranslationCache.clear()
     await dbClearTasks()
     await dbClearAmazonPlannerSessions()
     await clearImages()
