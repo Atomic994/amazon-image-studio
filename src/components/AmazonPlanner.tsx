@@ -68,6 +68,9 @@ import { DEFAULT_PARAMS } from '../types'
 import type { AmazonPlannerSession, AmazonUploadedStyleReference, CustomStyleReference, StyleReferenceEditState } from '../types'
 import StyleReferenceEditorModal from './StyleReferenceEditorModal'
 import StylePaletteLegend from './StylePaletteLegend'
+import StyleHoverPreview, { type StylePreviewState } from './StyleHoverPreview'
+import APlusModulePreviewModal from './APlusModulePreviewModal'
+import { buildPlannerModulePreviews } from '../lib/plannerModulePreview'
 import PlannerRunLog from './PlannerRunLog'
 import { usePlannerRunLog } from '../hooks/usePlannerRunLog'
 import { formatPlannerLogForCopy } from '../lib/plannerRunLog'
@@ -79,9 +82,6 @@ const LABEL_CLASS = 'mb-1.5 block text-[11px] font-semibold uppercase tracking-[
 const PLAN_LIST_CLASS = 'grid max-h-[420px] gap-2 overflow-y-auto overscroll-contain pr-1 custom-scrollbar sm:max-h-[480px]'
 const GUIDE_HINT_CLASS = 'mb-3 rounded-[var(--ios-radius-md)] bg-[hsl(var(--ios-blue-tint))] px-3 py-2 text-xs font-medium leading-relaxed text-[hsl(var(--primary))]'
 const DEEPSEEK_PLANNER_NOTICE = '当前 AI 策划配置为 DeepSeek 官方接口。DeepSeek 策划阶段不会读取参考图，系统会仅用 Listing 文本和你填写的商品信息生成策划；参考图仍会在正式生图时随生图请求发送。请把产品颜色、形状、结构、配件、Logo、套装数量等关键特征写进 Listing 或商品信息中。'
-const STYLE_PREVIEW_WIDTH = 420
-const STYLE_PREVIEW_HEIGHT = 500
-const STYLE_PREVIEW_OFFSET = 16
 const STYLE_DENSITY_OPTIONS: Array<{ value: AmazonStyleDensityMode; label: string }> = [
   { value: 'rich', label: '信息丰富' },
   { value: 'minimal', label: '简约' },
@@ -108,13 +108,6 @@ type SelectedStyleReference = {
   label: string
   description: string
   palette: string[]
-}
-type StylePreviewState = {
-  dataUrl: string
-  label: string
-  description: string
-  left: number
-  top: number
 }
 const PLANNER_HISTORY_LIMIT = 30
 
@@ -300,20 +293,6 @@ function isAbortError(err: unknown): boolean {
     (err instanceof Error && err.name === 'AbortError')
 }
 
-function getStylePreviewPosition(clientX: number, clientY: number) {
-  if (typeof window === 'undefined') {
-    return { left: clientX + STYLE_PREVIEW_OFFSET, top: clientY + STYLE_PREVIEW_OFFSET }
-  }
-  const viewportPadding = 12
-  const rightLeft = clientX + STYLE_PREVIEW_OFFSET
-  const left = rightLeft + STYLE_PREVIEW_WIDTH <= window.innerWidth - viewportPadding
-    ? rightLeft
-    : Math.max(viewportPadding, clientX - STYLE_PREVIEW_WIDTH - STYLE_PREVIEW_OFFSET)
-  const maxTop = Math.max(viewportPadding, window.innerHeight - STYLE_PREVIEW_HEIGHT - viewportPadding)
-  const top = Math.min(Math.max(viewportPadding, clientY - 160), maxTop)
-  return { left, top }
-}
-
 function getPlanSummary(planMarkdown: string) {
   const lines = planMarkdown
     .split(/\r?\n/)
@@ -442,9 +421,11 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   const [selectedStyleReference, setSelectedStyleReference] = useState<SelectedStyleReference | null>(null)
   const [styleDensityMode, setStyleDensityMode] = useState<AmazonStyleDensityMode>('rich')
   const [stylePreview, setStylePreview] = useState<StylePreviewState | null>(null)
+  const [modulePreviewIndex, setModulePreviewIndex] = useState<number | null>(null)
   const [isLoadingStylePreset, setIsLoadingStylePreset] = useState(false)
   const [styleError, setStyleError] = useState('')
   const [customStyleImageDataUrls, setCustomStyleImageDataUrls] = useState<Record<string, string>>({})
+  const customStylePreviewFallbackRef = useRef(new WeakMap<StyleReferenceEditState, string>())
   const [uploadedStyleImageDataUrls, setUploadedStyleImageDataUrls] = useState<Record<string, string>>({})
   const [isUploadingStyleReference, setIsUploadingStyleReference] = useState(false)
   const [renamingUploadedStyleReferenceId, setRenamingUploadedStyleReferenceId] = useState<string | null>(null)
@@ -481,6 +462,12 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   const aPlusDefaultSpecs = useMemo(() => getAPlusModuleSpecs(aPlusType), [aPlusType])
   const aPlusSpecsAreDefault = areAPlusModuleSpecsEquivalent(aPlusSpecs, aPlusDefaultSpecs)
   const aPlusPlansWithSizes = useMemo(() => withAPlusGenerationSizes(aPlusPlans, resolutionTier), [aPlusPlans, resolutionTier])
+  const modulePreviews = useMemo(() => buildPlannerModulePreviews({
+    specs: aPlusSpecs,
+    plans: aPlusPlansWithSizes,
+    tier: resolutionTier,
+    seriesStyleGuide: seriesStyleGuides.aplus,
+  }), [aPlusSpecs, aPlusPlansWithSizes, resolutionTier, seriesStyleGuides.aplus])
   const selectedPlan = selectedPlanIndex == null ? null : imagePlans[selectedPlanIndex] ?? null
   const selectedAPlusPlan = selectedAPlusPlanIndex == null ? null : aPlusPlansWithSizes[selectedAPlusPlanIndex] ?? null
   const selectedAPlusText = selectedAPlusPlan ? formatAPlusModuleText(selectedAPlusPlan) : ''
@@ -634,6 +621,25 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     ? getAmazonAPlusComplianceChecks(draft, selectedAPlusPlan, aPlusType, marketplaceId, inputImages.length, hasStyleReference)
     : getAmazonListingPlannerChecks(draft, targetSize, marketplaceId, inputImages.length, hasStyleReference, styleReferenceRequired)
   const atImageLimit = inputImages.length >= inputImageLimit
+  const hasStylePreview = stylePreview !== null
+
+  useEffect(() => {
+    if (!hasStylePreview) return
+    const dismiss = () => setStylePreview(null)
+    window.addEventListener('scroll', dismiss, true)
+    window.addEventListener('blur', dismiss)
+    return () => {
+      window.removeEventListener('scroll', dismiss, true)
+      window.removeEventListener('blur', dismiss)
+    }
+  }, [hasStylePreview])
+
+  useEffect(() => {
+    if (!isActive) {
+      setStylePreview(null)
+      setModulePreviewIndex(null)
+    }
+  }, [isActive])
 
   useEffect(() => {
     let cancelled = false
@@ -1309,7 +1315,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       dataUrl: getStylePresetAssetUrl(preset),
       label: preset.label,
       description: preset.description,
-      ...getStylePreviewPosition(event.clientX, event.clientY),
+      clientX: event.clientX,
+      clientY: event.clientY,
     })
   }
 
@@ -1318,11 +1325,17 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     event: ReactMouseEvent<HTMLElement>,
   ) => {
     const meta = getCustomStyleReferenceVisualMeta(customStyle)
+    let dataUrl = customStyleImageDataUrls[customStyle.id] || customStylePreviewFallbackRef.current.get(customStyle.editState)
+    if (!dataUrl) {
+      dataUrl = renderStyleReferenceDataUrl(customStyle.editState)
+      customStylePreviewFallbackRef.current.set(customStyle.editState, dataUrl)
+    }
     setStylePreview({
-      dataUrl: customStyleImageDataUrls[customStyle.id] || renderStyleReferenceDataUrl(customStyle.editState),
+      dataUrl,
       label: meta.label,
       description: meta.description,
-      ...getStylePreviewPosition(event.clientX, event.clientY),
+      clientX: event.clientX,
+      clientY: event.clientY,
     })
   }
 
@@ -1337,11 +1350,13 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       dataUrl,
       label: meta.label,
       description: meta.description,
-      ...getStylePreviewPosition(event.clientX, event.clientY),
+      clientX: event.clientX,
+      clientY: event.clientY,
     })
   }
 
   const openStylePresetPreview = async (presetId: string) => {
+    setStylePreview(null)
     const reference = selectedStyleReference?.presetId === presetId
       ? selectedStyleReference
       : await selectStylePreset(presetId, { silent: true })
@@ -1349,6 +1364,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   }
 
   const openCustomStylePreview = async (customStyle: CustomStyleReference) => {
+    setStylePreview(null)
     const reference = selectedStyleReference?.customStyleReferenceId === customStyle.id
       ? selectedStyleReference
       : await selectCustomStyleReference(customStyle, { silent: true })
@@ -1356,6 +1372,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   }
 
   const openUploadedStylePreview = async (uploadedStyle: AmazonUploadedStyleReference) => {
+    setStylePreview(null)
     const reference = selectedStyleReference?.uploadedStyleReferenceId === uploadedStyle.id
       ? selectedStyleReference
       : await selectUploadedStyleReference(uploadedStyle, { silent: true })
@@ -1936,6 +1953,15 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
 
   return (
     <>
+    {stylePreview && isActive && !styleEditor && modulePreviewIndex === null && <StyleHoverPreview preview={stylePreview} />}
+    {modulePreviewIndex !== null && isActive && (
+      <APlusModulePreviewModal
+        modules={modulePreviews}
+        initialIndex={modulePreviewIndex}
+        profile={plannerProfile}
+        onClose={() => setModulePreviewIndex(null)}
+      />
+    )}
     {styleEditor && (
       <StyleReferenceEditorModal
         title={styleEditor.title}
@@ -2850,18 +2876,6 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                   )}
                 </div>
               </div>
-              {stylePreview && (
-                <div
-                  className="ios-menu pointer-events-none fixed z-50 hidden w-[420px] max-w-[calc(100vw-24px)] overflow-hidden sm:block"
-                  style={{ left: stylePreview.left, top: stylePreview.top }}
-                >
-                  <img src={stylePreview.dataUrl} alt="" className="aspect-square w-full bg-gray-100 object-contain dark:bg-white/[0.04]" />
-                  <div className="border-t border-gray-100 p-3 dark:border-white/[0.08]">
-                    <div className="truncate text-sm font-semibold text-gray-900 dark:text-gray-100">{stylePreview.label}</div>
-                    <div className="mt-1 line-clamp-2 text-xs leading-relaxed text-gray-500 dark:text-gray-400">{stylePreview.description}</div>
-                  </div>
-                </div>
-              )}
               {selectedStyleImage?.imageId && selectedStyleLabel && (
                 <div className="mt-3 rounded-lg border border-violet-200 bg-violet-50 px-3 py-2 text-xs leading-relaxed text-violet-800 dark:border-violet-300/20 dark:bg-violet-400/10 dark:text-violet-200">
                   {isMainListingPlan
@@ -2946,9 +2960,12 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                     选择模块后，Prompt Preview 和生成按钮会切换到对应 A+ 提示词与尺寸。
                   </div>
                 </div>
-                <span className="shrink-0 rounded-lg bg-gray-100 px-2 py-1 text-xs font-medium text-gray-500 dark:bg-white/[0.06] dark:text-gray-400">
-                  {aPlusPlansWithSizes.length} 张
-                </span>
+                <div className="flex shrink-0 items-center gap-2">
+                  <button type="button" onClick={() => setModulePreviewIndex(selectedAPlusPlanIndex ?? 0)} title="预览模块内容" className="inline-flex h-8 items-center gap-1 rounded-lg border border-gray-200 px-2 text-xs font-medium text-gray-600 hover:bg-gray-50 dark:border-white/[0.08] dark:text-gray-300 dark:hover:bg-white/[0.06]">
+                    <EyeIcon className="h-3.5 w-3.5" />预览
+                  </button>
+                  <span className="rounded-lg bg-gray-100 px-2 py-1 text-xs font-medium text-gray-500 dark:bg-white/[0.06] dark:text-gray-400">{aPlusPlansWithSizes.length} 张</span>
+                </div>
               </div>
               <div className={PLAN_LIST_CLASS}>
                 {aPlusPlansWithSizes.map((plan, index) => {
@@ -2956,13 +2973,12 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                   const externalText = formatAPlusModuleText(plan)
                   const planActionProgress = actionProgress[getPlannerActionKey('aplus', index, plan.slot)]
                   return (
-                    <button
+                    <div
                       key={`${plan.slot}-${index}`}
-                      type="button"
-                      onClick={() => selectAPlusPlan(index)}
-                      className={`rounded-xl border p-3 text-left transition ${isSelected ? 'border-blue-400 bg-blue-50 ring-2 ring-blue-500/15 dark:border-blue-400/70 dark:bg-blue-500/10' : 'border-gray-200 bg-white hover:bg-gray-50 dark:border-white/[0.08] dark:bg-gray-950 dark:hover:bg-white/[0.05]'}`}
+                      className={`relative rounded-lg border text-left transition ${isSelected ? 'border-blue-400 bg-blue-50 ring-2 ring-blue-500/15 dark:border-blue-400/70 dark:bg-blue-500/10' : 'border-gray-200 bg-white hover:bg-gray-50 dark:border-white/[0.08] dark:bg-gray-950 dark:hover:bg-white/[0.05]'}`}
                     >
-                      <div className="flex flex-wrap items-center gap-2">
+                      <button type="button" onClick={() => selectAPlusPlan(index)} className="block w-full rounded-lg p-3 text-left">
+                      <div className="flex flex-wrap items-center gap-2 pr-9">
                         <span className={`rounded-md px-2 py-0.5 text-[11px] font-bold ${isSelected ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-600 dark:bg-white/[0.08] dark:text-gray-300'}`}>
                           {plan.slot}
                         </span>
@@ -2991,7 +3007,11 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                       <div className="mt-2 line-clamp-2 rounded-lg bg-white/70 px-2 py-1 text-[11px] leading-relaxed text-gray-500 dark:bg-white/[0.05] dark:text-gray-300">
                         Negative：{plan.negativePrompt || '未提供'}
                       </div>
-                    </button>
+                      </button>
+                      <button type="button" onClick={() => setModulePreviewIndex(index)} aria-label={`预览 ${plan.slot} 模块内容`} title="预览模块内容" className="absolute right-2 top-2 inline-flex h-8 w-8 items-center justify-center rounded-lg text-gray-500 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-300 dark:hover:bg-white/[0.08]">
+                        <EyeIcon className="h-4 w-4" />
+                      </button>
+                    </div>
                   )
                 })}
               </div>
@@ -3007,6 +3027,9 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
+                  <button type="button" onClick={() => setModulePreviewIndex(0)} title="预览模块内容" className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50 dark:border-white/[0.08] dark:text-gray-300 dark:hover:bg-white/[0.06]" aria-label="预览 A+ 模块编排">
+                    <EyeIcon className="h-4 w-4" />
+                  </button>
                   <button
                     type="button"
                     onClick={restoreDefaultAPlusModules}
@@ -3040,6 +3063,9 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                         </div>
                       </div>
                       <div className="flex shrink-0 items-center gap-1">
+                        <button type="button" onClick={() => setModulePreviewIndex(index)} aria-label={`预览 ${spec.slot} 模块内容`} title="预览模块内容" className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50 dark:border-white/[0.08] dark:text-gray-300 dark:hover:bg-white/[0.06]">
+                          <EyeIcon className="h-3.5 w-3.5" />
+                        </button>
                         <button
                           type="button"
                           onClick={() => addAPlusModuleAfter(index)}
