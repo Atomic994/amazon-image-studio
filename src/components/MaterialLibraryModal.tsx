@@ -4,8 +4,7 @@ import { useStore, saveMaterialCollection, removeMaterialCollection, renameMater
 import { localId } from '../lib/localId'
 import { materialCollectionCandidates } from '../lib/materialCollections'
 import { downloadImageIds } from '../lib/downloadImages'
-import { buildMaterialDeliveryZip, downloadMaterialDeliveryZip } from '../lib/materialDelivery'
-import { getImage } from '../lib/db'
+import MaterialDeliveryDialog from './MaterialDeliveryDialog'
 import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { usePreventBackgroundScroll } from '../hooks/usePreventBackgroundScroll'
 import { useModalFocus } from '../hooks/useModalFocus'
@@ -27,7 +26,7 @@ export default function MaterialLibraryModal() {
   const [note, setNote] = useState('')
   const [selectedImages, setSelectedImages] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
-  const [exportProgress, setExportProgress] = useState('')
+  const [deliveryVersionId, setDeliveryVersionId] = useState('')
   const [error, setError] = useState('')
   const [rename, setRename] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(false)
@@ -37,7 +36,7 @@ export default function MaterialLibraryModal() {
   const collection = collections.find((item) => item.id === selectedId)
   const version = collection?.versions.find((item) => item.id === versionId) ?? collection?.versions[collection.versions.length - 1]
   const visibleCollections = useMemo(() => [...collections].filter((item) => !search.trim() || item.title.toLowerCase().includes(search.trim().toLowerCase())).sort((a, b) => b.updatedAt - a.updatedAt), [collections, search])
-  const close = () => { if (!busy) useStore.getState().closeMaterialLibrary() }
+  const close = () => { if (!busy && !deliveryVersionId) useStore.getState().closeMaterialLibrary() }
   useCloseOnEscape(open, close)
   usePreventBackgroundScroll(open, panelRef)
   useModalFocus(open, panelRef)
@@ -62,7 +61,7 @@ export default function MaterialLibraryModal() {
   const attempt = async (work: () => Promise<unknown>) => {
     if (busy) return
     setBusy(true); setError('')
-    try { await work() } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) } finally { setBusy(false); setExportProgress('') }
+    try { await work() } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) } finally { setBusy(false) }
   }
   const save = () => draft && attempt(async () => {
     const saved = await saveMaterialCollection({ ...draft, title, items: candidateItems.filter((item) => selectedImages.includes(item.id)) }, targetId || undefined, note)
@@ -77,14 +76,13 @@ export default function MaterialLibraryModal() {
     useStore.getState().requestPlannerRestore({ ...session, id: localId('planner'), createdAt: at, updatedAt: at })
     close()
   }
-  return createPortal(<Sheet onClose={close} panelRef={panelRef} rootClassName="z-[115]" labelledBy="material-library-title" className="flex max-h-[92dvh] max-w-5xl flex-col overflow-hidden pt-5">
+  return <>{collection && deliveryVersionId && <MaterialDeliveryDialog collection={collection} versionId={deliveryVersionId} onClose={() => setDeliveryVersionId('')} />}{createPortal(<Sheet onClose={close} panelRef={panelRef} rootClassName="z-[115]" labelledBy="material-library-title" className="flex max-h-[92dvh] max-w-5xl flex-col overflow-hidden pt-5">
     <div className="flex shrink-0 items-start justify-between gap-3 border-b border-gray-100 px-4 py-3 dark:border-white/[0.08]">
       <div><h2 id="material-library-title" className="text-base font-semibold text-gray-900 dark:text-gray-100">{draft ? '收藏成套素材' : '素材收藏库'}</h2><p className="mt-1 text-xs text-gray-500">保存在当前浏览器。套组保留图片、提示词、参考图和策划快照，可通过本地数据备份迁移。</p></div>
       <button type="button" disabled={busy} onClick={close} className={BUTTON} aria-label="关闭素材收藏库"><CloseIcon className="h-4 w-4" /></button>
     </div>
     <div className="custom-scrollbar min-h-0 overflow-y-auto p-4">
       {error && <p role="alert" className="mb-3 rounded-xl bg-red-50 p-3 text-xs text-red-700 dark:bg-red-500/10 dark:text-red-300">{error}</p>}
-      {exportProgress && <p role="status" className="mb-3 text-xs text-blue-600 dark:text-blue-300">{exportProgress}</p>}
       {draft ? <div>
         <div className="grid gap-3 sm:grid-cols-2"><label className="text-xs text-gray-600 dark:text-gray-300">保存位置<select aria-label="素材套组保存位置" value={targetId} onChange={(event) => { setTargetId(event.target.value); setTitle(collections.find((item) => item.id === event.target.value)?.title ?? draft.title) }} className={`${INPUT} mt-1.5 w-full`}><option value="">创建新套组</option>{collections.map((item) => <option key={item.id} value={item.id}>{item.title} · 新增版本</option>)}</select></label><label className="text-xs text-gray-600 dark:text-gray-300">套组名称<input aria-label="素材套组名称" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={100} className={`${INPUT} mt-1.5 w-full`} /></label></div>
         <label className="mt-3 block text-xs text-gray-600 dark:text-gray-300">版本说明<input aria-label="素材套组版本说明" value={note} onChange={(event) => setNote(event.target.value)} maxLength={1000} placeholder="例如：确认版、替换主图后的第二版" className={`${INPUT} mt-1.5 w-full`} /></label>
@@ -101,11 +99,11 @@ export default function MaterialLibraryModal() {
           <div className="flex flex-wrap items-center gap-2"><button type="button" onClick={() => setSelectedId('')} className={BUTTON}>返回套组列表</button><h3 className="min-w-0 break-words font-semibold text-gray-900 dark:text-gray-100">{collection.title}</h3><select aria-label="素材套组版本" className={`${INPUT} ml-auto`} value={version?.id ?? ''} onChange={(event) => setVersionId(event.target.value)}>{[...collection.versions].reverse().map((item) => <option key={item.id} value={item.id}>v{item.versionNumber} · {new Date(item.createdAt).toLocaleDateString('zh-CN')}</option>)}</select></div>
           {version?.note && <p className="mt-3 text-xs text-gray-500">{version.note}</p>}
           <div className="mt-3 flex flex-wrap gap-2"><button type="button" disabled={!version?.plannerSession || busy} onClick={restore} className={BUTTON}>恢复整套策划</button><button type="button" disabled={!version?.items.length || busy} onClick={() => void attempt(() => downloadImageIds(version!.items.map((item) => item.imageId)))} className={BUTTON}>下载此版本图片</button></div>
-          <div className="mt-3"><button type="button" disabled={!version?.items.length || busy} onClick={() => void attempt(async () => { const result = await buildMaterialDeliveryZip(collection, version!.id, getImage, setExportProgress); downloadMaterialDeliveryZip(result); useStore.getState().showToast('本套所选版本已导出 ZIP', 'success') })} className={BUTTON}>{exportProgress ? '正在导出…' : '导出本套 ZIP'}</button><p className="mt-1 text-[11px] text-gray-500">仅包含所选版本的生成原图与提示词等信息，不含 API 配置；保留原始尺寸。完整迁移请用“备份本地数据”。</p></div>
+          <div className="mt-3"><button type="button" disabled={!version?.items.length || busy} onClick={() => setDeliveryVersionId(version!.id)} className={BUTTON}>交付预览 / 导出本套 ZIP</button><p className="mt-1 text-[11px] text-gray-500">可保留原图或调整交付尺寸，含图片位对应的 A+ 外置文案。完整迁移请用“备份本地数据”。</p></div>
           <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{version?.items.map((item) => <article key={item.id} className="overflow-hidden rounded-xl border border-gray-200 p-3 dark:border-white/[0.1]"><div className="flex aspect-square items-center justify-center overflow-hidden rounded-lg bg-gray-100 dark:bg-gray-950"><StoredImage imageId={item.imageId} alt={item.label} className="h-full w-full object-contain" /></div><p className="mt-2 text-xs font-semibold text-gray-700 dark:text-gray-200">{item.slot || item.label}</p><div className="mt-2 flex flex-wrap gap-1.5"><button type="button" className={BUTTON} onClick={() => { close(); useStore.getState().setReviewImageId(item.imageId) }}>对比 / 版本</button><button type="button" className={BUTTON} onClick={() => { openImageInSeedreamEditor(item.imageId); close() }}>编辑此图</button><button type="button" disabled={busy} className={BUTTON} onClick={() => void attempt(async () => { await reuseMaterialItem(item); useStore.getState().showToast('已复用提示词、参数和参考图，未提交生成', 'success'); useStore.getState().closeMaterialLibrary(); window.location.hash = '' })}>复用配置</button></div>{item.reviewNote && <p className="mt-2 text-xs text-gray-500">{item.reviewNote}</p>}</article>)}</div>
           <details className="mt-5 rounded-xl border border-gray-200 p-3 text-xs dark:border-white/[0.1]"><summary className="cursor-pointer text-gray-500">管理套组</summary><div className="mt-3 flex gap-2"><input aria-label="重命名素材套组" value={rename} onChange={(event) => setRename(event.target.value)} className={`${INPUT} min-w-0 flex-1`} /><button type="button" disabled={busy || !rename.trim()} onClick={() => void attempt(() => renameMaterialCollection(collection.id, rename))} className={BUTTON}>保存名称</button><button type="button" disabled={busy} onClick={() => setConfirmDelete(true)} className="rounded-lg px-3 py-2 text-red-600">删除套组</button></div>{confirmDelete && <div className="mt-3 rounded-lg bg-red-50 p-3 text-red-700 dark:bg-red-500/10 dark:text-red-300"><p>删除该套组及其收藏版本？已有生成任务不会删除。</p><div className="mt-2 flex gap-2"><button type="button" disabled={busy} className={BUTTON} onClick={() => void attempt(async () => { await removeMaterialCollection(collection.id); setSelectedId('') })}>确认删除套组</button><button type="button" onClick={() => setConfirmDelete(false)} className={BUTTON}>取消</button></div></div>}</details>
         </div>}
       </>}
     </div>
-  </Sheet>, document.body)
+  </Sheet>, document.body)}</>
 }

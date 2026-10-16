@@ -12,9 +12,20 @@ vi.mock('./lib/db', () => {
   const thumbnails = new Map<string, StoredImageThumbnail>()
   let imageSeq = 0
   const analysisCache = new Map<string, import('./types').ReferenceAnalysisCacheEntry>()
+  const library = new Map<string, import('./types').ReferenceLibraryItem>()
+  const queue = new Map<string, import('./types').GenerationQueueItem>()
 
   return {
     CURRENT_THUMBNAIL_VERSION: 2,
+    referenceLibraryDb: {
+      getAll: async () => [...library.values()], put: async (item: import('./types').ReferenceLibraryItem) => { library.set(item.id, item) },
+      remove: async (id: string) => { library.delete(id) }, clear: async () => { library.clear() },
+    },
+    generationQueueDb: {
+      getAll: async () => [...queue.values()], put: async (item: import('./types').GenerationQueueItem) => { queue.set(item.id, item) },
+      putMany: async (items: import('./types').GenerationQueueItem[]) => { items.forEach((item) => queue.set(item.id, item)) },
+      remove: async (id: string) => { queue.delete(id) }, clear: async () => { queue.clear() },
+    },
     hashDataUrl: async (dataUrl: string) => `hash:${dataUrl}`,
     referenceAnalysisCacheDb: {
       getAll: async () => [...analysisCache.values()],
@@ -105,12 +116,17 @@ vi.mock('./lib/agentApi', () => ({
     }
   }),
 }))
-import { clearAmazonPlannerSessions, clearMaterialCollections, clearImages, clearTasks as clearStoredTasks, getAllAmazonPlannerSessions, getImage, putAmazonPlannerSession, putImage, putTask } from './lib/db'
+import { clearAmazonPlannerSessions, clearMaterialCollections, clearImages, clearTasks as clearStoredTasks, getAllAmazonPlannerSessions, getImage, putAmazonPlannerSession, putImage, putTask, referenceLibraryDb, generationQueueDb } from './lib/db'
 import { materialItemFromTask } from './lib/materialCollections'
 import { confirmProductFacts, emptyProductFactsState } from './lib/productFacts'
 import { normalizeReferenceAnalysis } from './lib/referenceAnalysis'
 import { normalizeReferenceUsage } from './lib/referenceImageUsage'
 import { saveMaterialCollection, reuseMaterialItem } from './store'
+import { referenceLibraryEntry } from './lib/referenceLibrary'
+import { createGenerationQueueItems } from './lib/generationQueueModel'
+import { generationProfileIdentity } from './lib/plannerGeneration'
+import { stopImageTask } from './store'
+import * as falImageApi from './lib/falAiImageApi'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
 import { callImageApi } from './lib/api'
 import { cleanStaleAgentInputDrafts, clearData, deleteImageIfUnreferenced, editOutputs, ensureImageCached, exportData, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, mergePersistedState, openSeedreamTaskInEditor, regenerateAgentAssistantMessage, removeTask, resolveInputImagesForRequest, retryTask, reuseConfig, submitAgentMessage, submitTask, submitTaskWithInput, useStore } from './store'
@@ -120,6 +136,8 @@ const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
 
 beforeEach(async () => {
   await clearMaterialCollections()
+  await referenceLibraryDb.clear(); await generationQueueDb.clear()
+  useStore.setState({ referenceLibrary: [], generationQueue: [], generationQueuePaused: true, generationQueueReady: false, generationQueueOpen: false, generationQueueMessage: '' })
   useStore.setState({ materialCollections: [], referenceImageUsages: {}, imageResultReviews: {}, imageFinalSelections: {}, reviewImageId: null, materialCollectionDraft: null, plannerRestoreRequest: null })
 })
 
@@ -132,6 +150,44 @@ describe('local material and review persistence', () => {
     vi.mocked(callImageApi).mockReset().mockResolvedValue({ images: [], actualParams: {} })
   })
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
+
+  it('deduplicates one queue attempt and cancellation rejects late image results', async () => {
+    let complete: (value: { images: string[]; actualParams: {} }) => void = () => {}
+    vi.mocked(callImageApi).mockImplementation(() => new Promise((resolve) => { complete = resolve }))
+    const profile = getHomeApiProfile(useStore.getState().settings)
+    const request = { apiProfileId: profile.id, prompt: 'Queued lamp', params: { ...DEFAULT_PARAMS }, inputImages: [], category: { workflow: 'amazon-listing' as const, amazonSlot: 'MAIN' }, generationQueueRef: 'queue-id:1' }
+    const first = await submitTaskWithInput(request), second = await submitTaskWithInput(request)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(second).toBe(first); expect(callImageApi).toHaveBeenCalledTimes(1)
+    stopImageTask(first!)
+    expect(vi.mocked(callImageApi).mock.calls[0][0].signal?.aborted).toBe(true)
+    complete({ images: ['data:image/png;base64,late-result'], actualParams: {} }); await vi.advanceTimersByTimeAsync(0)
+    expect(useStore.getState().tasks[0].status).toBe('error'); expect(useStore.getState().tasks[0].outputImages).toEqual([])
+  })
+
+  it('retains library-only and queue-only originals through startup and unreferenced-image deletion', async () => {
+    for (const id of ['library-only', 'queue-only']) await putImage({ id, dataUrl: 'data:image/png;base64,YQ==', createdAt: 1 })
+    await referenceLibraryDb.put(referenceLibraryEntry({ imageId: 'library-only', title: 'Saved input', tags: '', usage: normalizeReferenceUsage() }))
+    const profile = getHomeApiProfile(useStore.getState().settings)
+    await generationQueueDb.putMany(createGenerationQueueItems([{ apiProfileId: profile.id, profileIdentity: generationProfileIdentity(profile), prompt: 'Photo', params: { ...DEFAULT_PARAMS }, category: { amazonSlot: 'MAIN' }, inputImageIds: ['queue-only'], referenceImageUsages: {} }], 'Saved queue'))
+    await initStore()
+    for (const id of ['library-only', 'queue-only']) { await deleteImageIfUnreferenced(id); expect(await getImage(id)).toBeDefined() }
+    expect(useStore.getState().generationQueuePaused).toBe(true)
+  })
+
+  it('does not let a late native asynchronous result revive a manually stopped queue task', async () => {
+    let finish: (value: Awaited<ReturnType<typeof falImageApi.getFalQueuedImageResult>>) => void = () => {}
+    const poll = vi.spyOn(falImageApi, 'getFalQueuedImageResult').mockImplementation(() => new Promise((resolve) => { finish = resolve }))
+    const fal = createDefaultFalProfile({ apiKey: 'test-key' })
+    useStore.setState({ settings: normalizeSettings({ ...useStore.getState().settings, profiles: [...useStore.getState().settings.profiles, fal] }) })
+    const native = task({ id: 'native-queue-task', status: 'running', apiProvider: 'fal', apiProfileId: fal.id, falRequestId: 'upstream-id', falEndpoint: 'fal-ai/test', generationQueueRef: 'queue-native:1', outputImages: [] })
+    await putTask(native); await initStore(); await vi.advanceTimersByTimeAsync(0)
+    expect(poll).toHaveBeenCalledTimes(1)
+    stopImageTask(native.id)
+    finish({ images: ['data:image/png;base64,late-native-result'], actualParams: {} }); await vi.advanceTimersByTimeAsync(0)
+    expect(useStore.getState().tasks.find((row) => row.id === native.id)).toMatchObject({ status: 'error', outputImages: [], customRecoverable: false, falRecoverable: false })
+    await vi.advanceTimersByTimeAsync(60_000); expect(poll).toHaveBeenCalledTimes(1)
+  })
 
   it('keeps all collection versions and references after deleting tasks and reopening the database', async () => {
     const generated = task({ id: 'collected-task', outputImages: ['saved-v1'], inputImageIds: ['saved-ref'] })
@@ -258,6 +314,10 @@ describe('local material and review persistence', () => {
     const facts = confirmProductFacts(draft, 'source', ['backup-ref'])
     const analysis = { id: 'backup-analysis', imageId: 'backup-ref', imageHash: 'hash:data:image/png;base64,YQ==', profileIdentity: 'planner', usage: normalizeReferenceUsage(), analysis: normalizeReferenceAnalysis({ summary: 'Round base' }), model: 'planner', createdAt: 1 }
     const savedTask = task({ outputImages: ['backup-output'], inputImageIds: ['backup-ref'], productFactsSnapshot: facts.versions[0], referenceAnalysisSnapshots: [analysis] })
+    await referenceLibraryDb.put(referenceLibraryEntry({ imageId: 'backup-ref', title: 'Portable input', tags: 'lamp', usage: normalizeReferenceUsage(), analyses: [analysis] }))
+    const profile = getHomeApiProfile(useStore.getState().settings)
+    const queue = createGenerationQueueItems([{ apiProfileId: profile.id, profileIdentity: generationProfileIdentity(profile), prompt: 'Queued photo', params: { ...DEFAULT_PARAMS }, category: { amazonSlot: 'MAIN' }, inputImageIds: ['backup-ref'], referenceImageUsages: {} }], 'Portable queue')
+    await generationQueueDb.putMany(queue)
     const saved = await saveMaterialCollection({ title: 'Portable set', items: [materialItemFromTask(savedTask, 'backup-output')], plannerSession: amazonPlannerSession({ referenceImageIds: ['backup-ref'], productFacts: facts, referenceAnalyses: { 'backup-ref': analysis } }) })
     useStore.getState().saveImageReview('backup-output', 'backup-output', 'approved', 'Keep it')
     vi.stubGlobal('document', { createElement: () => ({ href: '', download: '', click: vi.fn() }) })
@@ -269,7 +329,9 @@ describe('local material and review persistence', () => {
     const manifest = JSON.parse(strFromU8(unzipSync(new Uint8Array(bytes))['manifest.json'])) as ExportData
     expect(manifest.settings).toBeUndefined()
     expect(manifest.materialCollections?.[0].id).toBe(saved.id)
-    await clearMaterialCollections(); await clearImages()
+    expect(manifest.referenceLibrary?.[0].title).toBe('Portable input'); expect(manifest.generationQueue?.[0].id).toBe(queue[0].id)
+    expect(JSON.stringify(manifest)).not.toContain(profile.apiKey)
+    await clearMaterialCollections(); await clearImages(); await referenceLibraryDb.clear(); await generationQueueDb.clear()
     useStore.setState({ materialCollections: [], imageResultReviews: {}, imageFinalSelections: {} })
     expect(await importData({ arrayBuffer: async () => bytes } as File, { importConfig: false, importTasks: true })).toBe(true)
     expect(useStore.getState().materialCollections[0].versions[0].plannerSession?.referenceImageIds).toEqual(['backup-ref'])
@@ -279,6 +341,8 @@ describe('local material and review persistence', () => {
     expect(useStore.getState().imageFinalSelections['backup-output']).toBe('backup-output')
     expect(await getImage('backup-output')).toBeDefined()
     expect(await getImage('backup-ref')).toBeDefined()
+    expect(useStore.getState().referenceLibrary[0].analyses[0].analysis.summary).toBe('Round base')
+    expect(useStore.getState().generationQueue[0].status).toBe('queued'); expect(useStore.getState().generationQueuePaused).toBe(true)
   })
 })
 

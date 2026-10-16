@@ -1,13 +1,16 @@
-import type { AmazonPlannerSession, MaterialCollection, ReferenceAnalysisCacheEntry, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
+import type { AmazonPlannerSession, GenerationQueueItem, MaterialCollection, ReferenceLibraryItem, ReferenceAnalysisCacheEntry, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
+import { sortGenerationQueue } from './generationQueueModel'
 
 const DB_NAME = 'amazon-image-studio'
-const DB_VERSION = 5
+const DB_VERSION = 6
 const STORE_TASKS = 'tasks'
 const STORE_IMAGES = 'images'
 const STORE_THUMBNAILS = 'thumbnails'
 const STORE_AMAZON_PLANNER_SESSIONS = 'amazonPlannerSessions'
 const STORE_MATERIAL_COLLECTIONS = 'materialCollections'
 const STORE_REFERENCE_ANALYSIS_CACHE = 'referenceAnalysisCache'
+const STORE_REFERENCE_LIBRARY = 'referenceLibrary'
+const STORE_GENERATION_QUEUE = 'generationQueue'
 const THUMBNAIL_MAX_SIZE = 720
 const THUMBNAIL_QUALITY = 0.9
 const THUMBNAIL_VERSION = 2
@@ -35,6 +38,8 @@ function openDB(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_MATERIAL_COLLECTIONS)) db.createObjectStore(STORE_MATERIAL_COLLECTIONS, { keyPath: 'id' })
       if (!db.objectStoreNames.contains(STORE_REFERENCE_ANALYSIS_CACHE)) db.createObjectStore(STORE_REFERENCE_ANALYSIS_CACHE, { keyPath: 'id' })
+      if (!db.objectStoreNames.contains(STORE_REFERENCE_LIBRARY)) db.createObjectStore(STORE_REFERENCE_LIBRARY, { keyPath: 'id' })
+      if (!db.objectStoreNames.contains(STORE_GENERATION_QUEUE)) db.createObjectStore(STORE_GENERATION_QUEUE, { keyPath: 'id' })
     }
     req.onsuccess = () => {
       if (blocked) { req.result.close(); return }
@@ -119,6 +124,28 @@ export const referenceAnalysisCacheDb = {
   put: (entry: ReferenceAnalysisCacheEntry) => dbTransaction(STORE_REFERENCE_ANALYSIS_CACHE, 'readwrite', (s) => s.put(entry)),
   remove: (id: string) => dbTransaction(STORE_REFERENCE_ANALYSIS_CACHE, 'readwrite', (s) => s.delete(id)),
   clear: () => dbTransaction(STORE_REFERENCE_ANALYSIS_CACHE, 'readwrite', (s) => s.clear()),
+}
+
+export const referenceLibraryDb = {
+  getAll: (): Promise<ReferenceLibraryItem[]> => dbTransaction(STORE_REFERENCE_LIBRARY, 'readonly', (s) => s.getAll()),
+  put: (entry: ReferenceLibraryItem) => dbTransaction(STORE_REFERENCE_LIBRARY, 'readwrite', (s) => s.put(entry)),
+  remove: (id: string) => dbTransaction(STORE_REFERENCE_LIBRARY, 'readwrite', (s) => s.delete(id)),
+  clear: () => dbTransaction(STORE_REFERENCE_LIBRARY, 'readwrite', (s) => s.clear()),
+}
+export const generationQueueDb = {
+  getAll: (): Promise<GenerationQueueItem[]> => dbTransaction<GenerationQueueItem[]>(STORE_GENERATION_QUEUE, 'readonly', (s) => s.getAll()).then(sortGenerationQueue),
+  put: (entry: GenerationQueueItem) => dbTransaction(STORE_GENERATION_QUEUE, 'readwrite', (s) => s.put(entry)),
+  remove: (id: string) => dbTransaction(STORE_GENERATION_QUEUE, 'readwrite', (s) => s.delete(id)),
+  clear: () => dbTransaction(STORE_GENERATION_QUEUE, 'readwrite', (s) => s.clear()),
+  async putMany(entries: GenerationQueueItem[]): Promise<void> {
+    const db = await openDB()
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_GENERATION_QUEUE, 'readwrite')
+      for (const entry of entries) tx.objectStore(STORE_GENERATION_QUEUE).put(entry)
+      tx.oncomplete = () => { db.close(); resolve() }
+      tx.onerror = tx.onabort = () => { db.close(); reject(tx.error ?? new Error('队列保存失败')) }
+    })
+  },
 }
 
 // ===== Images =====

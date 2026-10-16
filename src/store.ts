@@ -23,6 +23,8 @@ import type {
   MaterialCollection,
   MaterialCollectionDraft,
   MaterialCollectionItem,
+  ReferenceLibraryItem,
+  GenerationQueueItem,
   ExportData,
   ResponsesApiResponse,
   ResponsesOutputItem,
@@ -55,6 +57,8 @@ import {
   deleteImage,
   clearImages,
   storeImage,
+  referenceLibraryDb,
+  generationQueueDb,
 } from './lib/db'
 import { callImageApi } from './lib/api'
 import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage, type BatchImageCallResult } from './lib/agentApi'
@@ -75,6 +79,9 @@ import { appendProductFactsContract } from './lib/productFacts'
 import { analysisMatchesInputs, buildReferenceAnalysisContract, referenceAnalysisCache } from './lib/referenceAnalysis'
 import { normalizeImageResultReviews } from './lib/imageVersions'
 import { appendMaterialCollectionVersion, collectMaterialImageIds } from './lib/materialCollections'
+import { collectWorkflowImageIds } from './lib/workflowReferences'
+import { queueSubmissionRef, restoreGenerationQueue } from './lib/generationQueueModel'
+import { withGenerationQueueRecovery } from './lib/generationQueueLock'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
 
 // ===== Image cache =====
@@ -95,6 +102,7 @@ const SUPPORT_PROMPT_IMAGE_THRESHOLD = 50
 const AGENT_INPUT_DRAFT_RETENTION_MS = 3 * 24 * 60 * 60 * 1000
 const falRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const imageTaskControllers = new Map<string, AbortController>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const agentRoundControllers = new Map<string, AbortController>()
 const OPENAI_INTERRUPTED_ERROR = '请求中断'
@@ -804,6 +812,13 @@ interface AppState {
   setReviewImageId: (imageId: string | null) => void
   saveImageReview: (rootImageId: string, imageId: string, status: ImageResultReview['status'], note: string) => void
   materialCollections: MaterialCollection[]
+  referenceLibrary: ReferenceLibraryItem[]
+  generationQueue: GenerationQueueItem[]
+  generationQueuePaused: boolean
+  generationQueueConcurrency: 1 | 2
+  generationQueueReady: boolean
+  generationQueueOpen: boolean
+  generationQueueMessage: string
   materialLibraryOpen: boolean
   materialCollectionDraft: MaterialCollectionDraft | null
   openMaterialLibrary: (draft?: MaterialCollectionDraft) => void
@@ -919,6 +934,7 @@ interface AppState {
 }
 
 function isImageReferencedByState(state: AppState, imageId: string) {
+  if (collectWorkflowImageIds(state.referenceLibrary, state.generationQueue).has(imageId)) return true
   if (collectMaterialImageIds(state.materialCollections).has(imageId)) return true
   if (state.imageFinalSelections[imageId] || Object.values(state.imageFinalSelections).includes(imageId)) return true
   if (state.inputImages.some((img) => img.id === imageId)) return true
@@ -1315,6 +1331,13 @@ export const useStore = create<AppState>()(
           : Object.fromEntries(Object.entries(state.imageFinalSelections).filter(([root, selected]) => root !== rootImageId || selected !== imageId)),
       })),
       materialCollections: [],
+      referenceLibrary: [],
+      generationQueue: [],
+      generationQueuePaused: true,
+      generationQueueConcurrency: 1,
+      generationQueueReady: false,
+      generationQueueOpen: false,
+      generationQueueMessage: '',
       materialLibraryOpen: false,
       materialCollectionDraft: null,
       openMaterialLibrary: (draft) => set({ materialLibraryOpen: true, materialCollectionDraft: draft ?? null }),
@@ -1945,7 +1968,7 @@ async function resolveImageSizeParamsList(
 
 async function completeRecoveredFalTask(task: TaskRecord, result: Awaited<ReturnType<typeof getFalQueuedImageResult>>) {
   const latest = useStore.getState().tasks.find((item) => item.id === task.id)
-  if (!latest || latest.status === 'done') return
+  if (!latest || latest.status === 'done' || latest.cancelledAt) return
 
   const actualParamsList = await resolveImageSizeParamsList(result.images, result.actualParamsList)
   const outputIds: string[] = []
@@ -1955,6 +1978,7 @@ async function completeRecoveredFalTask(task: TaskRecord, result: Awaited<Return
     outputIds.push(imgId)
   }
 
+  if (useStore.getState().tasks.find((item) => item.id === task.id)?.cancelledAt) return
   updateTaskInStore(task.id, {
     outputImages: outputIds,
     actualParams: firstActualParams(actualParamsList),
@@ -1972,7 +1996,7 @@ async function completeRecoveredFalTask(task: TaskRecord, result: Awaited<Return
 async function recoverFalTask(taskId: string) {
   const { settings, tasks } = useStore.getState()
   const task = tasks.find((item) => item.id === taskId)
-  if (!task || task.apiProvider !== 'fal' || !task.falRequestId || !task.falEndpoint || task.status === 'done') return
+  if (!task || task.apiProvider !== 'fal' || !task.falRequestId || !task.falEndpoint || task.status === 'done' || task.cancelledAt) return
 
   const profile = getFalRecoveryProfile(settings, task)
   if (!profile) {
@@ -1986,6 +2010,7 @@ async function recoverFalTask(taskId: string) {
     await completeRecoveredFalTask(task, result)
     return
   } catch (err) {
+    if (useStore.getState().tasks.find((item) => item.id === taskId)?.cancelledAt) return
     if (isFalConnectionRecoverableError(err)) {
       scheduleFalRecovery(taskId)
       return
@@ -2007,11 +2032,25 @@ async function recoverFalTask(taskId: string) {
 export async function initStore() {
   const storedTasks = await getAllTasks()
   const materialCollections = await getAllMaterialCollections()
+  const referenceLibrary = await referenceLibraryDb.getAll()
+  const generationQueue = await generationQueueDb.getAll()
   void referenceAnalysisCache.prune().catch(() => { /* Cache cleanup must not block existing local work. */ })
-  useStore.setState({ materialCollections })
-  const { tasks, interruptedTasks } = markInterruptedOpenAIRunningTasks(storedTasks)
-  await Promise.all(interruptedTasks.map((task) => putTask(task)))
+  useStore.setState({ materialCollections, referenceLibrary, generationQueue, generationQueuePaused: true })
+  const { tasks, restoredQueue } = await withGenerationQueueRecovery(async () => {
+    const fresh = await getAllTasks()
+    const { tasks, interruptedTasks } = markInterruptedOpenAIRunningTasks(fresh)
+    await Promise.all(interruptedTasks.map((task) => putTask(task)))
+    const restoredQueue = restoreGenerationQueue(await generationQueueDb.getAll(), tasks)
+    await generationQueueDb.putMany(restoredQueue)
+    return { tasks, restoredQueue }
+  }, async () => {
+    const fresh = await getAllTasks()
+    const { tasks: otherTasks, interruptedTasks } = markInterruptedOpenAIRunningTasks(fresh.filter((task) => !task.generationQueueRef))
+    await Promise.all(interruptedTasks.map((task) => putTask(task)))
+    return { tasks: [...otherTasks, ...fresh.filter((task) => task.generationQueueRef)], restoredQueue: await generationQueueDb.getAll() }
+  })
   useStore.getState().setTasks(tasks)
+  useStore.setState({ generationQueue: restoredQueue })
   showSupportPromptForExistingLocalData(tasks)
   for (const task of tasks) {
     if (
@@ -2034,6 +2073,7 @@ export async function initStore() {
   const plannerSessions = await getAllAmazonPlannerSessions()
   const referencedIds = collectPlannerImageReferences(plannerSessions, useStore.getState().settings)
   for (const id of collectMaterialImageIds(materialCollections)) referencedIds.add(id)
+  for (const id of collectWorkflowImageIds(referenceLibrary, generationQueue)) referencedIds.add(id)
   for (const [root, selected] of Object.entries(useStore.getState().imageFinalSelections)) { referencedIds.add(root); referencedIds.add(selected) }
   const state = useStore.getState()
   const persistedInputImages = state.inputImages
@@ -2181,6 +2221,7 @@ export async function initStore() {
         : {}),
     })
   }
+  useStore.setState({ generationQueueReady: true })
 }
 
 export interface SubmitTaskWithInputRequest {
@@ -2194,6 +2235,8 @@ export interface SubmitTaskWithInputRequest {
   maskImageId?: string | null
   productFactsSnapshot?: TaskRecord['productFactsSnapshot']
   referenceAnalysisSnapshots?: TaskRecord['referenceAnalysisSnapshots']
+  referenceImageUsages?: Record<string, ReferenceImageUsage>
+  generationQueueRef?: string
 }
 
 /** Resolve persisted IDs to actual image bytes, preserving order and repairing a live preview's missing record. */
@@ -2218,6 +2261,10 @@ export async function resolveInputImagesForRequest(images: InputImage[], signal?
 /** 使用指定配置和输入创建任务，不读取或修改首页输入状态。 */
 export async function submitTaskWithInput(request: SubmitTaskWithInputRequest): Promise<string | null> {
   const state = useStore.getState()
+  if (request.generationQueueRef) {
+    const existing = state.tasks.find((task) => task.generationQueueRef === request.generationQueueRef)
+    if (existing) return existing.id
+  }
   const settings = normalizeSettings(state.settings)
   const homeProfile = getHomeApiProfile(state.settings)
   const profile = homeProfile.id === request.apiProfileId
@@ -2271,7 +2318,8 @@ export async function submitTaskWithInput(request: SubmitTaskWithInputRequest): 
         referenceImageIds: request.imageEditContext.referenceImageIds.map((id) => mapImageId(id)!),
       }
     : undefined
-  const referenceImageUsages = request.imageEditContext ? undefined : Object.fromEntries(storedImages.filter((image) => state.referenceImageUsages[image.id]).map((image) => [image.id, normalizeReferenceUsage(state.referenceImageUsages[image.id])]))
+  const requestedUsages = request.referenceImageUsages ?? state.referenceImageUsages
+  const referenceImageUsages = request.imageEditContext ? undefined : Object.fromEntries(storedImages.filter((image) => requestedUsages[image.id]).map((image) => [image.id, normalizeReferenceUsage(requestedUsages[image.id])]))
   const referenceAnalysisSnapshots = []
   for (const snapshot of request.referenceAnalysisSnapshots ?? []) {
     const image = storedImages.find((image) => image.id === snapshot.imageId)
@@ -2301,6 +2349,7 @@ export async function submitTaskWithInput(request: SubmitTaskWithInputRequest): 
     referenceAnalysisSnapshots: referenceAnalysisSnapshots.length ? JSON.parse(JSON.stringify(referenceAnalysisSnapshots)) : undefined,
     imageEditContext,
     referenceImageUsages,
+    generationQueueRef: request.generationQueueRef,
   }
 
   useStore.getState().setTasks([task, ...useStore.getState().tasks])
@@ -2715,6 +2764,7 @@ async function addPlannerReferencedImageIds(target: Set<string>) {
   const sessions = await getAllAmazonPlannerSessions()
   for (const id of collectPlannerImageReferences(sessions, useStore.getState().settings)) target.add(id)
   for (const id of collectMaterialImageIds(await getAllMaterialCollections())) target.add(id)
+  for (const id of collectWorkflowImageIds(await referenceLibraryDb.getAll(), await generationQueueDb.getAll())) target.add(id)
   for (const [root, selected] of Object.entries(useStore.getState().imageFinalSelections)) { target.add(root); target.add(selected) }
 }
 
@@ -3948,7 +3998,7 @@ async function executeAgentRound(
 async function executeTask(taskId: string) {
   const { settings } = useStore.getState()
   const task = useStore.getState().tasks.find((t) => t.id === taskId)
-  if (!task) return
+  if (!task || task.cancelledAt) return
   const taskProfile = getTaskApiProfile(settings, task)
   if (!taskProfile && task.apiProfileId) {
     updateTaskInStore(taskId, {
@@ -3970,6 +4020,8 @@ async function executeTask(taskId: string) {
   let customTaskInfo: { taskId: string } | null = task.customTaskId
     ? { taskId: task.customTaskId }
     : null
+  const controller = new AbortController()
+  imageTaskControllers.set(taskId, controller)
 
   if (taskProvider !== 'fal' && !isAsyncCustomProviderTask(requestSettings, taskProvider, task.inputImageIds.length > 0)) {
     scheduleOpenAIWatchdog(taskId, activeProfile.timeout, activeProfile)
@@ -3999,11 +4051,13 @@ async function executeTask(taskId: string) {
 
     const result = await callImageApi({
       settings: requestSettings,
+      signal: controller.signal,
       prompt: [replaceImageMentionsForApi(appendProductFactsContract(task.prompt, task.productFactsSnapshot), inputDataUrls.length), referenceUsageContract(task.inputImageIds, task.referenceImageUsages ?? {}, task.category?.styleReferenceImageId), buildReferenceAnalysisContract(task.inputImageIds, task.referenceImageUsages ?? {}, validAnalysisSnapshots)].filter(Boolean).join('\n\n'),
       params: task.params,
       inputImageDataUrls: apiInputDataUrls,
       maskDataUrl: apiMaskDataUrl,
       onFalRequestEnqueued: (request) => {
+        if (useStore.getState().tasks.find((row) => row.id === taskId)?.status !== 'running') return
         falRequestInfo = request
         updateTaskInStore(taskId, {
           falRequestId: request.requestId,
@@ -4012,6 +4066,7 @@ async function executeTask(taskId: string) {
         })
       },
       onCustomTaskEnqueued: (request) => {
+        if (useStore.getState().tasks.find((row) => row.id === taskId)?.status !== 'running') return
         customTaskInfo = request
         updateTaskInStore(taskId, {
           customTaskId: request.taskId,
@@ -4160,10 +4215,21 @@ async function executeTask(taskId: string) {
     }
   } finally {
     // 释放输入图片的内存缓存（已持久化到 IndexedDB，后续按需从 DB 加载）
+    if (imageTaskControllers.get(taskId) === controller) imageTaskControllers.delete(taskId)
     for (const imgId of task.inputImageIds) {
       imageCache.delete(imgId)
     }
   }
+}
+
+export function stopImageTask(taskId: string) {
+  const task = useStore.getState().tasks.find((item) => item.id === taskId)
+  if (!task || task.status !== 'running') return
+  imageTaskControllers.get(taskId)?.abort(new DOMException('用户停止等待', 'AbortError'))
+  clearOpenAIWatchdogTimer(taskId)
+  clearFalRecoveryTimer(taskId)
+  clearCustomRecoveryTimer(taskId)
+  updateTaskInStore(taskId, { status: 'error', error: '已停止等待此请求', cancelledAt: Date.now(), falRecoverable: false, customRecoverable: false, finishedAt: Date.now(), elapsed: Date.now() - task.createdAt })
 }
 
 export function updateTaskInStore(taskId: string, patch: Partial<TaskRecord>) {
@@ -4521,9 +4587,13 @@ export async function clearData(options: ClearOptions = { clearConfig: true, cle
   const { setTasks, clearInputImages, clearMaskDraft, resetSeedreamEditorDraft, setSettings, setParams, showToast } = useStore.getState()
 
   if (options.clearTasks) {
+    useStore.setState({ generationQueuePaused: true, generationQueueReady: false })
     previewTranslationCache.clear()
     await referenceAnalysisCache.clear()
     await dbClearMaterialCollections()
+    await referenceLibraryDb.clear()
+    await generationQueueDb.clear()
+    useStore.setState({ referenceLibrary: [], generationQueue: [], generationQueueReady: true })
     useStore.setState({ materialCollections: [], imageResultReviews: {}, imageFinalSelections: {}, referenceImageUsages: {}, reviewImageId: null, materialCollectionDraft: null })
     await dbClearTasks()
     await dbClearAmazonPlannerSessions()
@@ -4575,7 +4645,7 @@ function bytesToDataUrl(bytes: Uint8Array, filePath: string): string {
 
 async function completeRecoveredCustomTask(task: TaskRecord, result: Awaited<ReturnType<typeof getCustomQueuedImageResult>>) {
   const latest = useStore.getState().tasks.find((item) => item.id === task.id)
-  if (!latest || latest.status === 'done') return
+  if (!latest || latest.status === 'done' || latest.cancelledAt) return
 
   const actualParamsList = await readImageSizeParamsList(result.images)
   const outputIds: string[] = []
@@ -4585,6 +4655,7 @@ async function completeRecoveredCustomTask(task: TaskRecord, result: Awaited<Ret
     outputIds.push(imgId)
   }
 
+  if (useStore.getState().tasks.find((item) => item.id === task.id)?.cancelledAt) return
   updateTaskInStore(task.id, {
     outputImages: outputIds,
     actualParams: firstActualParams(actualParamsList),
@@ -4602,7 +4673,7 @@ async function completeRecoveredCustomTask(task: TaskRecord, result: Awaited<Ret
 async function recoverCustomTask(taskId: string) {
   const { settings, tasks } = useStore.getState()
   const task = tasks.find((item) => item.id === taskId)
-  if (!task || !task.customTaskId || task.status === 'done') return
+  if (!task || !task.customTaskId || task.status === 'done' || task.cancelledAt) return
 
   const profile = getCustomRecoveryProfile(settings, task)
   const customProvider = task.apiProvider ? getCustomProviderDefinition(settings, task.apiProvider) : null
@@ -4616,6 +4687,7 @@ async function recoverCustomTask(taskId: string) {
     clearCustomRecoveryTimer(taskId)
     await completeRecoveredCustomTask(task, result)
   } catch (err) {
+    if (useStore.getState().tasks.find((item) => item.id === taskId)?.cancelledAt) return
     clearCustomRecoveryTimer(taskId)
     updateTaskInStore(taskId, {
       status: 'error',
@@ -4653,6 +4725,8 @@ export async function exportData(options: ExportOptions = { exportConfig: true, 
     const tasks = options.exportTasks ? await getAllTasks() : []
     const amazonPlannerSessions = options.exportTasks ? await getAllAmazonPlannerSessions() : []
     const materialCollections = options.exportTasks ? await getAllMaterialCollections() : []
+    const referenceLibrary = options.exportTasks ? await referenceLibraryDb.getAll() : []
+    const generationQueue = options.exportTasks ? await generationQueueDb.getAll() : []
     const images = options.exportTasks ? await getAllImages() : []
     const { settings, agentConversations } = useStore.getState()
     const exportedAt = Date.now()
@@ -4734,6 +4808,8 @@ export async function exportData(options: ExportOptions = { exportConfig: true, 
       manifest.agentConversations = agentConversations
       manifest.amazonPlannerSessions = amazonPlannerSessions
       manifest.materialCollections = materialCollections
+      manifest.referenceLibrary = referenceLibrary
+      manifest.generationQueue = generationQueue
       manifest.imageResultReviews = useStore.getState().imageResultReviews
       manifest.imageFinalSelections = useStore.getState().imageFinalSelections
       manifest.imageFiles = imageFiles
@@ -4825,11 +4901,15 @@ export async function importData(file: File, options: ImportOptions = { importCo
       for (const collection of data.materialCollections ?? []) {
         if (collection && typeof collection.id === 'string' && Array.isArray(collection.versions)) await putMaterialCollection(collection)
       }
+      for (const item of data.referenceLibrary ?? []) if (item?.id && item.imageId && Array.isArray(item.analyses)) await referenceLibraryDb.put(item)
+      for (const item of data.generationQueue ?? []) if (item?.id && item.request?.prompt && Array.isArray(item.request.inputImageIds)) {
+        await generationQueueDb.put({ ...item, status: item.status === 'running' ? 'interrupted' : item.status, error: item.status === 'running' ? '备份中的任务执行状态未知，请核对后重试' : item.error })
+      }
       useStore.setState((state) => ({
         imageResultReviews: { ...state.imageResultReviews, ...normalizeImageResultReviews(data.imageResultReviews) },
         imageFinalSelections: { ...state.imageFinalSelections, ...normalizeImageSelections(data.imageFinalSelections) },
       }))
-      useStore.setState({ materialCollections: await getAllMaterialCollections() })
+      useStore.setState({ materialCollections: await getAllMaterialCollections(), referenceLibrary: await referenceLibraryDb.getAll(), generationQueue: await generationQueueDb.getAll(), generationQueuePaused: true })
 
       const tasks = await getAllTasks()
       useStore.getState().setTasks(tasks)

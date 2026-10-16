@@ -21,6 +21,8 @@ import { useGlobalClickSuppression } from './lib/clickSuppression'
 import { previewTranslationCache } from './lib/previewTranslationCache'
 import ImageVersionReviewModal from './components/ImageVersionReviewModal'
 import MaterialLibraryModal from './components/MaterialLibraryModal'
+import GenerationQueueModal from './components/GenerationQueueModal'
+import { startGenerationQueueRunner } from './lib/generationQueueRunner'
 
 export type AppView = 'home' | 'editor' | 'tagger'
 
@@ -32,6 +34,7 @@ function getAppViewFromHash(): AppView {
 }
 
 export default function App() {
+  useEffect(() => startGenerationQueueRunner(), [])
   const setSettings = useStore((s) => s.setSettings)
   const plannerRestoreRequest = useStore((s) => s.plannerRestoreRequest)
   const [view, setView] = useState<AppView>(getAppViewFromHash)
@@ -132,6 +135,7 @@ export default function App() {
       <DetailModal />
       <ImageVersionReviewModal />
       <MaterialLibraryModal />
+      <GenerationQueueModal />
       <Lightbox />
       <SettingsModal scope={view === 'editor' ? 'editor' : 'home'} />
       <ConfirmDialog />

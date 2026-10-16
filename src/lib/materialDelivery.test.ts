@@ -50,4 +50,24 @@ describe('single material version delivery ZIP', () => {
     const empty = { ...collection, versions: [{ ...collection.versions[0], items: [] }] } as MaterialCollection
     await expect(buildMaterialDeliveryZip(empty, empty.versions[0].id, readImage)).rejects.toThrow('只有策划')
   })
+  it('exports A+ external copy only for delivered slots in the selected saved version', async () => {
+    const plannerSession = { mode: 'aplus', marketplaceId: 'de', aPlusPlans: [
+      { slot: 'A+L01', label: '横幅', textTitle: 'Leselampe', textBody: 'Für Ihren Schreibtisch.' },
+      { slot: 'A+L02', label: '其他模块', textTitle: 'Not delivered', textBody: 'Do not export this' },
+    ] } as unknown as import('../types').AmazonPlannerSession
+    const collection = appendMaterialCollectionVersion({ title: 'A+ set', items: [item('one', 'A+L01')], plannerSession })
+    const result = await buildMaterialDeliveryZip(collection, collection.versions[0].id, readImage)
+    const files = unzipSync(result.bytes), copy = strFromU8(files['APlus-copy.md'])
+    expect(copy).toContain('A+L01'); expect(copy).toContain('Leselampe'); expect(copy).toContain('de')
+    expect(copy).not.toContain('Not delivered'); expect(copy).not.toContain('A+L02')
+    const manifest = JSON.parse(strFromU8(files['manifest.json']))
+    expect(manifest.aPlusCopyFile).toBe('APlus-copy.md'); expect(manifest.images[0].originalDimensions).toEqual(manifest.images[0].dimensions)
+  })
+  it('uses the generated image’s linked module version instead of newer A+ copy', async () => {
+    const oldPlan = { slot: 'A+L01', label: '旧版横幅', textTitle: 'Original title', textBody: 'Original body', uploadSize: '970x300' }
+    const plannerSession = { mode: 'aplus', aPlusPlans: [{ ...oldPlan, textTitle: 'New unrelated title' }], moduleVersions: { 'aplus:A+L01': [{ id: 'old-plan', mode: 'aplus', plan: oldPlan }] } } as unknown as import('../types').AmazonPlannerSession
+    const collection = appendMaterialCollectionVersion({ title: 'Versioned copy', items: [{ ...item('one', 'A+L01'), category: { plannerModuleVersionId: 'old-plan' } }], plannerSession })
+    const copy = strFromU8(unzipSync((await buildMaterialDeliveryZip(collection, collection.versions[0].id, readImage)).bytes)['APlus-copy.md'])
+    expect(copy).toContain('Original title'); expect(copy).toContain('old-plan'); expect(copy).not.toContain('New unrelated title')
+  })
 })

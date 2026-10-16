@@ -1,9 +1,10 @@
 import type { InputImage, ReferenceImageUsage } from '../types'
 import { normalizeReferenceUsage, REFERENCE_PURPOSE_LABELS } from '../lib/referenceImageUsage'
 
-export default function PlannerReferenceCard({ image, index, usage: rawUsage, slots, onChange, onRemove, onPreview, onAnalyze, hasAnalysis }: {
+export default function PlannerReferenceCard({ image, index, usage: rawUsage, slots, onChange, onRemove, onPreview, onAnalyze, onSaveLibrary, hasAnalysis }: {
   image: InputImage; index: number; usage?: ReferenceImageUsage; slots: Array<{ slot: string; label: string }>
   onAnalyze?: () => void; hasAnalysis?: boolean
+  onSaveLibrary?: () => void
   onChange: (usage: Partial<ReferenceImageUsage>) => void; onRemove: () => void; onPreview: () => void
 }) {
   const usage = normalizeReferenceUsage(rawUsage)
@@ -12,5 +13,6 @@ export default function PlannerReferenceCard({ image, index, usage: rawUsage, sl
     <select aria-label={`参考图 ${index + 1} 适用图片位`} value={usage.slots[0] ?? ''} onChange={(event) => onChange({ slots: event.target.value ? [event.target.value] : [] })} className="mt-2 w-full rounded-lg border border-gray-200 bg-white p-1.5 text-xs text-gray-600 dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-300"><option value="">适用于全部图片</option>{usage.slots[0] && !slots.some((item) => item.slot === usage.slots[0]) && <option value={usage.slots[0]}>{usage.slots[0]}（其他编排）</option>}{slots.map((item) => <option key={item.slot} value={item.slot}>仅 {item.slot} · {item.label}</option>)}</select>
     <input aria-label={`参考图 ${index + 1} 使用说明`} maxLength={1000} value={usage.note} onChange={(event) => onChange({ note: event.target.value })} placeholder="可选：说明需要参考的细节" className="mt-2 w-full rounded-lg border border-gray-200 bg-white px-2 py-1.5 text-xs dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-200" />
     {onAnalyze && <button type="button" aria-label={`分析参考图 ${index + 1}`} onClick={onAnalyze} className="mt-2 w-full rounded-lg bg-blue-50 px-2 py-1.5 text-xs font-semibold text-blue-700 dark:bg-blue-500/10 dark:text-blue-300">{hasAnalysis ? '查看分析 / 缓存' : '分析参考图'}</button>}
+    {onSaveLibrary && <button type="button" aria-label={`收藏参考图 ${index + 1}`} onClick={onSaveLibrary} className="mt-1 w-full rounded-lg px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-50 dark:text-gray-400 dark:hover:bg-white/5">存入参考图库</button>}
   </div>
 }

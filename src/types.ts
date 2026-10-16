@@ -255,6 +255,7 @@ export interface TaskRecord {
   error: string | null
   createdAt: number
   finishedAt: number | null
+  cancelledAt?: number
   /** 总耗时毫秒 */
   elapsed: number | null
   /** 是否收藏 */
@@ -290,6 +291,7 @@ export interface TaskRecord {
   referenceImageUsages?: Record<string, ReferenceImageUsage>
   productFactsSnapshot?: ProductFactsVersion
   referenceAnalysisSnapshots?: ReferenceAnalysisSnapshot[]
+  generationQueueRef?: string
 }
 
 export interface AmazonVisualSystem {
@@ -437,6 +439,7 @@ export interface PlannerModuleVersion {
   mode: 'listing' | 'aplus'
   plan: AmazonPlannerSessionImagePlan | AmazonPlannerSessionAPlusPlan
   context?: PlannerSourceContext
+  creative?: { groupId: string; title: string; summary: string }
 }
 
 export interface ProductFacts {
@@ -489,6 +492,57 @@ export interface ReferenceAnalysisSnapshot {
   analysis: ReferenceAnalysis
   model: string
   createdAt: number
+  revisions?: ReferenceAnalysisRevision[]
+  selectedRevisionId?: string
+}
+
+export interface ReferenceAnalysisRevision {
+  id: string
+  versionNumber: number
+  createdAt: number
+  source: 'manual' | 'ai'
+  note: string
+  analysis: ReferenceAnalysis
+}
+
+export interface ReferenceLibraryItem {
+  id: string
+  title: string
+  tags: string[]
+  imageId: string
+  usage: ReferenceImageUsage
+  analyses: ReferenceAnalysisSnapshot[]
+  createdAt: number
+  updatedAt: number
+}
+
+/** Immutable request inputs; credentials are resolved from the current profile only when dispatched. */
+export interface GenerationQueueRequest {
+  apiProfileId: string
+  profileIdentity: string
+  prompt: string
+  inputImageIds: string[]
+  params: TaskParams
+  category: NonNullable<TaskRecord['category']>
+  referenceImageUsages: Record<string, ReferenceImageUsage>
+  productFactsSnapshot?: ProductFactsVersion
+  referenceAnalysisSnapshots?: ReferenceAnalysisSnapshot[]
+}
+
+export interface GenerationQueueItem {
+  id: string
+  batchId: string
+  title: string
+  slot: string
+  order?: number
+  status: 'queued' | 'running' | 'done' | 'error' | 'cancelled' | 'interrupted'
+  request: GenerationQueueRequest
+  attempt: number
+  taskId?: string
+  taskIds: string[]
+  error?: string
+  createdAt: number
+  updatedAt: number
 }
 
 export interface ReferenceAnalysisCacheEntry extends ReferenceAnalysisSnapshot {
@@ -737,6 +791,8 @@ export interface ExportData {
   agentConversations?: AgentConversation[]
   amazonPlannerSessions?: AmazonPlannerSession[]
   materialCollections?: MaterialCollection[]
+  referenceLibrary?: ReferenceLibraryItem[]
+  generationQueue?: GenerationQueueItem[]
   imageResultReviews?: Record<string, ImageResultReview>
   imageFinalSelections?: Record<string, string>
   /** imageId → 图片信息 */

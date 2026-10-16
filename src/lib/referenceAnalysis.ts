@@ -2,6 +2,7 @@ import type { ApiProfile, InputImage, PlannerSourceContext, ProductFactsVersion,
 import { hashDataUrl, referenceAnalysisCacheDb } from './db'
 import { cleanList, cleanText, contextFingerprint } from './productFacts'
 import { describeReferenceUsage, normalizeReferenceUsage } from './referenceImageUsage'
+import { localId } from './localId'
 
 export const REFERENCE_ANALYSIS_TTL = 30 * 24 * 60 * 60 * 1000
 const PROMPT_VERSION = 1
@@ -9,6 +10,20 @@ export const ANALYSIS_LIST_FIELDS = [['visibleDetails', '可见细节'], ['layou
 export function normalizeReferenceAnalysis(value: unknown): ReferenceAnalysis {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   return { summary: cleanText(raw.summary), ...Object.fromEntries(ANALYSIS_LIST_FIELDS.map(([key]) => [key, cleanList(raw[key])])) } as unknown as ReferenceAnalysis
+}
+export function effectiveReferenceAnalysis(snapshot: ReferenceAnalysisSnapshot): ReferenceAnalysis {
+  return normalizeReferenceAnalysis(snapshot.revisions?.find((item) => item.id === snapshot.selectedRevisionId)?.analysis ?? snapshot.analysis)
+}
+export function reviseReferenceAnalysis(snapshot: ReferenceAnalysisSnapshot, analysis: ReferenceAnalysis, note: string): ReferenceAnalysisSnapshot {
+  const normalized = normalizeReferenceAnalysis(analysis)
+  if (!normalized.summary) throw new Error('请填写分析摘要后保存')
+  const revision = { id: localId('reference-revision'), versionNumber: Math.max(0, ...(snapshot.revisions ?? []).map((item) => item.versionNumber)) + 1, source: 'manual' as const, createdAt: Date.now(), note: note.trim().slice(0, 1000), analysis: normalized }
+  return JSON.parse(JSON.stringify({ ...snapshot, revisions: [...(snapshot.revisions ?? []), revision], selectedRevisionId: revision.id }))
+}
+export function refreshReferenceAnalysis(previous: ReferenceAnalysisSnapshot | undefined, next: ReferenceAnalysisSnapshot): ReferenceAnalysisSnapshot {
+  if (!previous || previous.id !== next.id) return next
+  const archived = { id: localId('reference-ai'), versionNumber: Math.max(0, ...(previous.revisions ?? []).map((item) => item.versionNumber)) + 1, source: 'ai' as const, createdAt: previous.createdAt, note: '上一次 AI 原始分析', analysis: normalizeReferenceAnalysis(previous.analysis) }
+  return { ...next, revisions: [...(previous.revisions ?? []), archived], selectedRevisionId: undefined }
 }
 export function referenceProfileIdentity(profile: ApiProfile): string {
   // Deliberately excludes credentials and profile display names.
@@ -45,12 +60,13 @@ export function createReferenceAnalysisCache(db: CacheAdapter, now = Date.now) {
       const entry = (await prune()).find((row) => row.id === id)
       if (!entry) return
       if (touch) await db.put({ ...entry, lastUsedAt: now() })
-      const { lastUsedAt: _, ...snapshot } = entry
+      const { lastUsedAt: _, revisions: __, selectedRevisionId: ___, ...snapshot } = entry
       return { ...snapshot, usage: normalizeReferenceUsage(snapshot.usage), analysis: normalizeReferenceAnalysis(snapshot.analysis) }
     },
     async put(snapshot: ReferenceAnalysisSnapshot) {
       if (!snapshot.analysis.summary.trim()) throw new Error('参考图分析为空，未写入缓存')
-      await db.put({ ...JSON.parse(JSON.stringify(snapshot)), lastUsedAt: now() })
+      const { revisions: _, selectedRevisionId: __, ...automatic } = snapshot
+      await db.put({ ...JSON.parse(JSON.stringify(automatic)), lastUsedAt: now() })
       await prune()
     },
   }
@@ -74,7 +90,7 @@ export function analysisMatchesInputs(snapshot: ReferenceAnalysisSnapshot, image
   return snapshot.imageId === imageId && usageIdentity(snapshot.usage) === usageIdentity(usage) && (!profile || snapshot.profileIdentity === referenceProfileIdentity(profile))
 }
 export function referenceAnalysisDescription(usage?: ReferenceImageUsage, analysis?: ReferenceAnalysisSnapshot): string {
-  return [describeReferenceUsage(usage), analysis ? `Previously observed visual context (fallible observations; not verified product claims): ${JSON.stringify(normalizeReferenceAnalysis(analysis.analysis))}. Confirmed product facts take precedence.` : ''].filter(Boolean).join('\n')
+  return [describeReferenceUsage(usage), analysis ? `Previously observed visual context${analysis.selectedRevisionId ? ' with user corrections' : ''} (fallible observations; not verified product claims): ${JSON.stringify(effectiveReferenceAnalysis(analysis))}. Confirmed product facts take precedence.` : ''].filter(Boolean).join('\n')
 }
 export function buildReferenceAnalysisContract(ids: string[], usages: Record<string, ReferenceImageUsage>, snapshots: ReferenceAnalysisSnapshot[] = []): string {
   const entries = ids.flatMap((id, index) => {
@@ -85,7 +101,7 @@ export function buildReferenceAnalysisContract(ids: string[], usages: Record<str
 }
 export function plannerSourceContext(ids: string[], usages: Record<string, ReferenceImageUsage>, analyses: Record<string, ReferenceAnalysisSnapshot>, facts?: ProductFactsVersion): PlannerSourceContext {
   const snapshots = ids.flatMap((id) => analyses[id] && analysisMatchesInputs(analyses[id], id, usages[id]) ? [analyses[id]] : [])
-  return { productFactsVersionId: facts?.id, referenceFingerprint: contextFingerprint(ids.map((id) => { const snapshot = snapshots.find((row) => row.imageId === id); return [id, usageIdentity(usages[id]), snapshot ? [snapshot.id, snapshot.createdAt, snapshot.analysis] : null] })), referenceImageIds: [...ids], referenceAnalyses: JSON.parse(JSON.stringify(snapshots)) }
+  return { productFactsVersionId: facts?.id, referenceFingerprint: contextFingerprint(ids.map((id) => { const snapshot = snapshots.find((row) => row.imageId === id); return [id, usageIdentity(usages[id]), snapshot ? (snapshot.selectedRevisionId ? [snapshot.id, snapshot.createdAt, snapshot.selectedRevisionId, effectiveReferenceAnalysis(snapshot)] : [snapshot.id, snapshot.createdAt, snapshot.analysis]) : null] })), referenceImageIds: [...ids], referenceAnalyses: JSON.parse(JSON.stringify(snapshots)) }
 }
 export function isPlannerContextStale(previous: PlannerSourceContext | undefined, current: PlannerSourceContext): boolean {
   return previous ? previous.productFactsVersionId !== current.productFactsVersionId || previous.referenceFingerprint !== current.referenceFingerprint : !!current.productFactsVersionId || !!current.referenceAnalyses.length
