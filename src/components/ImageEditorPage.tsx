@@ -266,6 +266,9 @@ export default function ImageEditorPage() {
   const setEditorSubmitting = useStore((state) => state.setEditorSubmitting)
   const setDraft = useStore((state) => state.setSeedreamEditorDraft)
   const tasks = useStore((state) => state.tasks)
+  const collections = useStore((state) => state.materialCollections)
+  const inheritedFacts = tasks.find((task) => task.outputImages.includes(draft.sourceImageId ?? ''))?.productFactsSnapshot
+    ?? collections.flatMap((collection) => collection.versions.flatMap((version) => version.items)).find((item) => item.imageId === draft.sourceImageId)?.productFactsSnapshot
   const streamPreviews = useStore((state) => state.streamPreviews)
   const setShowSettings = useStore((state) => state.setShowSettings)
   const setLightboxImageId = useStore((state) => state.setLightboxImageId)
@@ -665,7 +668,10 @@ export default function ImageEditorPage() {
         ...(visualGuide ? [visualGuide] : []),
         ...referenceImages,
       ]
-      const sourceCategory = useStore.getState().tasks.find((task) => task.outputImages.includes(sourceImageId))?.category
+      const sourceTask = useStore.getState().tasks.find((task) => task.outputImages.includes(sourceImageId))
+      const sourceItem = useStore.getState().materialCollections.flatMap((collection) => collection.versions.flatMap((version) => version.items)).find((item) => item.imageId === sourceImageId)
+      const sourceCategory = sourceTask?.category ?? sourceItem?.category
+      const productFactsSnapshot = draft.preserveProductFacts === false ? undefined : sourceTask?.productFactsSnapshot ?? sourceItem?.productFactsSnapshot
       const taskId = await submitTaskWithInput({
         apiProfileId: profile.id,
         prompt: buildSeedreamEditPrompt({
@@ -675,7 +681,8 @@ export default function ImageEditorPage() {
         }),
         inputImages,
         params: createImageEditorParams(selectedResolution, profile, { width: sourceImage.naturalWidth, height: sourceImage.naturalHeight }),
-        category: { workflow: 'seedream-edit', productTitle: sourceCategory?.productTitle, amazonSlot: sourceCategory?.amazonSlot, plannerSessionId: sourceCategory?.plannerSessionId, plannerModuleVersionId: sourceCategory?.plannerModuleVersionId, marketplaceId: sourceCategory?.marketplaceId, aPlusType: sourceCategory?.aPlusType },
+        category: { workflow: 'seedream-edit', productTitle: sourceCategory?.productTitle, amazonSlot: sourceCategory?.amazonSlot, plannerSessionId: sourceCategory?.plannerSessionId, plannerModuleVersionId: sourceCategory?.plannerModuleVersionId, productFactsVersionId: productFactsSnapshot?.id, marketplaceId: sourceCategory?.marketplaceId, aPlusType: sourceCategory?.aPlusType },
+        productFactsSnapshot,
         imageEditContext: {
           engine: draft.engine,
           sourceImageId: draft.sourceImageId,
@@ -980,6 +987,7 @@ export default function ImageEditorPage() {
               ))}
             </div>
             <textarea id="seedream-instruction" disabled={uploadingSource} value={draft.instruction} onChange={(event) => setDraft({ instruction: event.target.value })} rows={6} placeholder="例如：删除红色箭头指向的文字，其余产品结构、光影和背景保持不变。" className="ios-field mt-3 w-full resize-y px-3 py-2.5 text-sm leading-6 text-gray-900 placeholder:text-gray-400 dark:text-gray-100" />
+            {inheritedFacts && <label className="mt-3 flex items-start gap-2 text-xs leading-relaxed text-gray-600 dark:text-gray-300"><input type="checkbox" checked={draft.preserveProductFacts !== false} onChange={(event) => setDraft({ preserveProductFacts: event.target.checked })} className="mt-0.5" /><span>保持来源商品事实 v{inheritedFacts.versionNumber}（{inheritedFacts.facts.productName || '已确认商品'}）。需要主动改变商品颜色、结构等事实时，可取消勾选。</span></label>}
 
             <div className="mt-4 flex items-center justify-between gap-3">
               <span className="text-xs font-semibold text-gray-500 dark:text-gray-400">输出分辨率</span>

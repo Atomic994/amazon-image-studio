@@ -11,9 +11,17 @@ vi.mock('./lib/db', () => {
   const images = new Map<string, StoredImage>()
   const thumbnails = new Map<string, StoredImageThumbnail>()
   let imageSeq = 0
+  const analysisCache = new Map<string, import('./types').ReferenceAnalysisCacheEntry>()
 
   return {
     CURRENT_THUMBNAIL_VERSION: 2,
+    hashDataUrl: async (dataUrl: string) => `hash:${dataUrl}`,
+    referenceAnalysisCacheDb: {
+      getAll: async () => [...analysisCache.values()],
+      put: async (entry: import('./types').ReferenceAnalysisCacheEntry) => { analysisCache.set(entry.id, entry) },
+      remove: async (id: string) => { analysisCache.delete(id) },
+      clear: async () => { analysisCache.clear() },
+    },
     getAllTasks: async () => [...tasks.values()],
     putTask: async (task: TaskRecord) => {
       tasks.set(task.id, task)
@@ -99,6 +107,9 @@ vi.mock('./lib/agentApi', () => ({
 }))
 import { clearAmazonPlannerSessions, clearMaterialCollections, clearImages, clearTasks as clearStoredTasks, getAllAmazonPlannerSessions, getImage, putAmazonPlannerSession, putImage, putTask } from './lib/db'
 import { materialItemFromTask } from './lib/materialCollections'
+import { confirmProductFacts, emptyProductFactsState } from './lib/productFacts'
+import { normalizeReferenceAnalysis } from './lib/referenceAnalysis'
+import { normalizeReferenceUsage } from './lib/referenceImageUsage'
 import { saveMaterialCollection, reuseMaterialItem } from './store'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
 import { callImageApi } from './lib/api'
@@ -174,6 +185,56 @@ describe('local material and review persistence', () => {
     expect(persisted.imageResultReviews.v3.note).toBe('Final')
   })
 
+  it('binds confirmed facts and validated reference observations to requests and keeps them on retry and reuse', async () => {
+    const reference = { id: 'facts-ref', dataUrl: 'data:image/png;base64,YQ==' }
+    await putImage(reference)
+    const factsState = emptyProductFactsState(); factsState.draft.productName = 'Lamp'; factsState.draft.color = 'Black'
+    const confirmed = confirmProductFacts(factsState, 'source', [reference.id]).versions[0]
+    const analysis = { id: 'cached', imageId: reference.id, imageHash: `hash:${reference.dataUrl}`, profileIdentity: 'planner', usage: normalizeReferenceUsage(), analysis: normalizeReferenceAnalysis({ summary: 'Round base' }), model: 'planner', createdAt: 1 }
+    const state = useStore.getState()
+    state.setInputImages([reference]); state.setPrompt('Generate lamp')
+    state.setPendingTaskCategory({ mode: 'prompt-match', prompt: 'Generate lamp', category: { workflow: 'amazon-listing', amazonSlot: 'MAIN', productFactsVersionId: confirmed.id }, productFactsSnapshot: confirmed, referenceAnalysisSnapshots: [analysis] })
+    expect(await submitTask()).toBe(true)
+    confirmed.facts.color = 'Changed outside task'
+    await vi.advanceTimersByTimeAsync(0)
+    const generated = useStore.getState().tasks[0]
+    expect(generated.productFactsSnapshot?.facts.color).toBe('Black')
+    expect(vi.mocked(callImageApi).mock.calls[0][0].prompt).toContain('color: Black')
+    expect(vi.mocked(callImageApi).mock.calls[0][0].prompt).toContain('Round base')
+    expect(vi.mocked(callImageApi).mock.calls[0][0].inputImageDataUrls).toEqual([reference.dataUrl])
+    await retryTask(generated); await vi.advanceTimersByTimeAsync(0)
+    expect(vi.mocked(callImageApi).mock.calls[1][0].prompt).toContain(`CONFIRMED PRODUCT FACTS [${confirmed.id}]`)
+    await reuseMaterialItem(materialItemFromTask(generated, 'output'))
+    expect(useStore.getState().pendingTaskCategory?.productFactsSnapshot?.facts.color).toBe('Black')
+    await reuseConfig(generated)
+    expect(useStore.getState().pendingTaskCategory?.productFactsSnapshot?.id).toBe(confirmed.id)
+  })
+
+  it('discards cached analysis when original bytes changed and never replaces image attachments with text', async () => {
+    const reference = { id: 'changed-bytes', dataUrl: 'data:image/png;base64,Yg==' }
+    await putImage(reference)
+    const analysis = { id: 'old-analysis', imageId: reference.id, imageHash: 'hash:data:image/png;base64,YQ==', profileIdentity: 'planner', usage: normalizeReferenceUsage(), analysis: normalizeReferenceAnalysis({ summary: 'Stale observation must not be used' }), model: 'planner', createdAt: 1 }
+    await submitTaskWithInput({ apiProfileId: getHomeApiProfile(useStore.getState().settings).id, prompt: 'Keep image', params: { ...DEFAULT_PARAMS }, inputImages: [reference], category: { workflow: 'gallery' }, referenceAnalysisSnapshots: [analysis] })
+    await vi.advanceTimersByTimeAsync(0)
+    const request = vi.mocked(callImageApi).mock.calls[0][0]
+    expect(request.inputImageDataUrls).toEqual([reference.dataUrl])
+    expect(request.prompt).not.toContain('Stale observation')
+    expect(useStore.getState().tasks[0].referenceAnalysisSnapshots).toBeUndefined()
+  })
+
+  it('pins fact provenance and analysis originals after the generation task is removed if a set still uses them', async () => {
+    const factsState = emptyProductFactsState(); factsState.draft.productName = 'Lamp'
+    const confirmed = confirmProductFacts(factsState, 'old-source', ['original-facts-source']).versions[0]
+    for (const id of ['saved-output', 'original-facts-source']) await putImage({ id, dataUrl: 'data:image/png;base64,YQ==', createdAt: 1 })
+    const generated = task({ id: 'facts-task', inputImageIds: [], outputImages: ['saved-output'], productFactsSnapshot: confirmed })
+    await putTask(generated); useStore.setState({ tasks: [generated] })
+    await saveMaterialCollection({ title: 'With fact provenance', items: [materialItemFromTask(generated, 'saved-output')] })
+    await removeTask(generated)
+    expect(await getImage('original-facts-source')).toBeDefined()
+    await initStore()
+    expect(await getImage('original-facts-source')).toBeDefined()
+  })
+
   it('remaps explicit references after scope filtering and rejects references excluded from the current slot', async () => {
     const refs = ['scope-product', 'scope-excluded', 'scope-style'].map((id) => ({ id, dataUrl: `data:image/png;base64,${id}` }))
     for (const image of refs) await putImage({ ...image, createdAt: 1 })
@@ -193,8 +254,11 @@ describe('local material and review persistence', () => {
 
   it('round-trips collections, review choices and images through a backup without API credentials', async () => {
     for (const id of ['backup-output', 'backup-ref']) await putImage({ id, dataUrl: 'data:image/png;base64,YQ==', createdAt: Date.now() })
-    const savedTask = task({ outputImages: ['backup-output'], inputImageIds: ['backup-ref'] })
-    const saved = await saveMaterialCollection({ title: 'Portable set', items: [materialItemFromTask(savedTask, 'backup-output')], plannerSession: amazonPlannerSession({ referenceImageIds: ['backup-ref'] }) })
+    const draft = emptyProductFactsState(); draft.draft.productName = 'Portable lamp'
+    const facts = confirmProductFacts(draft, 'source', ['backup-ref'])
+    const analysis = { id: 'backup-analysis', imageId: 'backup-ref', imageHash: 'hash:data:image/png;base64,YQ==', profileIdentity: 'planner', usage: normalizeReferenceUsage(), analysis: normalizeReferenceAnalysis({ summary: 'Round base' }), model: 'planner', createdAt: 1 }
+    const savedTask = task({ outputImages: ['backup-output'], inputImageIds: ['backup-ref'], productFactsSnapshot: facts.versions[0], referenceAnalysisSnapshots: [analysis] })
+    const saved = await saveMaterialCollection({ title: 'Portable set', items: [materialItemFromTask(savedTask, 'backup-output')], plannerSession: amazonPlannerSession({ referenceImageIds: ['backup-ref'], productFacts: facts, referenceAnalyses: { 'backup-ref': analysis } }) })
     useStore.getState().saveImageReview('backup-output', 'backup-output', 'approved', 'Keep it')
     vi.stubGlobal('document', { createElement: () => ({ href: '', download: '', click: vi.fn() }) })
     const objectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:local-backup')
@@ -209,6 +273,9 @@ describe('local material and review persistence', () => {
     useStore.setState({ materialCollections: [], imageResultReviews: {}, imageFinalSelections: {} })
     expect(await importData({ arrayBuffer: async () => bytes } as File, { importConfig: false, importTasks: true })).toBe(true)
     expect(useStore.getState().materialCollections[0].versions[0].plannerSession?.referenceImageIds).toEqual(['backup-ref'])
+    expect(useStore.getState().materialCollections[0].versions[0].plannerSession?.productFacts?.versions[0].facts.productName).toBe('Portable lamp')
+    expect(useStore.getState().materialCollections[0].versions[0].items[0].productFactsSnapshot?.id).toBe(facts.selectedVersionId)
+    expect(useStore.getState().materialCollections[0].versions[0].items[0].referenceAnalysisSnapshots?.[0].analysis.summary).toBe('Round base')
     expect(useStore.getState().imageFinalSelections['backup-output']).toBe('backup-output')
     expect(await getImage('backup-output')).toBeDefined()
     expect(await getImage('backup-ref')).toBeDefined()

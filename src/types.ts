@@ -175,6 +175,8 @@ export interface SeedreamEditorDraft {
   sourceImageId: string | null
   referenceImageIds: string[]
   instruction: string
+  /** Disable explicitly when an edit intentionally changes the confirmed product identity. */
+  preserveProductFacts?: boolean
   annotations: SeedreamAnnotation[]
   resolution: SeedreamEditorResolution
   latestTaskId: string | null
@@ -283,8 +285,11 @@ export interface TaskRecord {
     styleReferenceImageId?: string
     plannerSessionId?: string
     plannerModuleVersionId?: string
+    productFactsVersionId?: string
   }
   referenceImageUsages?: Record<string, ReferenceImageUsage>
+  productFactsSnapshot?: ProductFactsVersion
+  referenceAnalysisSnapshots?: ReferenceAnalysisSnapshot[]
 }
 
 export interface AmazonVisualSystem {
@@ -399,6 +404,8 @@ export interface AmazonPlannerSession {
   referenceImageUsages?: Record<string, ReferenceImageUsage>
   moduleVersions?: Record<string, PlannerModuleVersion[]>
   selectedModuleVersions?: Record<string, string>
+  productFacts?: ProductFactsState
+  referenceAnalyses?: Record<string, ReferenceAnalysisSnapshot>
   draft: AmazonPlannerSessionDraft
   seriesStyleGuides: {
     listing: string
@@ -429,6 +436,70 @@ export interface PlannerModuleVersion {
   instruction: string
   mode: 'listing' | 'aplus'
   plan: AmazonPlannerSessionImagePlan | AmazonPlannerSessionAPlusPlan
+  context?: PlannerSourceContext
+}
+
+export interface ProductFacts {
+  productName: string
+  brand: string
+  model: string
+  color: string
+  material: string
+  dimensions: string
+  packageContents: string
+  visibleFeatures: string[]
+  immutableFeatures: string[]
+  forbiddenChanges: string[]
+  needsConfirmation: string[]
+}
+
+export interface ProductFactsVersion {
+  id: string
+  versionNumber: number
+  confirmedAt: number
+  source: 'manual' | 'ai'
+  sourceFingerprint: string
+  sourceImageIds: string[]
+  facts: ProductFacts
+}
+
+export interface ProductFactsState {
+  draft: ProductFacts
+  draftSource: 'manual' | 'ai'
+  versions: ProductFactsVersion[]
+  selectedVersionId?: string
+}
+
+export interface ReferenceAnalysis {
+  summary: string
+  visibleDetails: string[]
+  layout: string[]
+  lightingAndColors: string[]
+  mustPreserve: string[]
+  mustNotCopy: string[]
+  uncertainties: string[]
+}
+
+export interface ReferenceAnalysisSnapshot {
+  id: string
+  imageId: string
+  imageHash: string
+  profileIdentity: string
+  usage: ReferenceImageUsage
+  analysis: ReferenceAnalysis
+  model: string
+  createdAt: number
+}
+
+export interface ReferenceAnalysisCacheEntry extends ReferenceAnalysisSnapshot {
+  lastUsedAt: number
+}
+
+export interface PlannerSourceContext {
+  productFactsVersionId?: string
+  referenceFingerprint: string
+  referenceImageIds: string[]
+  referenceAnalyses: ReferenceAnalysisSnapshot[]
 }
 
 export interface MaterialCollectionItem {
@@ -442,6 +513,8 @@ export interface MaterialCollectionItem {
   referenceImageUsages?: Record<string, ReferenceImageUsage>
   category?: TaskRecord['category']
   reviewNote?: string
+  productFactsSnapshot?: ProductFactsVersion
+  referenceAnalysisSnapshots?: ReferenceAnalysisSnapshot[]
 }
 
 export interface MaterialCollectionVersion {

@@ -45,6 +45,7 @@ import {
   deleteMaterialCollection as dbDeleteMaterialCollection,
   clearMaterialCollections as dbClearMaterialCollections,
   getImage,
+  hashDataUrl,
   getImageThumbnail,
   getStoredFreshImageThumbnail,
   getAllImageIds,
@@ -70,6 +71,8 @@ import { isAmazonListingMainSlot } from './lib/listingPlanner'
 import { collectPlannerImageReferences } from './lib/plannerImageReferences'
 import { previewTranslationCache } from './lib/previewTranslationCache'
 import { normalizeReferenceUsage, normalizeReferenceUsages, referenceAppliesToSlot, referenceUsageContract } from './lib/referenceImageUsage'
+import { appendProductFactsContract } from './lib/productFacts'
+import { analysisMatchesInputs, buildReferenceAnalysisContract, referenceAnalysisCache } from './lib/referenceAnalysis'
 import { normalizeImageResultReviews } from './lib/imageVersions'
 import { appendMaterialCollectionVersion, collectMaterialImageIds } from './lib/materialCollections'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
@@ -119,7 +122,7 @@ const DEFAULT_SEEDREAM_EDITOR_DRAFT: SeedreamEditorDraft = {
   updatedAt: 0,
 }
 
-type PendingTaskCategory =
+type PendingTaskCategory = Pick<TaskRecord, 'productFactsSnapshot' | 'referenceAnalysisSnapshots'> & (
   | {
       mode: 'prompt-match'
       prompt: string
@@ -129,6 +132,7 @@ type PendingTaskCategory =
       mode: 'next-submit'
       category: NonNullable<TaskRecord['category']>
     }
+)
 
 function isAmazonTaskWorkflow(
   workflow: NonNullable<TaskRecord['category']>['workflow'],
@@ -163,6 +167,7 @@ function createNextSubmitTaskCategory(task: TaskRecord): NonNullable<TaskRecord[
   if (amazonSlot) category.amazonSlot = amazonSlot
   if (task.category?.plannerSessionId) category.plannerSessionId = task.category.plannerSessionId
   if (task.category?.plannerModuleVersionId) category.plannerModuleVersionId = task.category.plannerModuleVersionId
+  if (task.category?.productFactsVersionId) category.productFactsVersionId = task.category.productFactsVersionId
   if (workflow === 'amazon-aplus' && aPlusType) category.aPlusType = aPlusType
   category.marketplaceId = marketplaceId
   if (styleReferenceImageId && !(workflow === 'amazon-listing' && isAmazonListingMainSlot(amazonSlot))) {
@@ -698,7 +703,7 @@ export async function reuseMaterialItem(item: MaterialCollectionItem) {
   state.setInputImages(images)
   state.setParams(item.params)
   state.setPrompt(item.prompt)
-  state.setPendingTaskCategory({ mode: 'prompt-match', prompt: item.prompt, category: item.category ?? {} })
+  state.setPendingTaskCategory({ mode: 'prompt-match', prompt: item.prompt, category: item.category ?? {}, productFactsSnapshot: item.productFactsSnapshot, referenceAnalysisSnapshots: item.referenceAnalysisSnapshots })
   useStore.setState({ referenceImageUsages: { ...state.referenceImageUsages, ...Object.fromEntries(images.map((image) => [image.id, normalizeReferenceUsage(item.referenceImageUsages?.[image.id])])) } })
 }
 
@@ -930,6 +935,8 @@ function isImageReferencedByState(state: AppState, imageId: string) {
     task.maskImageId === imageId ||
     task.imageEditContext?.sourceImageId === imageId ||
     task.imageEditContext?.visualGuideImageId === imageId ||
+    task.productFactsSnapshot?.sourceImageIds.includes(imageId) ||
+    task.referenceAnalysisSnapshots?.some((snapshot) => snapshot.imageId === imageId) ||
     task.imageEditContext?.referenceImageIds.includes(imageId)
   )) return true
   return state.agentConversations.some((conversation) =>
@@ -1739,6 +1746,7 @@ export function normalizeSeedreamEditorDraft(value: unknown): SeedreamEditorDraf
     sourceImageId,
     referenceImageIds,
     instruction: typeof draft.instruction === 'string' ? draft.instruction : '',
+    ...(draft.preserveProductFacts === false ? { preserveProductFacts: false } : {}),
     annotations: Array.isArray(draft.annotations)
       ? draft.annotations.map(normalizeSeedreamAnnotation).filter((item): item is SeedreamAnnotation => item != null)
       : [],
@@ -1999,6 +2007,7 @@ async function recoverFalTask(taskId: string) {
 export async function initStore() {
   const storedTasks = await getAllTasks()
   const materialCollections = await getAllMaterialCollections()
+  void referenceAnalysisCache.prune().catch(() => { /* Cache cleanup must not block existing local work. */ })
   useStore.setState({ materialCollections })
   const { tasks, interruptedTasks } = markInterruptedOpenAIRunningTasks(storedTasks)
   await Promise.all(interruptedTasks.map((task) => putTask(task)))
@@ -2183,6 +2192,8 @@ export interface SubmitTaskWithInputRequest {
   imageEditContext?: TaskImageEditContext
   maskTargetImageId?: string | null
   maskImageId?: string | null
+  productFactsSnapshot?: TaskRecord['productFactsSnapshot']
+  referenceAnalysisSnapshots?: TaskRecord['referenceAnalysisSnapshots']
 }
 
 /** Resolve persisted IDs to actual image bytes, preserving order and repairing a live preview's missing record. */
@@ -2260,6 +2271,12 @@ export async function submitTaskWithInput(request: SubmitTaskWithInputRequest): 
         referenceImageIds: request.imageEditContext.referenceImageIds.map((id) => mapImageId(id)!),
       }
     : undefined
+  const referenceImageUsages = request.imageEditContext ? undefined : Object.fromEntries(storedImages.filter((image) => state.referenceImageUsages[image.id]).map((image) => [image.id, normalizeReferenceUsage(state.referenceImageUsages[image.id])]))
+  const referenceAnalysisSnapshots = []
+  for (const snapshot of request.referenceAnalysisSnapshots ?? []) {
+    const image = storedImages.find((image) => image.id === snapshot.imageId)
+    if (image && analysisMatchesInputs(snapshot, image.id, referenceImageUsages?.[image.id]) && await hashDataUrl(image.dataUrl) === snapshot.imageHash) referenceAnalysisSnapshots.push(snapshot)
+  }
   const taskId = genId()
   const task: TaskRecord = {
     id: taskId,
@@ -2279,9 +2296,11 @@ export async function submitTaskWithInput(request: SubmitTaskWithInputRequest): 
     createdAt: Date.now(),
     finishedAt: null,
     elapsed: null,
-    category: request.category,
+    category: request.productFactsSnapshot ? { ...request.category, productFactsVersionId: request.productFactsSnapshot.id } : request.category,
+    productFactsSnapshot: request.productFactsSnapshot ? JSON.parse(JSON.stringify(request.productFactsSnapshot)) : undefined,
+    referenceAnalysisSnapshots: referenceAnalysisSnapshots.length ? JSON.parse(JSON.stringify(referenceAnalysisSnapshots)) : undefined,
     imageEditContext,
-    referenceImageUsages: request.imageEditContext ? undefined : Object.fromEntries(storedImages.filter((image) => state.referenceImageUsages[image.id]).map((image) => [image.id, { ...state.referenceImageUsages[image.id], slots: [...state.referenceImageUsages[image.id].slots] }])),
+    referenceImageUsages,
   }
 
   useStore.getState().setTasks([task, ...useStore.getState().tasks])
@@ -2420,6 +2439,8 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     inputImages: orderedInputImages,
     params: normalizedParams,
     category,
+    productFactsSnapshot: pendingTaskCategory && (pendingTaskCategory.mode === 'next-submit' || pendingTaskCategory.prompt.trim() === trimmedPrompt) ? pendingTaskCategory.productFactsSnapshot : undefined,
+    referenceAnalysisSnapshots: pendingTaskCategory && (pendingTaskCategory.mode === 'next-submit' || pendingTaskCategory.prompt.trim() === trimmedPrompt) ? pendingTaskCategory.referenceAnalysisSnapshots : undefined,
     maskTargetImageId,
     maskImageId,
   })
@@ -2698,6 +2719,8 @@ async function addPlannerReferencedImageIds(target: Set<string>) {
 }
 
 function addTaskReferencedImageIds(target: Set<string>, task: TaskRecord) {
+  for (const id of task.productFactsSnapshot?.sourceImageIds ?? []) target.add(id)
+  for (const snapshot of task.referenceAnalysisSnapshots ?? []) target.add(snapshot.imageId)
   for (const id of task.inputImageIds || []) target.add(id)
   if (task.maskImageId) target.add(task.maskImageId)
   if (task.imageEditContext?.sourceImageId) target.add(task.imageEditContext.sourceImageId)
@@ -3968,10 +3991,15 @@ async function executeTask(taskId: string) {
     const preparedPayload = await prepareReferenceImageAndMaskPayload(inputDataUrls, maskDataUrl)
     const apiInputDataUrls = preparedPayload.dataUrls
     const apiMaskDataUrl = preparedPayload.maskDataUrl
+    const validAnalysisSnapshots = []
+    for (const snapshot of task.referenceAnalysisSnapshots ?? []) {
+      const index = task.inputImageIds.indexOf(snapshot.imageId)
+      if (index >= 0 && await hashDataUrl(inputDataUrls[index]) === snapshot.imageHash) validAnalysisSnapshots.push(snapshot)
+    }
 
     const result = await callImageApi({
       settings: requestSettings,
-      prompt: [replaceImageMentionsForApi(task.prompt, inputDataUrls.length), referenceUsageContract(task.inputImageIds, task.referenceImageUsages ?? {}, task.category?.styleReferenceImageId)].filter(Boolean).join('\n\n'),
+      prompt: [replaceImageMentionsForApi(appendProductFactsContract(task.prompt, task.productFactsSnapshot), inputDataUrls.length), referenceUsageContract(task.inputImageIds, task.referenceImageUsages ?? {}, task.category?.styleReferenceImageId), buildReferenceAnalysisContract(task.inputImageIds, task.referenceImageUsages ?? {}, validAnalysisSnapshots)].filter(Boolean).join('\n\n'),
       params: task.params,
       inputImageDataUrls: apiInputDataUrls,
       maskDataUrl: apiMaskDataUrl,
@@ -4211,6 +4239,9 @@ export async function retryTask(task: TaskRecord) {
     finishedAt: null,
     elapsed: null,
     category: task.category,
+    productFactsSnapshot: task.productFactsSnapshot ? JSON.parse(JSON.stringify(task.productFactsSnapshot)) : undefined,
+    referenceAnalysisSnapshots: task.referenceAnalysisSnapshots ? JSON.parse(JSON.stringify(task.referenceAnalysisSnapshots)) : undefined,
+    referenceImageUsages: task.referenceImageUsages ? JSON.parse(JSON.stringify(task.referenceImageUsages)) : undefined,
     imageEditContext: task.imageEditContext ? {
       ...task.imageEditContext,
       referenceImageIds: [...task.imageEditContext.referenceImageIds],
@@ -4329,6 +4360,8 @@ export async function reuseConfig(task: TaskRecord) {
   setPendingTaskCategory({
     mode: 'next-submit',
     category: createNextSubmitTaskCategory(task),
+    productFactsSnapshot: task.productFactsSnapshot,
+    referenceAnalysisSnapshots: task.referenceAnalysisSnapshots,
   })
   const maskTargetImageId = task.maskTargetImageId ?? (task.maskImageId ? task.inputImageIds[0] : null)
   if (maskTargetImageId && task.maskImageId && imgs.some((img) => img.id === maskTargetImageId)) {
@@ -4489,6 +4522,7 @@ export async function clearData(options: ClearOptions = { clearConfig: true, cle
 
   if (options.clearTasks) {
     previewTranslationCache.clear()
+    await referenceAnalysisCache.clear()
     await dbClearMaterialCollections()
     useStore.setState({ materialCollections: [], imageResultReviews: {}, imageFinalSelections: {}, referenceImageUsages: {}, reviewImageId: null, materialCollectionDraft: null })
     await dbClearTasks()

@@ -8,12 +8,18 @@ export function materialItemFromTask(task: TaskRecord, imageId: string): Materia
     prompt: task.prompt, params: { ...task.params }, referenceImageIds: [...task.inputImageIds],
     referenceImageUsages: task.referenceImageUsages ? JSON.parse(JSON.stringify(task.referenceImageUsages)) : undefined,
     category: task.category ? { ...task.category } : undefined,
+    productFactsSnapshot: task.productFactsSnapshot ? JSON.parse(JSON.stringify(task.productFactsSnapshot)) : undefined,
+    referenceAnalysisSnapshots: task.referenceAnalysisSnapshots ? JSON.parse(JSON.stringify(task.referenceAnalysisSnapshots)) : undefined,
   }
 }
 export function collectMaterialImageIds(collections: MaterialCollection[]): Set<string> {
   const ids = new Set<string>()
   for (const collection of collections) for (const version of collection.versions) {
-    for (const item of version.items) { ids.add(item.imageId); for (const id of item.referenceImageIds) ids.add(id) }
+    for (const item of version.items) {
+      ids.add(item.imageId); for (const id of item.referenceImageIds) ids.add(id)
+      for (const id of item.productFactsSnapshot?.sourceImageIds ?? []) ids.add(id)
+      for (const snapshot of item.referenceAnalysisSnapshots ?? []) ids.add(snapshot.imageId)
+    }
     if (version.plannerSession) for (const id of collectPlannerImageReferences([version.plannerSession], { customStyleReferences: [], amazonUploadedStyleReferences: [] })) ids.add(id)
   }
   return ids

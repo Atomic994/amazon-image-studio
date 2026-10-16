@@ -1,16 +1,16 @@
-import type { AmazonPlannerSession, PlannerModuleVersion } from '../types'
+import type { AmazonPlannerSession, PlannerModuleVersion, PlannerSourceContext } from '../types'
 import { localId } from './localId'
 
 export function plannerModuleKey(mode: 'listing' | 'aplus', slot: string): string { return `${mode}:${slot}` }
-export function createPlannerModuleVersion(mode: PlannerModuleVersion['mode'], plan: PlannerModuleVersion['plan'], versionNumber: number, instruction = ''): PlannerModuleVersion {
-  return { id: localId('plan-version'), mode, plan: JSON.parse(JSON.stringify(plan)), versionNumber, createdAt: Date.now(), instruction }
+export function createPlannerModuleVersion(mode: PlannerModuleVersion['mode'], plan: PlannerModuleVersion['plan'], versionNumber: number, instruction = '', context?: PlannerSourceContext): PlannerModuleVersion {
+  return { id: localId('plan-version'), mode, plan: JSON.parse(JSON.stringify(plan)), versionNumber, createdAt: Date.now(), instruction, ...(context ? { context: JSON.parse(JSON.stringify(context)) } : {}) }
 }
-export function initialPlannerModuleVersions(imagePlans: AmazonPlannerSession['imagePlans'], aPlusPlans: AmazonPlannerSession['aPlusPlans']) {
+export function initialPlannerModuleVersions(imagePlans: AmazonPlannerSession['imagePlans'], aPlusPlans: AmazonPlannerSession['aPlusPlans'], contextForSlot?: (slot: string) => PlannerSourceContext) {
   const versions: Record<string, PlannerModuleVersion[]> = {}
   const selected: Record<string, string> = {}
   for (const [mode, plans] of [['listing', imagePlans], ['aplus', aPlusPlans]] as const) {
     for (const plan of plans) {
-      const version = createPlannerModuleVersion(mode, plan, 1)
+      const version = createPlannerModuleVersion(mode, plan, 1, '', contextForSlot?.(plan.slot))
       const key = plannerModuleKey(mode, plan.slot)
       versions[key] = [version]; selected[key] = version.id
     }

@@ -1,12 +1,13 @@
-import type { AmazonPlannerSession, MaterialCollection, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
+import type { AmazonPlannerSession, MaterialCollection, ReferenceAnalysisCacheEntry, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
 
 const DB_NAME = 'amazon-image-studio'
-const DB_VERSION = 4
+const DB_VERSION = 5
 const STORE_TASKS = 'tasks'
 const STORE_IMAGES = 'images'
 const STORE_THUMBNAILS = 'thumbnails'
 const STORE_AMAZON_PLANNER_SESSIONS = 'amazonPlannerSessions'
 const STORE_MATERIAL_COLLECTIONS = 'materialCollections'
+const STORE_REFERENCE_ANALYSIS_CACHE = 'referenceAnalysisCache'
 const THUMBNAIL_MAX_SIZE = 720
 const THUMBNAIL_QUALITY = 0.9
 const THUMBNAIL_VERSION = 2
@@ -33,6 +34,7 @@ function openDB(): Promise<IDBDatabase> {
         db.createObjectStore(STORE_AMAZON_PLANNER_SESSIONS, { keyPath: 'id' })
       }
       if (!db.objectStoreNames.contains(STORE_MATERIAL_COLLECTIONS)) db.createObjectStore(STORE_MATERIAL_COLLECTIONS, { keyPath: 'id' })
+      if (!db.objectStoreNames.contains(STORE_REFERENCE_ANALYSIS_CACHE)) db.createObjectStore(STORE_REFERENCE_ANALYSIS_CACHE, { keyPath: 'id' })
     }
     req.onsuccess = () => {
       if (blocked) { req.result.close(); return }
@@ -110,6 +112,13 @@ export function deleteMaterialCollection(id: string): Promise<undefined> {
 }
 export function clearMaterialCollections(): Promise<undefined> {
   return dbTransaction(STORE_MATERIAL_COLLECTIONS, 'readwrite', (s) => s.clear())
+}
+
+export const referenceAnalysisCacheDb = {
+  getAll: (): Promise<ReferenceAnalysisCacheEntry[]> => dbTransaction(STORE_REFERENCE_ANALYSIS_CACHE, 'readonly', (s) => s.getAll()),
+  put: (entry: ReferenceAnalysisCacheEntry) => dbTransaction(STORE_REFERENCE_ANALYSIS_CACHE, 'readwrite', (s) => s.put(entry)),
+  remove: (id: string) => dbTransaction(STORE_REFERENCE_ANALYSIS_CACHE, 'readwrite', (s) => s.delete(id)),
+  clear: () => dbTransaction(STORE_REFERENCE_ANALYSIS_CACHE, 'readwrite', (s) => s.clear()),
 }
 
 // ===== Images =====

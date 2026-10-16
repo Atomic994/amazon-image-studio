@@ -922,12 +922,78 @@ export async function translatePlannerPreviewText(options: {
   }
 }
 
+/** Structured vision/text analysis uses the same SSE reader, retry policy and shared deadline as planning. */
+export async function callPlannerStructuredAnalysis<T>(options: {
+  profile: ApiProfile; instructions: string; text: string; images: string[]; schema: Record<string, unknown>; schemaName: string
+  parse: (value: unknown) => T; signal?: AbortSignal; onProgress?: (progress: PlannerApiProgress) => void
+}): Promise<T> {
+  const { profile } = options
+  if (profile.apiMode !== 'chat' && profile.apiMode !== 'responses') throw new Error('分析需要 Chat Completions 或 Responses 策划配置')
+  const validation = validateApiProfile(profile)
+  if (validation) throw new Error(`AI 策划配置不完整：${validation}`)
+  const chat = profile.apiMode === 'chat'
+  const proxy = readClientDevProxyConfig()
+  const url = buildApiUrl(profile.baseUrl, chat ? 'chat/completions' : 'responses', proxy, shouldUseApiProxy(profile.apiProxy, proxy, profile.baseUrl), { prefixV1: !chat })
+  const body = chat ? {
+    model: profile.model, stream: true, response_format: { type: 'json_object' },
+    messages: [{ role: 'system', content: options.instructions }, { role: 'user', content: buildChatPlannerUserContent(options.text, options.images) }],
+  } : {
+    model: profile.model, stream: true, instructions: options.instructions,
+    input: buildResponsesPlannerInput(options.text, options.images),
+    text: { format: { type: 'json_schema', name: options.schemaName, strict: true, schema: options.schema } },
+  }
+  const timeout = Number.isFinite(profile.timeout) && profile.timeout > 0 ? profile.timeout : DEFAULT_API_TIMEOUT
+  const linked = createLinkedAbortController(timeout, options.signal)
+  const signal = linked.controller.signal
+  try {
+    for (let attempt = 1; attempt <= MAX_PLANNER_ATTEMPTS; attempt++) {
+      signal.throwIfAborted()
+      const emit = (progress: Omit<PlannerApiProgress, 'attempt' | 'maxAttempts'>) => options.onProgress?.({ ...progress, attempt, maxAttempts: MAX_PLANNER_ATTEMPTS })
+      emit({ phase: 'connecting', receivedChars: 0 })
+      try {
+        const response = await fetch(url, { method: 'POST', signal, cache: 'no-store', headers: { Authorization: `Bearer ${profile.apiKey}`, 'Content-Type': 'application/json', Accept: 'text/event-stream, application/json' }, body: JSON.stringify(body) })
+        if (!response.ok) throw await readPlannerHttpError(response)
+        emit({ phase: 'connected', httpStatus: response.status })
+        let lastEmissionAt = 0, lastActivityAt = 0, lastPhase = ''
+        const report = (phase: 'receiving' | 'thinking', receivedChars?: number) => {
+          const at = Date.now()
+          if (lastPhase === phase && at - lastEmissionAt < 1000) return
+          lastPhase = phase; lastEmissionAt = at; emit({ phase, receivedChars })
+        }
+        const text = await readPlannerResponseText(response, signal, 'aPlusPlans', {
+          onReceiving: (stats) => report('receiving', stats.receivedChars), onThinking: () => report('thinking'),
+          onActivity: () => { const at = Date.now(); if (at - lastActivityAt >= 1000) { lastActivityAt = at; emit({ phase: 'activity' }) } },
+        })
+        signal.throwIfAborted()
+        emit({ phase: 'validating', receivedChars: text.length })
+        const trimmed = text.trim()
+        const parsed: unknown = JSON.parse(trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1] ?? trimmed)
+        return options.parse(parsed)
+      } catch (err) {
+        signal.throwIfAborted()
+        const fallback = body.stream && err instanceof PlannerHttpError && [400, 422].includes(err.status) && /stream/i.test(err.message) && /not support|unsupported|not allowed|must be false/i.test(err.message)
+        if (attempt === MAX_PLANNER_ATTEMPTS || (!fallback && !isRetryablePlannerError(err))) throw err
+        const retryDelayMs = fallback ? 0 : err instanceof PlannerHttpError ? err.retryAfterMs ?? 1000 * 2 ** (attempt - 1) : 1000 * 2 ** (attempt - 1)
+        options.onProgress?.({ phase: fallback ? 'fallback' : 'retrying', attempt: attempt + 1, maxAttempts: MAX_PLANNER_ATTEMPTS, retryDelayMs, message: err instanceof Error ? err.message : String(err) })
+        if (fallback) body.stream = false
+        else await waitForPlannerRetry(retryDelayMs, signal)
+      }
+    }
+    throw new Error('分析接口未返回完整结果')
+  } catch (err) {
+    if (options.signal?.aborted) throw options.signal.reason ?? err
+    if (signal.aborted) throw new Error(`分析请求超时（${timeout} 秒，包含自动重试）`)
+    throw err
+  } finally { linked.cleanup() }
+}
+
 export async function callAmazonPlannerApi(options: {
   listingText: string
   baseDraft: AmazonPromptDraft
   profile: ApiProfile
   referenceImageDataUrls?: string[]
   referenceImageDescriptions?: string[]
+  confirmedProductFacts?: string
   moduleRevision?: { plan: AmazonImagePlan | AmazonAPlusPlan; instruction: string; seriesStyleGuide: string }
   model?: string
   mode?: AmazonPlannerMode
@@ -979,7 +1045,7 @@ export async function callAmazonPlannerApi(options: {
     listingImageCount,
     aPlusModuleSpecs,
     marketplaceId,
-  })) + (!isDeepSeekPlannerProfile && options.referenceImageDescriptions?.length ? `\n\nReference image roles, in attachment order:\n${options.referenceImageDescriptions.map((description, index) => `${index + 1}. ${description}`).join('\n')}\nOnly product references establish product facts. Honor each reference scope; other references only inform their stated visual role.` : '')
+  })) + (options.confirmedProductFacts ? `\n\n${options.confirmedProductFacts}` : '') + (!isDeepSeekPlannerProfile && options.referenceImageDescriptions?.length ? `\n\nReference image roles, in attachment order:\n${options.referenceImageDescriptions.map((description, index) => `${index + 1}. ${description}`).join('\n')}\nOnly product references establish product facts. Honor each reference scope; other references only inform their stated visual role.` : '')
   const referenceImageDataUrls = isDeepSeekPlannerProfile
     ? []
     : options.referenceImageDataUrls ?? []

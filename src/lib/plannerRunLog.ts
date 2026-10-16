@@ -8,7 +8,7 @@ export interface PlannerLogEntry {
 }
 
 export interface PlannerRunLogState {
-  kind?: 'planner' | 'translation'
+  kind?: 'planner' | 'translation' | 'analysis'
   status: 'idle' | 'running' | 'success' | 'error' | 'stopped'
   phase: string
   label: string
@@ -26,8 +26,8 @@ export interface PlannerRunLogState {
   lastActivityLogAt?: number
 }
 
-export function createPlannerRunLog(kind: 'planner' | 'translation' = 'planner'): PlannerRunLogState {
-  return { kind, status: 'idle', phase: 'idle', label: kind === 'translation' ? '等待开始翻译' : '等待开始 AI 策划', receivedChars: 0, completedPlans: 0, totalPlans: 0, attempt: 0, entries: [], nextId: 1 }
+export function createPlannerRunLog(kind: NonNullable<PlannerRunLogState['kind']> = 'planner'): PlannerRunLogState {
+  return { kind, status: 'idle', phase: 'idle', label: kind === 'analysis' ? '等待开始分析' : kind === 'translation' ? '等待开始翻译' : '等待开始 AI 策划', receivedChars: 0, completedPlans: 0, totalPlans: 0, attempt: 0, entries: [], nextId: 1 }
 }
 
 export function redactPlannerLogMessage(message: string, apiKey = ''): string {
@@ -39,7 +39,8 @@ export function appendPlannerLog(state: PlannerRunLogState, message: string, at:
   return { ...state, nextId: state.nextId + 1, entries: [...state.entries, { id: state.nextId, at, message, level }].slice(-160) }
 }
 
-export function describePlannerProgress(progress: PlannerApiProgress, kind: 'planner' | 'translation' = 'planner'): string {
+export function describePlannerProgress(progress: PlannerApiProgress, kind: NonNullable<PlannerRunLogState['kind']> = 'planner'): string {
+  if (kind === 'analysis') return describePlannerProgress(progress, 'translation').split('翻译').join('分析').split('译文').join('分析内容')
   if (kind === 'translation') {
     switch (progress.phase) {
       case 'connecting': return `发送第 ${progress.attempt} 次翻译请求，等待接口响应（最多 ${progress.maxAttempts} 次）`
@@ -94,7 +95,8 @@ export function updatePlannerRunLog(state: PlannerRunLogState, progress: Planner
     connecting: '正在等待翻译接口响应…', connected: '接口已连接，等待译文…', thinking: '模型正在处理翻译请求…',
     receiving: '正在接收译文…', validating: '正在检查译文…', retrying: '翻译接口暂时未完成响应，等待重试…', fallback: '正在切换翻译兼容模式…',
   }
-  next.label = (state.kind === 'translation' ? translationLabels : labels)[progress.phase]
+  next.label = (state.kind === 'translation' || state.kind === 'analysis' ? translationLabels : labels)[progress.phase]
+  if (state.kind === 'analysis') next.label = next.label.split('翻译').join('分析').split('译文').join('分析内容')
   next.phase = progress.phase
   const phaseChanged = state.phase !== progress.phase || state.attempt !== progress.attempt
   if (progress.phase === 'receiving' && !phaseChanged && state.completedPlans === next.completedPlans && at - (state.lastReceivingLogAt ?? 0) < 5000) return next
@@ -106,7 +108,7 @@ export function updatePlannerRunLog(state: PlannerRunLogState, progress: Planner
 
 export function finishPlannerRunLog(state: PlannerRunLogState, status: 'success' | 'error' | 'stopped', message: string, at: number, apiKey = ''): PlannerRunLogState {
   if (state.status !== 'running') return state
-  const labels = state.kind === 'translation'
+  const labels = state.kind === 'analysis' ? { success: '分析已完成', error: '分析失败', stopped: '分析已停止' } : state.kind === 'translation'
     ? { success: '翻译已完成', error: '翻译失败', stopped: '翻译已停止' }
     : { success: 'AI 策划已完成', error: 'AI 策划失败', stopped: 'AI 策划已停止' }
   const next = { ...state, status, phase: status, label: labels[status], finishedAt: at }
@@ -123,5 +125,5 @@ export function formatPlannerLogTime(at: number): string {
 }
 
 export function formatPlannerLogForCopy(state: PlannerRunLogState): string {
-  return [state.kind === 'translation' ? 'AI 翻译运行日志' : 'AI 策划运行日志', ...state.entries.map((entry) => `[${formatPlannerLogTime(entry.at)} +${formatPlannerElapsed(entry.at - (state.startedAt ?? entry.at))}] ${entry.message}`)].join('\n')
+  return [state.kind === 'analysis' ? 'AI 分析运行日志' : state.kind === 'translation' ? 'AI 翻译运行日志' : 'AI 策划运行日志', ...state.entries.map((entry) => `[${formatPlannerLogTime(entry.at)} +${formatPlannerElapsed(entry.at - (state.startedAt ?? entry.at))}] ${entry.message}`)].join('\n')
 }
