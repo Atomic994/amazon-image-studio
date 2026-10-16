@@ -14,6 +14,7 @@ import type {
   TaskParams,
   InputImage,
   MaskDraft,
+  LocalEditProtection,
   SeedreamAnnotation,
   SeedreamEditorDraft,
   TaskRecord,
@@ -67,6 +68,7 @@ import { IMAGE_FETCH_CORS_HINT } from './lib/imageApiShared'
 import { getFalErrorMessage, getFalQueuedImageResult } from './lib/falAiImageApi'
 import { getCustomQueuedImageResult } from './lib/openaiCompatibleImageApi'
 import { validateMaskMatchesImage } from './lib/canvasImage'
+import { compositeProtectedEdit, validateProtectedEditInputs } from './lib/localEditProtection'
 import { orderInputImagesForMask } from './lib/mask'
 import { getChangedParams, getInputImageLimitForSettings, normalizeParamsForSettings } from './lib/paramCompatibility'
 import { prepareReferenceImageAndMaskPayload, prepareReferenceImagePayload, type PlannerReferenceImagePayload } from './lib/referenceImagePayload'
@@ -130,7 +132,7 @@ const DEFAULT_SEEDREAM_EDITOR_DRAFT: SeedreamEditorDraft = {
   updatedAt: 0,
 }
 
-type PendingTaskCategory = Pick<TaskRecord, 'productFactsSnapshot' | 'referenceAnalysisSnapshots'> & (
+type PendingTaskCategory = Pick<TaskRecord, 'productFactsSnapshot' | 'referenceAnalysisSnapshots' | 'localEditProtection'> & (
   | {
       mode: 'prompt-match'
       prompt: string
@@ -711,7 +713,7 @@ export async function reuseMaterialItem(item: MaterialCollectionItem) {
   state.setInputImages(images)
   state.setParams(item.params)
   state.setPrompt(item.prompt)
-  state.setPendingTaskCategory({ mode: 'prompt-match', prompt: item.prompt, category: item.category ?? {}, productFactsSnapshot: item.productFactsSnapshot, referenceAnalysisSnapshots: item.referenceAnalysisSnapshots })
+  state.setPendingTaskCategory({ mode: 'prompt-match', prompt: item.prompt, category: item.category ?? {}, productFactsSnapshot: item.productFactsSnapshot, referenceAnalysisSnapshots: item.referenceAnalysisSnapshots, localEditProtection: item.localEditProtection })
   useStore.setState({ referenceImageUsages: { ...state.referenceImageUsages, ...Object.fromEntries(images.map((image) => [image.id, normalizeReferenceUsage(item.referenceImageUsages?.[image.id])])) } })
 }
 
@@ -939,8 +941,8 @@ function isImageReferencedByState(state: AppState, imageId: string) {
   if (state.imageFinalSelections[imageId] || Object.values(state.imageFinalSelections).includes(imageId)) return true
   if (state.inputImages.some((img) => img.id === imageId)) return true
   if (state.galleryInputDraft?.inputImages.some((img) => img.id === imageId)) return true
-  if (state.seedreamEditorDraft.sourceImageId === imageId || state.seedreamEditorDraft.referenceImageIds.includes(imageId)) return true
-  if (Object.values(state.imageEditorDrafts).some((draft) => draft.sourceImageId === imageId || draft.referenceImageIds.includes(imageId))) return true
+  if (state.seedreamEditorDraft.sourceImageId === imageId || state.seedreamEditorDraft.localEditMaskId === imageId || state.seedreamEditorDraft.referenceImageIds.includes(imageId)) return true
+  if (Object.values(state.imageEditorDrafts).some((draft) => draft.sourceImageId === imageId || draft.localEditMaskId === imageId || draft.referenceImageIds.includes(imageId))) return true
   if (collectPlannerImageReferences([], state.settings).has(imageId)) return true
   if (Object.values(state.agentInputDrafts).some((draft) => draft.inputImages.some((img) => img.id === imageId))) return true
   if (state.tasks.some((task) =>
@@ -949,6 +951,8 @@ function isImageReferencedByState(state: AppState, imageId: string) {
     task.streamPartialImageIds?.includes(imageId) ||
     task.maskTargetImageId === imageId ||
     task.maskImageId === imageId ||
+    task.localEditProtection?.baseImageId === imageId ||
+    task.localEditProtection?.maskImageId === imageId ||
     task.imageEditContext?.sourceImageId === imageId ||
     task.imageEditContext?.visualGuideImageId === imageId ||
     task.productFactsSnapshot?.sourceImageIds.includes(imageId) ||
@@ -1005,6 +1009,7 @@ function normalizeMaskDraft(value: unknown): MaskDraft | null {
   return {
     targetImageId: value.targetImageId,
     maskDataUrl: value.maskDataUrl,
+    protectUneditedArea: value.protectUneditedArea === true,
     updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : Date.now(),
   }
 }
@@ -1349,6 +1354,7 @@ export const useStore = create<AppState>()(
         const next = normalizeSeedreamEditorDraft({
           ...state.seedreamEditorDraft,
           ...patch,
+          ...(patch.sourceImageId !== undefined && patch.sourceImageId !== state.seedreamEditorDraft.sourceImageId && patch.localEditMaskId === undefined ? { localEditMaskId: null, protectUneditedArea: true } : {}),
           updatedAt: Date.now(),
         })
         const imageEditorDrafts = { ...state.imageEditorDrafts }
@@ -1770,6 +1776,8 @@ export function normalizeSeedreamEditorDraft(value: unknown): SeedreamEditorDraf
     referenceImageIds,
     instruction: typeof draft.instruction === 'string' ? draft.instruction : '',
     ...(draft.preserveProductFacts === false ? { preserveProductFacts: false } : {}),
+    localEditMaskId: sourceImageId && typeof draft.localEditMaskId === 'string' ? draft.localEditMaskId : null,
+    protectUneditedArea: draft.protectUneditedArea !== false,
     annotations: Array.isArray(draft.annotations)
       ? draft.annotations.map(normalizeSeedreamAnnotation).filter((item): item is SeedreamAnnotation => item != null)
       : [],
@@ -1966,19 +1974,46 @@ async function resolveImageSizeParamsList(
   return images.map((_, index) => hasActualParams(preferred?.[index]) ? preferred?.[index] : fallback[index])
 }
 
+async function readProtectedEditSource(protection: LocalEditProtection, inputImageIds: string[]) {
+  if (inputImageIds[0] !== protection.baseImageId) throw new Error('局部保护的原图必须是第一张输入图片，请重新选择编辑原图')
+  const [base, mask] = await Promise.all([getImage(protection.baseImageId), getImage(protection.maskImageId)])
+  if (!base?.dataUrl || !mask?.dataUrl) throw new Error('局部保护所需的原图或修改区域已丢失，请恢复备份或重新选择修改区域')
+  const [baseHash, maskHash] = await Promise.all([hashDataUrl(base.dataUrl), hashDataUrl(mask.dataUrl)])
+  if (baseHash !== protection.baseHash || maskHash !== protection.maskHash) throw new Error('原图或修改区域与提交时不同，已停止此任务，请重新提交编辑')
+  await validateProtectedEditInputs(base.dataUrl, mask.dataUrl)
+  return { baseDataUrl: base.dataUrl, maskDataUrl: mask.dataUrl }
+}
+
+/** Never publish an unprotected result when local compositing fails, including recovered requests. */
+async function prepareProtectedTaskOutputs(task: TaskRecord, images: string[]) {
+  if (!task.localEditProtection) return { images, actualParamsList: undefined }
+  const source = await readProtectedEditSource(task.localEditProtection, task.inputImageIds)
+  const protectedImages: string[] = [], actualParamsList: Partial<TaskParams>[] = []
+  for (const image of images) {
+    const current = useStore.getState().tasks.find((item) => item.id === task.id)
+    if (!current || current.cancelledAt) throw new Error('局部编辑已取消')
+    const result = await compositeProtectedEdit(source.baseDataUrl, source.maskDataUrl, image)
+    protectedImages.push(result.dataUrl)
+    actualParamsList.push({ size: `${result.width}x${result.height}`, output_format: 'png', output_compression: null, n: 1 })
+  }
+  return { images: protectedImages, actualParamsList }
+}
+
 async function completeRecoveredFalTask(task: TaskRecord, result: Awaited<ReturnType<typeof getFalQueuedImageResult>>) {
   const latest = useStore.getState().tasks.find((item) => item.id === task.id)
   if (!latest || latest.status === 'done' || latest.cancelledAt) return
 
-  const actualParamsList = await resolveImageSizeParamsList(result.images, result.actualParamsList)
+  const prepared = await prepareProtectedTaskOutputs(task, result.images)
+  const actualParamsList = prepared.actualParamsList ?? await resolveImageSizeParamsList(prepared.images, result.actualParamsList)
   const outputIds: string[] = []
-  for (const dataUrl of result.images) {
+  for (const dataUrl of prepared.images) {
     const imgId = await storeImage(dataUrl, 'generated')
     cacheImage(imgId, dataUrl)
     outputIds.push(imgId)
   }
 
-  if (useStore.getState().tasks.find((item) => item.id === task.id)?.cancelledAt) return
+  const current = useStore.getState().tasks.find((item) => item.id === task.id)
+  if (!current || current.cancelledAt) { void deleteUnreferencedImageIds(outputIds); return }
   updateTaskInStore(task.id, {
     outputImages: outputIds,
     actualParams: firstActualParams(actualParamsList),
@@ -2233,6 +2268,7 @@ export interface SubmitTaskWithInputRequest {
   imageEditContext?: TaskImageEditContext
   maskTargetImageId?: string | null
   maskImageId?: string | null
+  localEditProtection?: Pick<LocalEditProtection, 'baseImageId' | 'maskImageId'> & Partial<Pick<LocalEditProtection, 'baseHash' | 'maskHash'>>
   productFactsSnapshot?: TaskRecord['productFactsSnapshot']
   referenceAnalysisSnapshots?: TaskRecord['referenceAnalysisSnapshots']
   referenceImageUsages?: Record<string, ReferenceImageUsage>
@@ -2308,6 +2344,21 @@ export async function submitTaskWithInput(request: SubmitTaskWithInputRequest): 
     return null
   }
 
+  let localEditProtection: LocalEditProtection | undefined
+  if (request.localEditProtection) {
+    try {
+      const requested = request.localEditProtection
+      const [base, mask] = await Promise.all([getImage(requested.baseImageId), getImage(requested.maskImageId)])
+      if (!base?.dataUrl || !mask?.dataUrl) throw new Error('原图或修改区域已丢失，请重新选择修改区域')
+      const [baseHash, maskHash] = await Promise.all([hashDataUrl(base.dataUrl), hashDataUrl(mask.dataUrl)])
+      localEditProtection = { version: 1, baseImageId: requested.baseImageId, maskImageId: requested.maskImageId, baseHash: requested.baseHash ?? baseHash, maskHash: requested.maskHash ?? maskHash }
+      await readProtectedEditSource(localEditProtection, storedImages.map((image) => image.id))
+    } catch (error) {
+      state.showToast(error instanceof Error ? error.message : String(error), 'error')
+      return null
+    }
+  }
+
   const params = normalizeParamsForSettings(request.params, requestSettings, { hasInputImages: storedImages.length > 0 })
   const mapImageId = (id: string | null | undefined) => id ? imageIdMap.get(id) ?? id : id
   const imageEditContext = request.imageEditContext
@@ -2338,6 +2389,7 @@ export async function submitTaskWithInput(request: SubmitTaskWithInputRequest): 
     inputImageIds: storedImages.map((image) => image.id),
     maskTargetImageId: mapImageId(request.maskTargetImageId) ?? null,
     maskImageId: request.maskImageId ?? null,
+    localEditProtection,
     outputImages: [],
     status: 'running',
     error: null,
@@ -2492,6 +2544,9 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     referenceAnalysisSnapshots: pendingTaskCategory && (pendingTaskCategory.mode === 'next-submit' || pendingTaskCategory.prompt.trim() === trimmedPrompt) ? pendingTaskCategory.referenceAnalysisSnapshots : undefined,
     maskTargetImageId,
     maskImageId,
+    localEditProtection: maskDraft?.protectUneditedArea && maskTargetImageId && maskImageId
+      ? { baseImageId: maskTargetImageId, maskImageId }
+      : !maskDraft && pendingTaskCategory && (pendingTaskCategory.mode === 'next-submit' || pendingTaskCategory.prompt.trim() === trimmedPrompt) ? pendingTaskCategory.localEditProtection : undefined,
   })
   if (!taskId) return false
 
@@ -2753,9 +2808,11 @@ function addInputDraftReferencedImageIds(target: Set<string>, draft: AgentInputD
 
 function addSeedreamEditorDraftReferencedImageIds(target: Set<string>, draft = useStore.getState().seedreamEditorDraft) {
   if (draft.sourceImageId) target.add(draft.sourceImageId)
+  if (draft.localEditMaskId) target.add(draft.localEditMaskId)
   for (const id of draft.referenceImageIds) target.add(id)
   for (const saved of Object.values(useStore.getState().imageEditorDrafts)) {
     if (saved.sourceImageId) target.add(saved.sourceImageId)
+    if (saved.localEditMaskId) target.add(saved.localEditMaskId)
     for (const id of saved.referenceImageIds) target.add(id)
   }
 }
@@ -2773,6 +2830,7 @@ function addTaskReferencedImageIds(target: Set<string>, task: TaskRecord) {
   for (const snapshot of task.referenceAnalysisSnapshots ?? []) target.add(snapshot.imageId)
   for (const id of task.inputImageIds || []) target.add(id)
   if (task.maskImageId) target.add(task.maskImageId)
+  if (task.localEditProtection) { target.add(task.localEditProtection.baseImageId); target.add(task.localEditProtection.maskImageId) }
   if (task.imageEditContext?.sourceImageId) target.add(task.imageEditContext.sourceImageId)
   if (task.imageEditContext?.visualGuideImageId) target.add(task.imageEditContext.visualGuideImageId)
   for (const id of task.imageEditContext?.referenceImageIds || []) target.add(id)
@@ -4040,6 +4098,8 @@ async function executeTask(taskId: string) {
       maskDataUrl = await ensureImageCached(task.maskImageId)
       if (!maskDataUrl) throw new Error('遮罩图片已不存在')
     }
+    if (task.localEditProtection) await readProtectedEditSource(task.localEditProtection, task.inputImageIds)
+    controller.signal.throwIfAborted()
     const preparedPayload = await prepareReferenceImageAndMaskPayload(inputDataUrls, maskDataUrl)
     const apiInputDataUrls = preparedPayload.dataUrls
     const apiMaskDataUrl = preparedPayload.maskDataUrl
@@ -4074,6 +4134,7 @@ async function executeTask(taskId: string) {
         })
       },
       onPartialImage: (partial) => {
+        if (task.localEditProtection) return
         useStore.getState().setTaskStreamPreview(taskId, partial.image, partial.requestIndex)
         void persistTaskStreamPartialImage(taskId, partial.image)
       },
@@ -4085,20 +4146,22 @@ async function executeTask(taskId: string) {
       return
     }
 
-    // 存储输出图片
+    const prepared = await prepareProtectedTaskOutputs(task, result.images)
+    // 存储最终图片；局部编辑只保存已经与原图合成的结果。
     const outputIds: string[] = []
-    for (const dataUrl of result.images) {
+    for (const dataUrl of prepared.images) {
       const imgId = await storeImage(dataUrl, 'generated')
       cacheImage(imgId, dataUrl)
       outputIds.push(imgId)
     }
     const isAsyncCustomTask = taskProvider !== 'fal' && taskProvider !== 'openai' && taskProvider !== 'volcengine' && Boolean(customTaskInfo)
-    const actualParamsList = taskProvider === 'fal'
-      ? await resolveImageSizeParamsList(result.images, result.actualParamsList)
+    const actualParamsList = prepared.actualParamsList ?? (taskProvider === 'fal'
+      ? await resolveImageSizeParamsList(prepared.images, result.actualParamsList)
       : isAsyncCustomTask
-      ? await readImageSizeParamsList(result.images)
-      : result.actualParamsList
+      ? await readImageSizeParamsList(prepared.images)
+      : result.actualParamsList)
     const actualParams = (() => {
+      if (prepared.actualParamsList) return { ...firstActualParams(prepared.actualParamsList), n: outputIds.length }
       if (taskProvider === 'fal') return firstActualParams(actualParamsList)
       if (isAsyncCustomTask) return firstActualParams(actualParamsList)
       return { ...result.actualParams, n: outputIds.length }
@@ -4126,6 +4189,7 @@ async function executeTask(taskId: string) {
     const latestBeforeUpdate = useStore.getState().tasks.find((t) => t.id === taskId)
     if (!latestBeforeUpdate || latestBeforeUpdate.status !== 'running') {
       useStore.getState().setTaskStreamPreview(taskId)
+      void deleteUnreferencedImageIds(outputIds)
       return
     }
     const partialImageIdsToClean = latestBeforeUpdate.streamPartialImageIds || []
@@ -4134,7 +4198,7 @@ async function executeTask(taskId: string) {
     updateTaskInStore(taskId, {
       outputImages: outputIds,
       streamPartialImageIds: undefined,
-      rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
+      rawImageUrls: !task.localEditProtection && result.rawImageUrls?.length ? result.rawImageUrls : undefined,
       actualParams,
       actualParamsByImage,
       revisedPromptByImage: revisedPromptByImage && Object.keys(revisedPromptByImage).length > 0 ? revisedPromptByImage : undefined,
@@ -4298,6 +4362,7 @@ export async function retryTask(task: TaskRecord) {
     inputImageIds: [...task.inputImageIds],
     maskTargetImageId: task.maskTargetImageId ?? null,
     maskImageId: task.maskImageId ?? null,
+    localEditProtection: task.localEditProtection ? { ...task.localEditProtection } : undefined,
     outputImages: [],
     status: 'running',
     error: null,
@@ -4327,6 +4392,8 @@ export async function retryTask(task: TaskRecord) {
           ...DEFAULT_SEEDREAM_EDITOR_DRAFT, sourceImageId, engine: editorEngine,
           instruction: task.imageEditContext?.userInstruction ?? task.prompt,
           referenceImageIds: task.imageEditContext?.referenceImageIds ?? [],
+          localEditMaskId: task.localEditProtection?.maskImageId,
+          protectUneditedArea: Boolean(task.localEditProtection),
         }) } })
       }
       if (!useStore.getState().seedreamEditorDraft.sourceImageId) useStore.getState().selectImageEditorSource(sourceImageId)
@@ -4379,6 +4446,8 @@ export function openSeedreamTaskInEditor(task: TaskRecord) {
     referenceImageIds: (context?.referenceImageIds ?? []).filter((id) => id !== sourceImageId).slice(0, MAX_SEEDREAM_REFERENCE_IMAGES),
     instruction: context?.userInstruction ?? task.prompt,
     annotations: keepAnnotations ? remembered!.annotations : [],
+    localEditMaskId: task.localEditProtection?.maskImageId ?? null,
+    protectUneditedArea: Boolean(task.localEditProtection),
     resolution: getSeedreamEditorResolutionFromSize(task.params.size),
     latestTaskId: task.id,
   })
@@ -4428,6 +4497,7 @@ export async function reuseConfig(task: TaskRecord) {
     category: createNextSubmitTaskCategory(task),
     productFactsSnapshot: task.productFactsSnapshot,
     referenceAnalysisSnapshots: task.referenceAnalysisSnapshots,
+    localEditProtection: task.localEditProtection,
   })
   const maskTargetImageId = task.maskTargetImageId ?? (task.maskImageId ? task.inputImageIds[0] : null)
   if (maskTargetImageId && task.maskImageId && imgs.some((img) => img.id === maskTargetImageId)) {
@@ -4436,6 +4506,7 @@ export async function reuseConfig(task: TaskRecord) {
       setMaskDraft({
         targetImageId: maskTargetImageId,
         maskDataUrl,
+        protectUneditedArea: Boolean(task.localEditProtection),
         updatedAt: Date.now(),
       })
     } else {
@@ -4647,15 +4718,17 @@ async function completeRecoveredCustomTask(task: TaskRecord, result: Awaited<Ret
   const latest = useStore.getState().tasks.find((item) => item.id === task.id)
   if (!latest || latest.status === 'done' || latest.cancelledAt) return
 
-  const actualParamsList = await readImageSizeParamsList(result.images)
+  const prepared = await prepareProtectedTaskOutputs(task, result.images)
+  const actualParamsList = prepared.actualParamsList ?? await readImageSizeParamsList(prepared.images)
   const outputIds: string[] = []
-  for (const dataUrl of result.images) {
+  for (const dataUrl of prepared.images) {
     const imgId = await storeImage(dataUrl, 'generated')
     cacheImage(imgId, dataUrl)
     outputIds.push(imgId)
   }
 
-  if (useStore.getState().tasks.find((item) => item.id === task.id)?.cancelledAt) return
+  const current = useStore.getState().tasks.find((item) => item.id === task.id)
+  if (!current || current.cancelledAt) { void deleteUnreferencedImageIds(outputIds); return }
   updateTaskInStore(task.id, {
     outputImages: outputIds,
     actualParams: firstActualParams(actualParamsList),

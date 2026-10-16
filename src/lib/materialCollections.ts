@@ -10,6 +10,7 @@ export function materialItemFromTask(task: TaskRecord, imageId: string): Materia
     category: task.category ? { ...task.category } : undefined,
     productFactsSnapshot: task.productFactsSnapshot ? JSON.parse(JSON.stringify(task.productFactsSnapshot)) : undefined,
     referenceAnalysisSnapshots: task.referenceAnalysisSnapshots ? JSON.parse(JSON.stringify(task.referenceAnalysisSnapshots)) : undefined,
+    localEditProtection: task.localEditProtection ? { ...task.localEditProtection } : undefined,
   }
 }
 export function collectMaterialImageIds(collections: MaterialCollection[]): Set<string> {
@@ -19,6 +20,7 @@ export function collectMaterialImageIds(collections: MaterialCollection[]): Set<
       ids.add(item.imageId); for (const id of item.referenceImageIds) ids.add(id)
       for (const id of item.productFactsSnapshot?.sourceImageIds ?? []) ids.add(id)
       for (const snapshot of item.referenceAnalysisSnapshots ?? []) ids.add(snapshot.imageId)
+      if (item.localEditProtection) { ids.add(item.localEditProtection.baseImageId); ids.add(item.localEditProtection.maskImageId) }
     }
     if (version.plannerSession) for (const id of collectPlannerImageReferences([version.plannerSession], { customStyleReferences: [], amazonUploadedStyleReferences: [] })) ids.add(id)
   }

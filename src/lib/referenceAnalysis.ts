@@ -104,5 +104,14 @@ export function plannerSourceContext(ids: string[], usages: Record<string, Refer
   return { productFactsVersionId: facts?.id, referenceFingerprint: contextFingerprint(ids.map((id) => { const snapshot = snapshots.find((row) => row.imageId === id); return [id, usageIdentity(usages[id]), snapshot ? (snapshot.selectedRevisionId ? [snapshot.id, snapshot.createdAt, snapshot.selectedRevisionId, effectiveReferenceAnalysis(snapshot)] : [snapshot.id, snapshot.createdAt, snapshot.analysis]) : null] })), referenceImageIds: [...ids], referenceAnalyses: JSON.parse(JSON.stringify(snapshots)) }
 }
 export function isPlannerContextStale(previous: PlannerSourceContext | undefined, current: PlannerSourceContext): boolean {
-  return previous ? previous.productFactsVersionId !== current.productFactsVersionId || previous.referenceFingerprint !== current.referenceFingerprint : !!current.productFactsVersionId || !!current.referenceAnalyses.length
+  return plannerContextChangeReasons(previous, current).length > 0
+}
+export function plannerContextChangeReasons(previous: PlannerSourceContext | undefined, current: PlannerSourceContext): string[] {
+  if (!previous) return current.productFactsVersionId || current.referenceAnalyses.length ? ['历史方案缺少商品事实或参考图来源记录'] : []
+  const changes: string[] = []
+  if (previous.productFactsVersionId !== current.productFactsVersionId) changes.push('商品事实版本已变化')
+  if (previous.referenceFingerprint !== current.referenceFingerprint) changes.push('参考图、用途或分析已变化')
+  const labels = { listing: 'Listing 内容已变化', product: '商品信息或场景要求已变化', visual: '视觉风格已变化', density: '信息密度已变化', guide: '整套风格要求已变化', layout: '图片数量或模块规格已变化', marketplace: '目标站点已变化' } as const
+  if (previous.planningSettings && current.planningSettings) for (const key of Object.keys(labels) as Array<keyof typeof labels>) if (previous.planningSettings[key] !== current.planningSettings[key]) changes.push(labels[key])
+  return changes
 }

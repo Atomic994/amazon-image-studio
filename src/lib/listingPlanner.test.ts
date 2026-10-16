@@ -375,11 +375,12 @@ describe('single module replanning', () => {
       ? { choices: [{ message: { content: JSON.stringify(payload) }, finish_reason: 'stop' }] }
       : { status: 'completed', output_text: JSON.stringify(payload) })))
     vi.stubGlobal('fetch', fetchMock)
-    const result = await callAmazonPlannerApi({ ...createPlannerRequest(apiMode), referenceImageDataUrls: ['data:image/png;base64,test'], referenceImageDescriptions: ['Style only; never copy its product'], moduleRevision: { plan: payload.imagePlans[0], instruction: 'Show the handle', seriesStyleGuide: 'Keep product facts' } })
+    const result = await callAmazonPlannerApi({ ...createPlannerRequest(apiMode), planningStyleContext: 'Information density: minimal; selected palette: warm gold', referenceImageDataUrls: ['data:image/png;base64,test'], referenceImageDescriptions: ['Style only; never copy its product'], moduleRevision: { plan: payload.imagePlans[0], instruction: 'Show the handle', seriesStyleGuide: 'Keep product facts' } })
     expect(result.plans.map((plan) => plan.slot)).toEqual(['PT01'])
     const body = JSON.parse(String((fetchMock.mock.calls as unknown as [string, RequestInit][])[0][1].body))
     expect(JSON.stringify(body)).toContain('SINGLE MODULE REVISION: PT01')
     expect(JSON.stringify(body)).toContain('Only product references establish product facts')
+    expect(JSON.stringify(body)).toContain('Information density: minimal; selected palette: warm gold')
     if (apiMode === 'responses') {
       const schema = body.text.format.schema
       expect(schema.properties.imagePlans.minItems).toBe(1)

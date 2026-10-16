@@ -1,10 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from 'react'
 import { createPortal } from 'react-dom'
 import { ensureImageCached, useStore } from '../store'
 import { canvasToBlob, loadImage } from '../lib/canvasImage'
 import { storeImage } from '../lib/db'
 import { prepareMaskTargetDataUrl, replaceMaskTargetImage } from '../lib/maskPreprocess'
+import { localMaskPreview } from '../lib/localEditProtection'
+import { assertUsableMaskCoverage, classifyMaskAlpha } from '../lib/mask'
 import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { usePreventBackgroundScroll } from '../hooks/usePreventBackgroundScroll'
 import {
@@ -100,10 +102,13 @@ function blobToDataUrl(blob: Blob): Promise<string> {
   })
 }
 
-export default function MaskEditorModal() {
-  const imageId = useStore((s) => s.maskEditorImageId)
+export default function MaskEditorModal({ editor }: { editor?: { sourceImageId: string; initialMaskDataUrl?: string; onSave: (maskDataUrl: string) => Promise<void>; onRemove: () => void; onClose: () => void } } = {}) {
+  const galleryImageId = useStore((s) => s.maskEditorImageId)
+  const supportsLocalProtection = useStore((s) => s.appMode !== 'agent')
+  const imageId = editor?.sourceImageId ?? galleryImageId
   const setMaskEditorImageId = useStore((s) => s.setMaskEditorImageId)
-  const maskDraft = useStore((s) => s.maskDraft)
+  const galleryMaskDraft = useStore((s) => s.maskDraft)
+  const maskDraft = useMemo(() => editor ? editor.initialMaskDataUrl ? { targetImageId: editor.sourceImageId, maskDataUrl: editor.initialMaskDataUrl, protectUneditedArea: true, updatedAt: 0 } : null : galleryMaskDraft, [editor?.sourceImageId, editor?.initialMaskDataUrl, editor ? null : galleryMaskDraft, Boolean(editor)])
   const setMaskDraft = useStore((s) => s.setMaskDraft)
   const clearMaskDraft = useStore((s) => s.clearMaskDraft)
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
@@ -134,6 +139,8 @@ export default function MaskEditorModal() {
 
   const [sourceDataUrl, setSourceDataUrl] = useState('')
   const [size, setSize] = useState<CanvasSize | null>(null)
+  const [originalSize, setOriginalSize] = useState<CanvasSize | null>(null)
+  const [protectOutside, setProtectOutside] = useState(true)
   const [tool, setTool] = useState<Tool>('brush')
   const [brushSize, setBrushSize] = useState(64)
   const [showBrushControls, setShowBrushControls] = useState(false)
@@ -150,7 +157,8 @@ export default function MaskEditorModal() {
 
   const close = () => {
     if (isSaving) return
-    setMaskEditorImageId(null)
+    if (editor) editor.onClose()
+    else setMaskEditorImageId(null)
   }
   useCloseOnEscape(Boolean(imageId), close)
   usePreventBackgroundScroll(Boolean(imageId))
@@ -188,8 +196,8 @@ export default function MaskEditorModal() {
       message: '确定要撤销对这张图片的所有涂抹并移除遮罩吗？',
       tone: 'danger',
       action: () => {
-        clearMaskDraft()
-        setMaskEditorImageId(null)
+        if (editor) { editor.onRemove(); editor.onClose() }
+        else { clearMaskDraft(); setMaskEditorImageId(null) }
         showToast('已移除遮罩', 'success')
       },
     })
@@ -470,6 +478,7 @@ export default function MaskEditorModal() {
     const targetImageId = imageId
     let cancelled = false
     setIsLoading(true)
+    setProtectOutside(editor ? true : maskDraft?.protectUneditedArea ?? !maskDraft)
     setSourceDataUrl('')
     setSize(null)
     undoStackRef.current = []
@@ -482,11 +491,11 @@ export default function MaskEditorModal() {
         if (cancelled) return
         if (!dataUrl) {
           showToast('图片已不存在，无法编辑遮罩', 'error')
-          setMaskEditorImageId(null)
+          close()
           return
         }
 
-        const preparedTarget = await prepareMaskTargetDataUrl(dataUrl)
+        const preparedTarget = editor ? await localMaskPreview(dataUrl) : await prepareMaskTargetDataUrl(dataUrl)
         const image = await loadImage(preparedTarget.dataUrl)
         if (cancelled) return
 
@@ -525,9 +534,10 @@ export default function MaskEditorModal() {
         renderPreview()
         setSourceDataUrl(preparedTarget.dataUrl)
         setSize(nextSize)
+        setOriginalSize({ width: preparedTarget.originalWidth, height: preparedTarget.originalHeight })
         if (preparedTarget.wasResized) {
           showToast(
-            `已为遮罩编辑按官方要求调整图片尺寸：\n${preparedTarget.originalWidth}×${preparedTarget.originalHeight} → ${preparedTarget.width}×${preparedTarget.height}`,
+            editor ? '预览已缩小以便涂抹，保存后仍使用原图尺寸。' : `已为遮罩编辑调整图片尺寸：\n${preparedTarget.originalWidth}×${preparedTarget.originalHeight} → ${preparedTarget.width}×${preparedTarget.height}`,
             'info',
           )
         }
@@ -535,7 +545,7 @@ export default function MaskEditorModal() {
       } catch (err) {
         if (!cancelled) {
           showToast(err instanceof Error ? err.message : String(err), 'error')
-          setMaskEditorImageId(null)
+          close()
         }
       } finally {
         if (!cancelled) setIsLoading(false)
@@ -557,7 +567,7 @@ export default function MaskEditorModal() {
       panGestureRef.current = null
       setIsPanning(false)
     }
-  }, [imageId, maskDraft, setMaskEditorImageId, showToast])
+  }, [imageId, maskDraft, setMaskEditorImageId, showToast, Boolean(editor)])
 
   useEffect(() => {
     if (isAltKeyPressed) {
@@ -789,6 +799,20 @@ export default function MaskEditorModal() {
     const savingImageId = imageId
     try {
       setIsSaving(true)
+      const context = canvas.getContext('2d', { willReadFrequently: true })
+      if (!context) throw new Error('浏览器无法读取修改区域')
+      assertUsableMaskCoverage(classifyMaskAlpha(context.getImageData(0, 0, canvas.width, canvas.height)))
+      if (editor) {
+        if (!originalSize) throw new Error('原图尺寸尚未载入')
+        const fullMask = document.createElement('canvas'); fullMask.width = originalSize.width; fullMask.height = originalSize.height
+        try {
+          const fullContext = fullMask.getContext('2d')
+          if (!fullContext) throw new Error('浏览器无法保存修改区域')
+          fullContext.drawImage(canvas, 0, 0, fullMask.width, fullMask.height)
+          if (activeSessionIdRef.current === savingSessionId) await editor.onSave(fullMask.toDataURL('image/png'))
+        } finally { fullMask.width = 1; fullMask.height = 1 }
+        return
+      }
       const blob = await canvasToBlob(canvas, 'image/png')
       const maskDataUrl = await blobToDataUrl(blob)
       const workingTargetId = await storeImage(sourceDataUrl, 'upload')
@@ -809,6 +833,7 @@ export default function MaskEditorModal() {
       setMaskDraft({
         targetImageId: workingTargetId,
         maskDataUrl,
+        protectUneditedArea: supportsLocalProtection && protectOutside,
         updatedAt: Date.now(),
       })
       setMaskEditorImageId(null)
@@ -817,7 +842,7 @@ export default function MaskEditorModal() {
       if (
         saveTokenRef.current !== token ||
         activeSessionIdRef.current !== savingSessionId ||
-        useStore.getState().maskEditorImageId !== savingImageId
+        (!editor && useStore.getState().maskEditorImageId !== savingImageId)
       ) return
       showToast(err instanceof Error ? err.message : String(err), 'error')
     } finally {
@@ -842,7 +867,7 @@ export default function MaskEditorModal() {
 
   return (
     <>
-      <div data-no-drag-select className="fixed inset-0 z-[80] flex flex-col bg-background animate-fade-in">
+      <div role="dialog" aria-modal="true" aria-labelledby="mask-editor-title" data-no-drag-select className="fixed inset-0 z-[80] flex flex-col bg-background animate-fade-in">
       {/* Header */}
       <div className="ios-material z-20 flex flex-none items-center justify-between rounded-none px-4 py-3">
         <div className="flex items-center gap-3">
@@ -850,7 +875,7 @@ export default function MaskEditorModal() {
             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg>
           </button>
           <div className="relative flex items-center gap-1.5">
-            <h2 className="text-sm font-medium text-gray-700 dark:text-gray-200" id="mask-editor-title">编辑遮罩</h2>
+            <h2 className="text-sm font-medium text-gray-700 dark:text-gray-200" id="mask-editor-title">{editor ? '选择可修改区域' : '编辑遮罩'}</h2>
             <button
               type="button"
               onClick={showMaskInfoPopover}
@@ -868,8 +893,8 @@ export default function MaskEditorModal() {
             </button>
             {showMaskInfo && (
               <div className="ios-menu absolute left-0 top-full mt-2 w-64 px-3 py-2 text-xs leading-5 text-muted-foreground">
-                <p>根据官方文档说明，此功能仅基于提示词，无法完全控制模型编辑区域。</p>
-                <p className="mt-2">建议附加类似“只编辑遮罩区域”的提示词以提升模型指令遵循程度。</p>
+                <p>涂抹需要修改的区域。{editor || supportsLocalProtection ? '开启区域保护后，未涂抹处使用原图像素，结果以当前原图尺寸保存为 PNG。' : '涂抹范围将作为遮罩发送给模型。'}</p>
+                <p className="mt-2">标注用于表达编辑意图，可修改区域用于限定最终保留的修改范围。</p>
               </div>
             )}
           </div>
@@ -877,16 +902,17 @@ export default function MaskEditorModal() {
         <div className="flex items-center gap-2">
           {maskDraft?.targetImageId === imageId && (
             <button onClick={handleRemoveMask} className="flex h-8 items-center gap-1.5 px-4 text-sm font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition">
-              移除遮罩
+              {editor ? '移除修改区域' : '移除遮罩'}
             </button>
           )}
           <button onClick={handleSave} disabled={!isReady || isSaving} className="flex h-8 items-center gap-1.5 px-4 text-sm font-medium text-white bg-blue-500 hover:bg-blue-600 rounded-lg disabled:opacity-50 transition">
-            {isSaving ? '保存中...' : '保存'}
+            {isSaving ? '保存中...' : editor ? '保存修改区域' : '保存'}
           </button>
         </div>
       </div>
 
       {/* Workspace */}
+      {(editor || supportsLocalProtection) && <div className="px-4 py-2 text-xs text-gray-600 dark:text-gray-300">{editor ? '涂抹允许修改的区域，其余区域从原图恢复；结果保持原图尺寸并保存为 PNG。' : <label className="flex items-center gap-2"><input type="checkbox" checked={protectOutside} onChange={(event) => setProtectOutside(event.target.checked)} disabled={isSaving} />生成后保护未涂抹区域（保持当前主图尺寸，保存为 PNG）</label>}</div>}
       <div ref={stageRef} className="flex-1 relative flex items-center justify-center overflow-hidden bg-gray-100/50 dark:bg-black/50 p-0 pb-[76px] sm:p-6 sm:pb-[100px]" style={{ containerType: 'size' }}>
         {isLoading && (
           <div className="absolute inset-0 z-20 flex items-center justify-center bg-white/50 text-sm text-gray-500 backdrop-blur-sm dark:bg-gray-900/50 dark:text-gray-300">

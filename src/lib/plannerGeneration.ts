@@ -1,27 +1,22 @@
 import type { AmazonPlannerSession, ApiProfile, GenerationQueueRequest, ReferenceAnalysisSnapshot } from '../types'
 import { DEFAULT_PARAMS } from '../types'
 import { appendProductFactsContract, confirmedProductFacts, contextFingerprint } from './productFacts'
-import { analysisMatchesInputs, isPlannerContextStale, plannerSourceContext } from './referenceAnalysis'
+import { analysisMatchesInputs, plannerContextChangeReasons } from './referenceAnalysis'
 import { REFERENCE_PURPOSE_LABELS, normalizeReferenceUsage, referenceAppliesToSlot } from './referenceImageUsage'
 import { buildAmazonAPlusPlanPrompt, buildAmazonPlanPrompt, isAmazonListingMainSlot } from './listingPlanner'
 import { plannerModuleKey } from './plannerModuleVersions'
-import { getStylePresetById } from './stylePresets'
-import { getCustomStyleReferenceVisualMeta } from './styleReferences'
+import { plannerContextForSlot, plannerVisualStyle } from './plannerContext'
+export { plannerVisualStyle } from './plannerContext'
 import { canApiProfileGenerateImages, validateApiProfile } from './apiProfiles'
 
 export interface PlannerGenerationSpec {
   slot: string; label: string; versionLabel: string; prompt: string; size: string; stale: boolean
-  factsVersion?: number; errors: string[]; excludedIds: string[]
+  factsVersion?: number; errors: string[]; excludedIds: string[]; staleReasons: string[]
   references: Array<{ id: string; role: string; hidden: boolean; analysis?: ReferenceAnalysisSnapshot }>
   request: GenerationQueueRequest
 }
 export function generationProfileIdentity(profile: ApiProfile): string {
   return contextFingerprint([profile.provider, profile.baseUrl.trim().replace(/\/+$/, ''), profile.model, profile.apiMode, profile.codexCli])
-}
-export function plannerVisualStyle(session: AmazonPlannerSession) {
-  if (session.selectedCustomStyleReferenceSnapshot) return getCustomStyleReferenceVisualMeta(session.selectedCustomStyleReferenceSnapshot)
-  if (session.selectedUploadedStyleReferenceSnapshot) return { label: session.selectedUploadedStyleReferenceSnapshot.title, description: '参考上传图片的配色、光影、对比度、材质和整体视觉质感，不复制原图文字、布局、产品或场景。', palette: [] }
-  return getStylePresetById(session.selectedStylePresetId) ?? null
 }
 /** Used both by preflight and dispatch, with the exact ordered input IDs captured here. */
 export function buildPlannerGenerationSpec(session: AmazonPlannerSession, slot: string, profile: ApiProfile, inputLimit: number): PlannerGenerationSpec {
@@ -47,7 +42,7 @@ export function buildPlannerGenerationSpec(session: AmazonPlannerSession, slot: 
   if (!main && !styleId) errors.push('请先选择并加载一套风格参考')
   if (ids.length > inputLimit) errors.push(`实际参考图 ${ids.length} 张，超过当前接口上限 ${inputLimit} 张`)
   if (!prompt.trim()) errors.push('生图提示词为空')
-  const contextIds = ids.filter((id) => id !== styleId)
+  const staleReasons = plannerContextChangeReasons(version?.context, plannerContextForSlot(session, slot, analyses))
   const request: GenerationQueueRequest = { apiProfileId: profile.id, profileIdentity: generationProfileIdentity(profile), prompt, inputImageIds: ids,
     params: { ...DEFAULT_PARAMS, size, n: 1 }, referenceImageUsages: usages, productFactsSnapshot: facts, referenceAnalysisSnapshots: Object.values(analyses),
     category: { productTitle: session.draft.productTitle.trim(), workflow: session.mode === 'aplus' ? 'amazon-aplus' : 'amazon-listing', amazonSlot: slot, plannerSessionId: session.id,
@@ -55,7 +50,7 @@ export function buildPlannerGenerationSpec(session: AmazonPlannerSession, slot: 
   }
   return { slot, label: plan.label, prompt, size, excludedIds, request, errors, factsVersion: facts?.versionNumber,
     versionLabel: version ? `v${version.versionNumber}${version.creative ? ` · ${version.creative.title}` : ''}` : '原始策划',
-    stale: isPlannerContextStale(version?.context, plannerSourceContext(contextIds, usages, analyses, facts)),
+    stale: staleReasons.length > 0, staleReasons,
     references: ids.map((id) => ({ id, hidden: id === styleId, role: id === styleId ? '隐藏风格参考：仅用于视觉风格' : `${REFERENCE_PURPOSE_LABELS[usages[id].purpose]} · ${usages[id].slots.length ? `仅 ${usages[id].slots.join('、')}` : '全部图片位'}${usages[id].note ? ` · ${usages[id].note}` : ''}`, analysis: analyses[id] })),
   }
 }

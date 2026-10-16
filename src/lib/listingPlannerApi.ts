@@ -994,6 +994,7 @@ export async function callAmazonPlannerApi(options: {
   referenceImageDataUrls?: string[]
   referenceImageDescriptions?: string[]
   confirmedProductFacts?: string
+  planningStyleContext?: string
   moduleRevision?: { plan: AmazonImagePlan | AmazonAPlusPlan; instruction: string; seriesStyleGuide: string }
   model?: string
   mode?: AmazonPlannerMode
@@ -1046,6 +1047,7 @@ export async function callAmazonPlannerApi(options: {
     aPlusModuleSpecs,
     marketplaceId,
   })) + (options.confirmedProductFacts ? `\n\n${options.confirmedProductFacts}` : '') + (!isDeepSeekPlannerProfile && options.referenceImageDescriptions?.length ? `\n\nReference image roles, in attachment order:\n${options.referenceImageDescriptions.map((description, index) => `${index + 1}. ${description}`).join('\n')}\nOnly product references establish product facts. Honor each reference scope; other references only inform their stated visual role.` : '')
+  const finalInputText = inputText + (options.planningStyleContext ? `\n\n${options.planningStyleContext}` : '')
   const referenceImageDataUrls = isDeepSeekPlannerProfile
     ? []
     : options.referenceImageDataUrls ?? []
@@ -1067,7 +1069,7 @@ export async function callAmazonPlannerApi(options: {
             },
             {
               role: 'user',
-              content: buildChatPlannerUserContent(inputText, referenceImageDataUrls),
+              content: buildChatPlannerUserContent(finalInputText, referenceImageDataUrls),
             },
           ],
           response_format: { type: 'json_object' },
@@ -1081,7 +1083,7 @@ export async function callAmazonPlannerApi(options: {
             aPlusModuleSpecs,
             marketplaceId,
           }),
-          input: buildResponsesPlannerInput(inputText, referenceImageDataUrls),
+          input: buildResponsesPlannerInput(finalInputText, referenceImageDataUrls),
           text: {
             format: {
               type: 'json_schema',

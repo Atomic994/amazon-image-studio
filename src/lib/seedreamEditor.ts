@@ -42,6 +42,7 @@ export interface SeedreamEditPromptOptions {
   instruction: string
   hasVisualGuide: boolean
   referenceCount: number
+  hasProtectedMask?: boolean
 }
 
 function getImageEditorTaskEngine(task: TaskRecord): ImageEditorEngine {
@@ -73,7 +74,7 @@ export function findLatestImageEditorTask(
   ), null)
 }
 
-export function buildSeedreamEditPrompt({ instruction, hasVisualGuide, referenceCount }: SeedreamEditPromptOptions) {
+export function buildSeedreamEditPrompt({ instruction, hasVisualGuide, referenceCount, hasProtectedMask }: SeedreamEditPromptOptions) {
   const visualGuideIndex = hasVisualGuide ? 2 : null
   const referenceStartIndex = hasVisualGuide ? 3 : 2
   const roles = [
@@ -96,6 +97,7 @@ export function buildSeedreamEditPrompt({ instruction, hasVisualGuide, reference
       ? '请根据视觉定位图理解位置，但最终结果中不得出现任何红、蓝、绿、黄标注线、箭头、边框或涂鸦。'
       : null,
     '只修改用户明确指定的区域和内容；未指定区域、主体身份、透视、光照、文字与版式应尽量保持不变。',
+    hasProtectedMask ? '图2中的半透明青色区域是允许修改的范围，青色只用于定位，不是商品颜色。只在该范围内完成修改，不要移动或缩放整张画面；最终不要保留青色覆盖。范围以外将使用图1的原始像素。' : null,
     '保持图1的原始宽高比，只输出一张完成后的干净图片，不要输出对比图、拼图、说明文字或额外版本。',
   ].filter((line): line is string => line != null).join('\n')
 }

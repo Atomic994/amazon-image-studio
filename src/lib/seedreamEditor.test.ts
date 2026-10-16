@@ -26,6 +26,11 @@ function editorTask(overrides: Partial<TaskRecord>): TaskRecord {
 }
 
 describe('Seedream editor prompt', () => {
+  it('keeps the protected region guide separate from reference roles and prohibits frame shifts', () => {
+    const prompt = buildSeedreamEditPrompt({ instruction: '修正灯罩', hasVisualGuide: true, hasProtectedMask: true, referenceCount: 1 })
+    expect(prompt).toContain('图2中的半透明青色区域'); expect(prompt).toContain('图3是参考图1')
+    expect(prompt).toContain('不要移动或缩放整张画面'); expect(prompt).toContain('范围以外将使用图1的原始像素')
+  })
   it('describes source and references without inventing a visual guide role', () => {
     const prompt = buildSeedreamEditPrompt({
       instruction: '把杯子替换成参考图里的玻璃杯',

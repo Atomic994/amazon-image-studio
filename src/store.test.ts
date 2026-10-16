@@ -127,6 +127,8 @@ import { createGenerationQueueItems } from './lib/generationQueueModel'
 import { generationProfileIdentity } from './lib/plannerGeneration'
 import { stopImageTask } from './store'
 import * as falImageApi from './lib/falAiImageApi'
+import * as localEdit from './lib/localEditProtection'
+import * as customImageApi from './lib/openaiCompatibleImageApi'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
 import { callImageApi } from './lib/api'
 import { cleanStaleAgentInputDrafts, clearData, deleteImageIfUnreferenced, editOutputs, ensureImageCached, exportData, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, mergePersistedState, openSeedreamTaskInEditor, regenerateAgentAssistantMessage, removeTask, resolveInputImagesForRequest, retryTask, reuseConfig, submitAgentMessage, submitTask, submitTaskWithInput, useStore } from './store'
@@ -144,12 +146,119 @@ beforeEach(async () => {
 describe('local material and review persistence', () => {
   beforeEach(async () => {
     vi.useFakeTimers()
-    vi.stubGlobal('window', { requestIdleCallback: () => 0 })
+    vi.stubGlobal('window', { requestIdleCallback: () => 0, location: { hash: '' } })
     await clearStoredTasks(); await clearImages(); await clearAmazonPlannerSessions()
     useStore.setState({ settings: settingsWithConfiguredImageProfile(), tasks: [], inputImages: [], galleryInputDraft: null, imageEditorDrafts: {}, agentInputDrafts: {}, agentConversations: [], prompt: '', params: { ...DEFAULT_PARAMS }, pendingTaskCategory: null, reusedTaskApiProfileId: null, reusedTaskApiProfileMissing: false, maskDraft: null, showToast: vi.fn() })
     vi.mocked(callImageApi).mockReset().mockResolvedValue({ images: [], actualParams: {} })
   })
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
+
+  const protectedInput = async () => {
+    const original = { id: 'protected-original', dataUrl: 'data:image/png;base64,original' }, mask = { id: 'protected-mask', dataUrl: 'data:image/png;base64,mask' }
+    await putImage(original); await putImage(mask)
+    vi.spyOn(localEdit, 'validateProtectedEditInputs').mockResolvedValue({ width: 1200, height: 800 })
+    vi.spyOn(localEdit, 'compositeProtectedEdit').mockResolvedValue({ dataUrl: 'data:image/png;base64,protected-result', width: 1200, height: 800 })
+    return { original, mask, request: { apiProfileId: getHomeApiProfile(useStore.getState().settings).id, prompt: 'Change selected area', params: { ...DEFAULT_PARAMS }, inputImages: [original], category: { workflow: 'seedream-edit' as const }, localEditProtection: { baseImageId: original.id, maskImageId: mask.id } } }
+  }
+
+  it('stores only composited PNGs with original dimensions and retains the immutable mask on retry', async () => {
+    const { original, mask, request } = await protectedInput()
+    vi.mocked(callImageApi).mockResolvedValue({ images: ['data:image/jpeg;base64,upstream'], actualParams: { size: '2048x2048', output_format: 'jpeg' }, rawImageUrls: ['https://upstream.example/raw.jpg'] })
+    const id = await submitTaskWithInput(request); await vi.advanceTimersByTimeAsync(0)
+    const result = useStore.getState().tasks.find((row) => row.id === id)!
+    expect(result).toMatchObject({ status: 'done', localEditProtection: { version: 1, baseHash: `hash:${original.dataUrl}`, maskHash: `hash:${mask.dataUrl}` }, actualParams: { size: '1200x800', output_format: 'png', output_compression: null }, rawImageUrls: undefined })
+    expect((await getImage(result.outputImages[0]))?.dataUrl).toBe('data:image/png;base64,protected-result')
+    expect(localEdit.compositeProtectedEdit).toHaveBeenCalledWith(original.dataUrl, mask.dataUrl, 'data:image/jpeg;base64,upstream')
+    await retryTask(result); await vi.advanceTimersByTimeAsync(0)
+    expect(localEdit.compositeProtectedEdit).toHaveBeenCalledTimes(2)
+    expect(useStore.getState().tasks[0].localEditProtection).toEqual(result.localEditProtection)
+    openSeedreamTaskInEditor(result)
+    expect(useStore.getState().seedreamEditorDraft).toMatchObject({ sourceImageId: original.id, localEditMaskId: mask.id, protectUneditedArea: true })
+  })
+
+  it('rejects an incompatible mask or wrong first image before making a paid request', async () => {
+    const { request } = await protectedInput()
+    vi.mocked(localEdit.validateProtectedEditInputs).mockRejectedValueOnce(new Error('修改区域与原图尺寸不一致'))
+    expect(await submitTaskWithInput(request)).toBeNull()
+    expect(await submitTaskWithInput({ ...request, inputImages: [imageB, ...request.inputImages] })).toBeNull()
+    expect(callImageApi).not.toHaveBeenCalled()
+  })
+
+  it('never saves an unprotected fallback if compositing fails', async () => {
+    const { request } = await protectedInput()
+    vi.mocked(callImageApi).mockResolvedValue({ images: ['data:image/png;base64,unprotected'], actualParams: {} })
+    vi.mocked(localEdit.compositeProtectedEdit).mockRejectedValueOnce(new Error('区域合成失败'))
+    const id = await submitTaskWithInput(request); await vi.advanceTimersByTimeAsync(0)
+    expect(useStore.getState().tasks.find((row) => row.id === id)).toMatchObject({ status: 'error', error: '区域合成失败', outputImages: [] })
+  })
+
+  it('stops retry before the API when submitted mask bytes have changed', async () => {
+    const { request, mask } = await protectedInput()
+    const id = await submitTaskWithInput(request); await vi.advanceTimersByTimeAsync(0)
+    const originalTask = useStore.getState().tasks.find((row) => row.id === id)!
+    await putImage({ ...mask, dataUrl: 'data:image/png;base64,changed' })
+    await retryTask(originalTask); await vi.advanceTimersByTimeAsync(0)
+    expect(callImageApi).toHaveBeenCalledTimes(1)
+    expect(useStore.getState().tasks[0]).toMatchObject({ status: 'error', outputImages: [], error: expect.stringContaining('提交时不同') })
+  })
+
+  it('protects recovered fal outputs and retains a material collection mask after task deletion and restart', async () => {
+    const { original, mask } = await protectedInput()
+    const fal = createDefaultFalProfile({ apiKey: 'test-key' })
+    useStore.setState({ settings: normalizeSettings({ ...useStore.getState().settings, profiles: [...useStore.getState().settings.profiles, fal] }) })
+    vi.spyOn(falImageApi, 'getFalQueuedImageResult').mockResolvedValue({ images: ['data:image/png;base64,recovered-raw'], actualParams: {} })
+    const native = task({ id: 'protected-native', status: 'running', apiProvider: 'fal', apiProfileId: fal.id, falRequestId: 'native-id', falEndpoint: 'fal-ai/test', inputImageIds: [original.id], outputImages: [], localEditProtection: { version: 1, baseImageId: original.id, maskImageId: mask.id, baseHash: `hash:${original.dataUrl}`, maskHash: `hash:${mask.dataUrl}` } })
+    await putTask(native); await initStore(); await vi.advanceTimersByTimeAsync(0)
+    const result = useStore.getState().tasks.find((row) => row.id === native.id)!
+    expect(result).toMatchObject({ status: 'done', actualParams: { size: '1200x800', output_format: 'png' } })
+    expect(localEdit.compositeProtectedEdit).toHaveBeenCalledWith(original.dataUrl, mask.dataUrl, 'data:image/png;base64,recovered-raw')
+    const saved = await saveMaterialCollection({ title: 'Protected set', items: [materialItemFromTask(result, result.outputImages[0])] })
+    await removeTask(result); await initStore(); await deleteImageIfUnreferenced(mask.id)
+    expect(await getImage(mask.id)).toBeDefined()
+    expect(saved.versions[0].items[0].localEditProtection).toEqual(native.localEditProtection)
+    await reuseMaterialItem(saved.versions[0].items[0])
+    expect(useStore.getState().pendingTaskCategory?.localEditProtection).toEqual(native.localEditProtection)
+  })
+
+  it('persists separate masks in editor workspaces and pins them during startup cleanup', async () => {
+    const { original, mask } = await protectedInput()
+    useStore.getState().selectImageEditorSource(original.id)
+    useStore.getState().updateImageEditorDraft(original.id, { localEditMaskId: mask.id, protectUneditedArea: false })
+    useStore.getState().selectImageEditorSource('another-original')
+    const restored = mergePersistedState(getPersistedState(useStore.getState()), useStore.getState())
+    expect(restored.imageEditorDrafts[original.id]).toMatchObject({ localEditMaskId: mask.id, protectUneditedArea: false })
+    useStore.setState(restored); await initStore(); await deleteImageIfUnreferenced(mask.id)
+    expect(await getImage(mask.id)).toBeDefined()
+    useStore.getState().selectImageEditorSource(original.id)
+    expect(useStore.getState().seedreamEditorDraft.localEditMaskId).toBe(mask.id)
+    useStore.getState().setSeedreamEditorDraft({ sourceImageId: 'new-result' })
+    expect(useStore.getState().seedreamEditorDraft.localEditMaskId).toBeNull()
+    expect(useStore.getState().imageEditorDrafts[original.id].localEditMaskId).toBe(mask.id)
+  })
+
+  it('composites custom asynchronous recovery using the submitted mask and original size', async () => {
+    const { original, mask } = await protectedInput()
+    const profile = createDefaultOpenAIProfile({ id: 'protected-custom-profile', provider: 'protected-async', apiKey: 'local-only', baseUrl: 'https://custom.example/v1' })
+    useStore.setState({ settings: normalizeSettings({ ...useStore.getState().settings, profiles: [...useStore.getState().settings.profiles, profile], customProviders: [{ id: 'protected-async', name: 'Local async fixture', submit: { path: 'images/generations', taskIdPath: 'id' }, poll: { path: 'images/tasks/{task_id}', statusPath: 'status', successValues: ['done'], failureValues: ['error'], result: { b64JsonPaths: ['image'] } } }] }) })
+    const poll = vi.spyOn(customImageApi, 'getCustomQueuedImageResult').mockResolvedValue({ images: ['data:image/png;base64,recovered-custom'], actualParams: {} })
+    const native = task({ id: 'protected-custom', status: 'running', apiProvider: profile.provider, apiProfileId: profile.id, customTaskId: 'custom-native-id', inputImageIds: [original.id], outputImages: [], localEditProtection: { version: 1, baseImageId: original.id, maskImageId: mask.id, baseHash: `hash:${original.dataUrl}`, maskHash: `hash:${mask.dataUrl}` } })
+    await putTask(native); await initStore(); await vi.advanceTimersByTimeAsync(0)
+    expect(poll).toHaveBeenCalledTimes(1)
+    expect(localEdit.compositeProtectedEdit).toHaveBeenCalledWith(original.dataUrl, mask.dataUrl, 'data:image/png;base64,recovered-custom')
+    expect(useStore.getState().tasks.find((row) => row.id === native.id)).toMatchObject({ status: 'done', actualParams: { size: '1200x800', output_format: 'png' } })
+  })
+
+  it('rejects missing protection data and never publishes a result after cancellation during compositing', async () => {
+    const { request } = await protectedInput()
+    expect(await submitTaskWithInput({ ...request, localEditProtection: { ...request.localEditProtection, maskImageId: 'missing-mask' } })).toBeNull()
+    expect(callImageApi).not.toHaveBeenCalled()
+    let finish: (value: { dataUrl: string; width: number; height: number }) => void = () => {}
+    vi.mocked(localEdit.compositeProtectedEdit).mockImplementation(() => new Promise((resolve) => { finish = resolve }))
+    vi.mocked(callImageApi).mockResolvedValue({ images: ['data:image/png;base64,late-raw'], actualParams: {} })
+    const id = await submitTaskWithInput(request); await vi.advanceTimersByTimeAsync(0)
+    stopImageTask(id!); finish({ dataUrl: 'data:image/png;base64,late-protected', width: 1200, height: 800 }); await vi.advanceTimersByTimeAsync(0)
+    expect(useStore.getState().tasks.find((row) => row.id === id)).toMatchObject({ status: 'error', outputImages: [], cancelledAt: expect.any(Number) })
+  })
 
   it('deduplicates one queue attempt and cancellation rejects late image results', async () => {
     let complete: (value: { images: string[]; actualParams: {} }) => void = () => {}

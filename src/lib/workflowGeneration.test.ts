@@ -139,10 +139,11 @@ describe('single-module creative directions transport', () => {
   it('plans only one slot with actual images and confirmed facts, using Chat or Responses', async () => {
     for (const apiMode of ['chat', 'responses'] as const) {
       const fetchMock = vi.fn(async () => response([direction(1), direction(2)], apiMode === 'chat')); vi.stubGlobal('fetch', fetchMock)
-      const result = await planCreativeDirections({ session: session(), slot: 'PT01', count: 2, instruction: '桌面细节', profile: { ...planner, apiMode }, images: ['data:image/png;base64,YQ=='], referenceDescriptions: ['Product reference'] })
+      const result = await planCreativeDirections({ session: { ...session(), styleDensityMode: 'minimal' }, slot: 'PT01', count: 2, instruction: '桌面细节', profile: { ...planner, apiMode }, images: ['data:image/png;base64,YQ=='], referenceDescriptions: ['Product reference'] })
       expect(result).toHaveLength(2); expect(result[0].plan.slot).toBe('PT01')
       const body = JSON.parse(String((fetchMock.mock.calls[0] as any)[1].body))
       expect(JSON.stringify(body)).toContain('Black'); expect(JSON.stringify(body)).toContain('data:image/png')
+      expect(JSON.stringify(body)).toContain('Information density: minimal')
       if (apiMode === 'responses') expect(body.text.format.schema.properties.directions.minItems).toBe(2)
     }
   })

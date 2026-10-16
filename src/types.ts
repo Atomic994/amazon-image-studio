@@ -148,6 +148,7 @@ export interface MaskDraft {
   targetImageId: string
   maskDataUrl: string
   updatedAt: number
+  protectUneditedArea?: boolean
 }
 
 // 图片编辑页的分辨率档位：首页生图 API 支持 1K，Seedream Pro 原生使用 2K/4K。
@@ -177,6 +178,8 @@ export interface SeedreamEditorDraft {
   instruction: string
   /** Disable explicitly when an edit intentionally changes the confirmed product identity. */
   preserveProductFacts?: boolean
+  localEditMaskId?: string | null
+  protectUneditedArea?: boolean
   annotations: SeedreamAnnotation[]
   resolution: SeedreamEditorResolution
   latestTaskId: string | null
@@ -243,6 +246,7 @@ export interface TaskRecord {
   inputImageIds: string[]
   maskTargetImageId?: string | null
   maskImageId?: string | null
+  localEditProtection?: LocalEditProtection
   /** 输出图片的 image store id 列表 */
   outputImages: string[]
   /** 流式生成的中间步骤图片 id 列表，仅失败时保留供排查/下载 */
@@ -554,6 +558,26 @@ export interface PlannerSourceContext {
   referenceFingerprint: string
   referenceImageIds: string[]
   referenceAnalyses: ReferenceAnalysisSnapshot[]
+  planningSettings?: PlannerSettingsSnapshot
+  legacySettingsBaseline?: boolean
+}
+
+export interface PlannerSettingsSnapshot {
+  listing: string
+  product: string
+  visual: string
+  density: string
+  guide: string
+  layout: string
+  marketplace: string
+}
+
+export interface LocalEditProtection {
+  version: 1
+  baseImageId: string
+  maskImageId: string
+  baseHash: string
+  maskHash: string
 }
 
 export interface MaterialCollectionItem {
@@ -569,6 +593,7 @@ export interface MaterialCollectionItem {
   reviewNote?: string
   productFactsSnapshot?: ProductFactsVersion
   referenceAnalysisSnapshots?: ReferenceAnalysisSnapshot[]
+  localEditProtection?: LocalEditProtection
 }
 
 export interface MaterialCollectionVersion {

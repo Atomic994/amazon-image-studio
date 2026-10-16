@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as
 import { canApiProfileGenerateImages, getHomeApiProfile, getSeedreamEditorProfile, isVolcengineSeedreamProModel, validateApiProfile } from '../lib/apiProfiles'
 import { downloadImageIds } from '../lib/downloadImages'
 import { loadImage } from '../lib/canvasImage'
+import { createProtectedEditGuide, validateProtectedEditInputs } from '../lib/localEditProtection'
+import MaskEditorModal from './MaskEditorModal'
 import { formatPlannerElapsed } from '../lib/plannerRunLog'
 import {
   appendSeedreamQuickAction,
@@ -293,6 +295,8 @@ export default function ImageEditorPage() {
   const [redoStack, setRedoStack] = useState<SeedreamAnnotation[][]>([])
   const [pickerMode, setPickerMode] = useState<PickerMode | null>(null)
   const [uploadingSource, setUploadingSource] = useState(false)
+  const [regionEditor, setRegionEditor] = useState<{ sourceImageId: string; initialMaskDataUrl?: string } | null>(null)
+  const [protectedPreview, setProtectedPreview] = useState<{ source: string; mask: string; dataUrl: string } | null>(null)
   const submitting = Boolean(draft.sourceImageId && submittingImageIds.includes(draft.sourceImageId))
   const [now, setNow] = useState(Date.now)
 
@@ -320,6 +324,23 @@ export default function ImageEditorPage() {
   ]
   const imageDataUrls = useImageDataUrls(requestedImageIds)
   const sourceDataUrl = draft.sourceImageId ? imageDataUrls[draft.sourceImageId] : null
+  useEffect(() => {
+    let cancelled = false
+    if (sourceDataUrl && draft.sourceImageId && draft.localEditMaskId && draft.protectUneditedArea !== false) {
+      const sourceId = draft.sourceImageId, maskId = draft.localEditMaskId
+      void ensureImageCached(maskId).then((mask) => { if (!mask) throw new Error('修改区域已不存在，请重新选择'); return createProtectedEditGuide(sourceDataUrl, mask) })
+        .then((dataUrl) => { if (!cancelled) setProtectedPreview({ source: sourceId, mask: maskId, dataUrl }) })
+        .catch((error) => { if (!cancelled) showToast(String(error), 'error') })
+    }
+    return () => { cancelled = true }
+  }, [sourceDataUrl, draft.sourceImageId, draft.localEditMaskId, draft.protectUneditedArea, showToast])
+  const openRegionEditor = async () => {
+    if (!draft.sourceImageId) return
+    try {
+      const mask = draft.localEditMaskId ? await ensureImageCached(draft.localEditMaskId) : undefined
+      setRegionEditor({ sourceImageId: draft.sourceImageId, initialMaskDataUrl: mask || undefined })
+    } catch (error) { showToast(String(error), 'error') }
+  }
   const outputDataUrl = outputImageId ? imageDataUrls[outputImageId] : null
   const homeProfile = useMemo(() => getHomeApiProfile(settings), [settings])
   const seedreamProfile = useMemo(() => getSeedreamEditorProfile(settings), [settings])
@@ -661,7 +682,10 @@ export default function ImageEditorPage() {
         if (!dataUrl) throw new Error('有参考图已不存在，请移除后重试')
         referenceImages.push({ id, dataUrl })
       }
-      const guideDataUrl = await createSeedreamVisualGuideDataUrl(source, draft.annotations)
+      const protectedMask = draft.localEditMaskId && draft.protectUneditedArea !== false ? await ensureImageCached(draft.localEditMaskId) : null
+      if (draft.localEditMaskId && draft.protectUneditedArea !== false && !protectedMask) throw new Error('修改区域已不存在，请重新选择后生成')
+      let guideDataUrl = await createSeedreamVisualGuideDataUrl(source, draft.annotations)
+      if (protectedMask) { await validateProtectedEditInputs(source, protectedMask); guideDataUrl = await createProtectedEditGuide(guideDataUrl ?? source, protectedMask) }
       if (guideDataUrl) visualGuide = await createInputImageFromDataUrl(guideDataUrl)
       const inputImages = [
         { id: draft.sourceImageId, dataUrl: source },
@@ -678,11 +702,13 @@ export default function ImageEditorPage() {
           instruction: draft.instruction,
           hasVisualGuide: Boolean(visualGuide),
           referenceCount: referenceImages.length,
+          hasProtectedMask: !!protectedMask,
         }),
         inputImages,
         params: createImageEditorParams(selectedResolution, profile, { width: sourceImage.naturalWidth, height: sourceImage.naturalHeight }),
         category: { workflow: 'seedream-edit', productTitle: sourceCategory?.productTitle, amazonSlot: sourceCategory?.amazonSlot, plannerSessionId: sourceCategory?.plannerSessionId, plannerModuleVersionId: sourceCategory?.plannerModuleVersionId, productFactsVersionId: productFactsSnapshot?.id, marketplaceId: sourceCategory?.marketplaceId, aPlusType: sourceCategory?.aPlusType },
         productFactsSnapshot,
+        localEditProtection: protectedMask ? { baseImageId: sourceImageId, maskImageId: draft.localEditMaskId! } : undefined,
         imageEditContext: {
           engine: draft.engine,
           sourceImageId: draft.sourceImageId,
@@ -761,7 +787,7 @@ export default function ImageEditorPage() {
           <div className="relative inline-block max-w-full overflow-hidden rounded-[var(--ios-radius-sm)] shadow-[var(--ios-shadow-2)] ring-1 ring-black/[0.06] dark:ring-white/[0.08]" style={{ zoom }}>
             {sourceDataUrl ? (
               <img
-                src={sourceDataUrl}
+                src={draft.protectUneditedArea !== false && protectedPreview?.source === draft.sourceImageId && protectedPreview.mask === draft.localEditMaskId ? protectedPreview.dataUrl : sourceDataUrl}
                 alt="待编辑主图"
                 className="block max-h-[66vh] max-w-full bg-white object-contain"
                 onLoad={(event) => setDimensions({ width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight })}
@@ -988,6 +1014,10 @@ export default function ImageEditorPage() {
             </div>
             <textarea id="seedream-instruction" disabled={uploadingSource} value={draft.instruction} onChange={(event) => setDraft({ instruction: event.target.value })} rows={6} placeholder="例如：删除红色箭头指向的文字，其余产品结构、光影和背景保持不变。" className="ios-field mt-3 w-full resize-y px-3 py-2.5 text-sm leading-6 text-gray-900 placeholder:text-gray-400 dark:text-gray-100" />
             {inheritedFacts && <label className="mt-3 flex items-start gap-2 text-xs leading-relaxed text-gray-600 dark:text-gray-300"><input type="checkbox" checked={draft.preserveProductFacts !== false} onChange={(event) => setDraft({ preserveProductFacts: event.target.checked })} className="mt-0.5" /><span>保持来源商品事实 v{inheritedFacts.versionNumber}（{inheritedFacts.facts.productName || '已确认商品'}）。需要主动改变商品颜色、结构等事实时，可取消勾选。</span></label>}
+            <div className="mt-3 rounded-xl border border-blue-100 bg-blue-50/50 p-3 text-xs text-gray-600 dark:border-blue-500/20 dark:bg-blue-500/5 dark:text-gray-300">
+              <div className="flex flex-wrap items-center gap-2"><button type="button" disabled={!draft.sourceImageId || uploadingSource} onClick={() => void openRegionEditor()} className="rounded-lg border border-blue-200 bg-white px-3 py-2 font-semibold text-blue-700 disabled:opacity-40 dark:border-blue-500/20 dark:bg-gray-900 dark:text-blue-300">{draft.localEditMaskId ? '调整可修改区域' : '选择可修改区域'}</button>{draft.localEditMaskId && <label className="flex items-center gap-2"><input type="checkbox" aria-label="保护未修改区域" checked={draft.protectUneditedArea !== false} onChange={(event) => setDraft({ protectUneditedArea: event.target.checked })} />保护未修改区域</label>}</div>
+              <p className="mt-2 leading-relaxed">{draft.localEditMaskId && draft.protectUneditedArea !== false ? '青色区域允许修改，其余区域使用原图。结果按原图尺寸保存为 PNG；所选生成分辨率只影响模型返回的编辑内容。' : '需要只改一处时，先涂抹可修改区域。文字、箭头等标注只用于表达编辑要求。'}</p>
+            </div>
 
             <div className="mt-4 flex items-center justify-between gap-3">
               <span className="text-xs font-semibold text-gray-500 dark:text-gray-400">输出分辨率</span>
@@ -1084,6 +1114,12 @@ export default function ImageEditorPage() {
       </section>
 
       {pickerMode && <HistoryImagePicker mode={pickerMode} tasks={tasks} onSelect={handleHistorySelect} onClose={() => setPickerMode(null)} />}
+      {regionEditor && <MaskEditorModal editor={{ ...regionEditor, onClose: () => setRegionEditor(null), onRemove: () => updateWorkspace(regionEditor.sourceImageId, { localEditMaskId: null }), onSave: async (maskDataUrl) => {
+        const image = await createInputImageFromDataUrl(maskDataUrl)
+        updateWorkspace(regionEditor.sourceImageId, { localEditMaskId: image.id, protectUneditedArea: true })
+        setRegionEditor(null)
+        showToast('修改区域已保存，其他区域会使用原图', 'success')
+      } }} />}
     </div>
   )
 }

@@ -71,7 +71,8 @@ import { normalizeReferenceUsage, referenceAppliesToSlot } from '../lib/referenc
 import { applyPlannerModuleVersion, createPlannerModuleVersion, initialPlannerModuleVersions, plannerModuleKey } from '../lib/plannerModuleVersions'
 import { plannerCollectionCandidates } from '../lib/materialCollections'
 import { appendProductFactsContract, buildProductFactsContract, confirmedProductFacts, emptyProductFactsState, normalizeProductFactsState } from '../lib/productFacts'
-import { analysisMatchesInputs, isPlannerContextStale, plannerSourceContext, referenceAnalysisDescription, resolveReferenceAnalyses } from '../lib/referenceAnalysis'
+import { analysisMatchesInputs, plannerContextChangeReasons, referenceAnalysisDescription, resolveReferenceAnalyses } from '../lib/referenceAnalysis'
+import { plannerContextForSlot, plannerStyleInstructions, upgradePlannerContextBaseline } from '../lib/plannerContext'
 import ProductContextPanel from './ProductContextPanel'
 import ReferenceLibraryModal, { type ReferenceLibrarySeed } from './ReferenceLibraryModal'
 import PlannerGenerationDialog from './PlannerGenerationDialog'
@@ -566,10 +567,11 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     : activePrompt
   const plannerProfile = getAmazonPlannerProfile(settings)
   const validAnalyses = Object.fromEntries(Object.entries(referenceAnalyses).filter(([id, analysis]) => inputImages.some((image) => image.id === id) && analysisMatchesInputs(analysis, id, referenceImageUsages[id], plannerProfile ?? undefined)))
-  const contextForSlot = (slot: string, analyses = validAnalyses) => plannerSourceContext(inputImages.filter((image) => referenceAppliesToSlot(referenceImageUsages[image.id], slot)).map((image) => image.id), referenceImageUsages, analyses, activeFacts)
+  const contextForSlot = (slot: string, analyses = validAnalyses, session = createPlannerSessionSnapshot()) => plannerContextForSlot(session, slot, analyses)
   const activeVersionKey = activeSlot ? plannerModuleKey(plannerMode, activeSlot) : ''
   const activeModuleVersion = moduleVersions[activeVersionKey]?.find((version) => version.id === selectedModuleVersions[activeVersionKey])
-  const activeContextStale = !!activeSlot && isPlannerContextStale(activeModuleVersion?.context, contextForSlot(activeSlot))
+  const activeContextChanges = activeSlot ? plannerContextChangeReasons(activeModuleVersion?.context, contextForSlot(activeSlot)) : []
+  const activeContextStale = activeContextChanges.length > 0
   const plannerProfileValidation = plannerProfile ? validateApiProfile(plannerProfile) : '未选择支持 Chat Completions 或 Responses API 的 AI 策划配置'
   const plannerApiLabel = plannerProfile?.apiMode === 'chat' ? 'Chat Completions' : 'Responses API'
   const plannerUsesOfficialDeepSeek = plannerProfile ? isOfficialDeepSeekPlannerProfile(plannerProfile) : false
@@ -839,7 +841,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     ]))
   }
 
-  const createPlannerSessionSnapshot = (overrides: Partial<AmazonPlannerSession> = {}): AmazonPlannerSession => {
+  function createPlannerSessionSnapshot(overrides: Partial<AmazonPlannerSession> = {}): AmazonPlannerSession {
     const now = Date.now()
     const targetSessionId = overrides.id ?? currentPlannerSessionId
     const existing = targetSessionId ? plannerSessions.find((session) => session.id === targetSessionId) : null
@@ -907,6 +909,12 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     void savePlannerSession(overrides).catch((err) => {
       showToast(`策划历史保存失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     })
+  }
+
+  const changeProductDraft = <K extends keyof AmazonPromptDraft>(field: K, value: AmazonPromptDraft[K]) => {
+    const next = updateDraft(draft, field, value)
+    setDraft(next)
+    updateCurrentPlannerSession({ draft: toSessionDraft(next) })
   }
 
   // Async requests read the latest snapshot so UI changes during a request are retained.
@@ -1521,14 +1529,24 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     if (reference?.imageId) setLightboxImageId(reference.imageId, [reference.imageId])
   }
 
-  const applyPlannerResult = (result: PlannerApiResult, sourceLabel: string, analyses = validAnalyses) => {
+  const applyPlannerResult = (result: PlannerApiResult, sourceLabel: string, analyses = validAnalyses, requestSession = createPlannerSessionSnapshot()) => {
+    const epoch = contextEpochRef.current
+    const latestSession = plannerSnapshotRef.current()
+    const visibleAnalyses = { ...analyses }
+    for (const id of new Set([...Object.keys(requestSession.referenceAnalyses ?? {}), ...Object.keys(latestSession.referenceAnalyses ?? {})])) {
+      const current = latestSession.referenceAnalyses?.[id]
+      if (JSON.stringify(current) !== JSON.stringify(requestSession.referenceAnalyses?.[id])) {
+        if (current) visibleAnalyses[id] = current
+        else delete visibleAnalyses[id]
+      }
+    }
     const resultMarketplaceId = normalizeAmazonMarketplaceId(result.marketplaceId)
     const firstPlan = result.plans[0]
     const nextDraft = {
-      ...draft,
+      ...fromSessionDraft(requestSession.draft),
       ...result.parsed.inferred,
-      productTitle: result.parsed.title || draft.productTitle,
-      sellingPoints: result.parsed.bullets.length ? result.parsed.bullets.join('\n') : draft.sellingPoints,
+      productTitle: result.parsed.title || requestSession.draft.productTitle,
+      sellingPoints: result.parsed.bullets.length ? result.parsed.bullets.join('\n') : requestSession.draft.sellingPoints,
       ...(firstPlan?.kind ? { kind: firstPlan.kind } : {}),
     }
     const nextSeriesStyleGuides = {
@@ -1539,13 +1557,17 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     const nextAPlusPlans = result.mode === 'aplus' ? withAPlusGenerationSizes(result.aPlusPlans, resolutionTier) : []
     const nextSelectedPlanIndex = result.mode === 'listing' && result.plans.length ? 0 : null
     const nextSelectedAPlusPlanIndex = result.mode === 'aplus' && result.aPlusPlans.length ? 0 : null
-    const initialVersions = initialPlannerModuleVersions(nextImagePlans, nextAPlusPlans, (slot) => contextForSlot(slot, analyses))
+    const plannedSession = { ...requestSession, mode: result.mode, marketplaceId: resultMarketplaceId, draft: toSessionDraft(nextDraft), seriesStyleGuides: nextSeriesStyleGuides, imagePlans: nextImagePlans, aPlusPlans: nextAPlusPlans }
+    const initialVersions = initialPlannerModuleVersions(nextImagePlans, nextAPlusPlans, (slot) => contextForSlot(slot, analyses, plannedSession))
     setModuleVersions(initialVersions.versions)
     setSelectedModuleVersions(initialVersions.selected)
-    setReferenceAnalyses(analyses)
+    setReferenceAnalyses(visibleAnalyses)
 
-    setDraft(nextDraft)
-    setMarketplaceId(resultMarketplaceId)
+    const visibleMarketplaceId = latestSession.marketplaceId !== requestSession.marketplaceId ? latestSession.marketplaceId ?? resultMarketplaceId : resultMarketplaceId
+    const visibleDraft = { ...nextDraft }
+    for (const key of Object.keys(requestSession.draft) as Array<keyof AmazonPlannerSession['draft']>) if (key !== 'kind' && latestSession.draft[key] !== requestSession.draft[key]) visibleDraft[key] = latestSession.draft[key]
+    setDraft(visibleDraft)
+    setMarketplaceId(visibleMarketplaceId)
     if (result.mode === 'aplus') {
       setAPlusPlans(nextAPlusPlans)
       setImagePlans([])
@@ -1558,51 +1580,52 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       setSelectedAPlusPlanIndex(null)
     }
     setSeriesStyleGuides(nextSeriesStyleGuides)
-    setSelectedStylePresetId(DEFAULT_STYLE_PRESET_ID)
-    setSelectedStyleReference(null)
     setStylePreview(null)
     setStyleError('')
     setPlannerError('')
     setActionProgress({})
     void savePlannerSession({
+      ...latestSession,
       id: createPlannerSessionId(),
+      createdAt: Date.now(),
+      listingText: latestSession.listingText,
       mode: result.mode,
-      marketplaceId: resultMarketplaceId,
-      listingImageCount,
-      aPlusModuleSpecs: getAPlusModuleSpecsForSession(aPlusModuleSpecsByType),
-      draft: toSessionDraft(nextDraft),
+      marketplaceId: visibleMarketplaceId,
+      listingImageCount: latestSession.listingImageCount,
+      aPlusModuleSpecs: latestSession.aPlusModuleSpecs,
+      draft: toSessionDraft(visibleDraft),
       seriesStyleGuides: nextSeriesStyleGuides,
       styleCandidates: [],
       styleImages: [],
       selectedStyleIndex: null,
-      selectedStylePresetId: DEFAULT_STYLE_PRESET_ID,
-      selectedStyleReferenceImageId: null,
-      selectedCustomStyleReferenceId: null,
-      selectedCustomStyleReferenceSnapshot: null,
-      selectedUploadedStyleReferenceId: null,
-      selectedUploadedStyleReferenceSnapshot: null,
-      styleDensityMode,
+      selectedStylePresetId: latestSession.selectedStylePresetId,
+      selectedStyleReferenceImageId: latestSession.selectedStyleReferenceImageId,
+      selectedCustomStyleReferenceId: latestSession.selectedCustomStyleReferenceId,
+      selectedCustomStyleReferenceSnapshot: latestSession.selectedCustomStyleReferenceSnapshot,
+      selectedUploadedStyleReferenceId: latestSession.selectedUploadedStyleReferenceId,
+      selectedUploadedStyleReferenceSnapshot: latestSession.selectedUploadedStyleReferenceSnapshot,
+      styleDensityMode: latestSession.styleDensityMode,
       imagePlans: nextImagePlans,
       aPlusPlans: nextAPlusPlans,
       moduleVersions: initialVersions.versions,
       selectedModuleVersions: initialVersions.selected,
-      referenceAnalyses: analyses,
-      productFacts,
+      referenceAnalyses: visibleAnalyses,
+      productFacts: latestSession.productFacts,
       selectedPlanIndex: nextSelectedPlanIndex,
       selectedAPlusPlanIndex: nextSelectedAPlusPlanIndex,
     })
-      .then((session) => selectStylePreset(DEFAULT_STYLE_PRESET_ID, { silent: true, persist: false })
-        .then(async (reference) => {
-          if (!reference) return
-          const latestSession = (await getAllAmazonPlannerSessions()).find((item) => item.id === session.id) ?? session
+      .then(async (session) => {
+          if (contextEpochRef.current !== epoch || session.selectedStyleReferenceImageId || session.selectedCustomStyleReferenceId || session.selectedUploadedStyleReferenceId) return
+          const presetId = session.selectedStylePresetId ?? DEFAULT_STYLE_PRESET_ID
+          if (plannerSnapshotRef.current().selectedStylePresetId !== session.selectedStylePresetId) return
+          const reference = await selectStylePreset(presetId, { silent: true, persist: false })
+          if (!reference || contextEpochRef.current !== epoch) return
+          const saved = (await getAllAmazonPlannerSessions()).find((item) => item.id === session.id) ?? session
+          if (saved.selectedStylePresetId !== session.selectedStylePresetId || saved.selectedCustomStyleReferenceId || saved.selectedUploadedStyleReferenceId) return
           const nextSession = {
-            ...latestSession,
+            ...saved,
             selectedStylePresetId: reference.presetId,
             selectedStyleReferenceImageId: reference.imageId,
-            selectedCustomStyleReferenceId: null,
-            selectedCustomStyleReferenceSnapshot: null,
-            selectedUploadedStyleReferenceId: null,
-            selectedUploadedStyleReferenceSnapshot: null,
             updatedAt: Date.now(),
           }
           void putAmazonPlannerSession(nextSession)
@@ -1610,7 +1633,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
             .catch((err) => {
               showToast(`策划历史保存失败：${err instanceof Error ? err.message : String(err)}`, 'error')
             })
-        }))
+        })
       .catch((err) => {
       showToast(`策划历史保存失败：${err instanceof Error ? err.message : String(err)}`, 'error')
     })
@@ -1650,6 +1673,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       apiKey: plannerProfile.apiKey,
     })
     setPlannerError('')
+    const requestSession = plannerSnapshotRef.current()
+    const requestEpoch = contextEpochRef.current
     try {
       const currentMarketplaceId = marketplaceId
       const resolvedReferences = await resolveInputImagesForRequest(inputImages, controller.signal)
@@ -1665,6 +1690,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
         referenceImageDataUrls: referencePayload.dataUrls,
         referenceImageDescriptions: resolvedReferences.map((image) => referenceAnalysisDescription(referenceImageUsages[image.id], analyses[image.id])),
         confirmedProductFacts: buildProductFactsContract(activeFacts),
+        planningStyleContext: plannerStyleInstructions(requestSession),
         mode: plannerMode,
         marketplaceId: currentMarketplaceId,
         listingImageCount,
@@ -1677,8 +1703,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
           plannerLog.progress(progress)
         },
       })
-      if (controller.signal.aborted) return
-      applyPlannerResult(result, plannerMode === 'aplus' ? 'A+ AI 策划' : 'AI 策划', analyses)
+      if (controller.signal.aborted || plannerAbortControllerRef.current !== controller || contextEpochRef.current !== requestEpoch) return
+      applyPlannerResult(result, plannerMode === 'aplus' ? 'A+ AI 策划' : 'AI 策划', analyses, requestSession)
       plannerLog.finish('success', `策划完成，已生成 ${result.mode === 'aplus' ? result.aPlusPlans.length : result.plans.length} 份完整方案`)
     } catch (err) {
       if (controller.signal.aborted || isAbortError(err)) {
@@ -1759,6 +1785,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
         aPlusType: snapshot.aPlusType, aPlusModuleSpecs: aPlusSpecs, aPlusGenerationTier: resolutionTier,
         referenceImageDataUrls: payload.dataUrls, referenceImageDescriptions: resolved.map((image) => referenceAnalysisDescription(referenceImageUsages[image.id], analyses[image.id])),
         confirmedProductFacts: buildProductFactsContract(confirmedProductFacts(snapshot.productFacts)),
+        planningStyleContext: plannerStyleInstructions(snapshot, target.slot),
         moduleRevision: { plan: plan as AmazonImagePlan | AmazonAPlusPlan, instruction, seriesStyleGuide: snapshot.seriesStyleGuides[target.mode] },
         signal: controller.signal, onProgress: (event) => { if (revisionControllerRef.current === controller && !controller.signal.aborted) revisionLog.progress(event) },
       })
@@ -1766,7 +1793,10 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       const nextPlan = target.mode === 'listing' ? result.plans[0] : result.aPlusPlans[0]
       const key = plannerModuleKey(target.mode, target.slot)
       const history = plannerSnapshotRef.current().moduleVersions?.[key] ?? []
-      const version = createPlannerModuleVersion(target.mode, nextPlan, Math.max(0, ...history.map((entry) => entry.versionNumber)) + 1, instruction, contextForSlot(target.slot, analyses))
+      const plannedSnapshot = target.mode === 'listing'
+        ? { ...snapshot, imagePlans: snapshot.imagePlans.map((row) => row.slot === target.slot ? nextPlan as AmazonImagePlan : row) }
+        : { ...snapshot, aPlusPlans: snapshot.aPlusPlans.map((row) => row.slot === target.slot ? nextPlan as AmazonAPlusPlan : row) }
+      const version = createPlannerModuleVersion(target.mode, nextPlan, Math.max(0, ...history.map((entry) => entry.versionNumber)) + 1, instruction, contextForSlot(target.slot, analyses, plannedSnapshot))
       await commitModuleVersion(version)
       revisionLog.finish('success', `${target.slot} 策划完成，已保存 v${version.versionNumber}`)
       showToast(`${target.slot} 已更新，其他图片位保持原方案`, 'success')
@@ -1809,7 +1839,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       if (controller.signal.aborted || creativeControllerRef.current !== controller || epoch !== contextEpochRef.current || plannerSnapshotRef.current().id !== snapshot.id) return
       const latest = plannerSnapshotRef.current(), key = plannerModuleKey(snapshot.mode, slot), history = latest.moduleVersions?.[key] ?? []
       const number = Math.max(0, ...history.map((item) => item.versionNumber)), groupId = localId('creative-group')
-      const versions = directions.map((direction, index) => ({ ...createPlannerModuleVersion(snapshot.mode, direction.plan, number + index + 1, instruction, contextForSlot(slot, analyses)), creative: { groupId, title: direction.title, summary: direction.summary } }))
+      const versions = directions.map((direction, index) => ({ ...createPlannerModuleVersion(snapshot.mode, direction.plan, number + index + 1, instruction, contextForSlot(slot, analyses, snapshot)), creative: { groupId, title: direction.title, summary: direction.summary } }))
       const next = { ...latest, moduleVersions: { ...latest.moduleVersions, [key]: [...history, ...versions] }, updatedAt: Date.now() }
       await putAmazonPlannerSession(next)
       if (controller.signal.aborted || epoch !== contextEpochRef.current) return
@@ -1952,6 +1982,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   }
 
   const clearListingPlan = () => {
+    stopAiPlan()
+    stopModuleRevision()
     stopCreativePlanning()
     setCreativeTarget(null)
     setGenerationDialog(null); setReferenceLibrary(null)
@@ -1979,7 +2011,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     setActionProgress({})
   }
 
-  const restorePlannerSession = async (session: AmazonPlannerSession) => {
+  const restorePlannerSession = async (savedSession: AmazonPlannerSession) => {
+    const session = upgradePlannerContextBaseline(savedSession)
     stopCreativePlanning()
     setCreativeTarget(null)
     setGenerationDialog(null); setReferenceLibrary(null)
@@ -2153,7 +2186,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     setStylePreview(null)
     setImagePlans(session.imagePlans as AmazonImagePlan[])
     setAPlusPlans(session.aPlusPlans as AmazonAPlusPlan[])
-    const initialVersions = initialPlannerModuleVersions(session.imagePlans, session.aPlusPlans)
+    const initialVersions = initialPlannerModuleVersions(session.imagePlans, session.aPlusPlans, (slot) => plannerContextForSlot(session, slot))
     const restoredVersions = { ...initialVersions.versions, ...session.moduleVersions }
     const restoredSelected = { ...initialVersions.selected, ...session.selectedModuleVersions }
     // Legacy sessions get a baseline; existing histories keep their stable IDs.
@@ -2518,7 +2551,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
               <span className={LABEL_CLASS}>{plannerMode === 'aplus' ? '标题 / 五点描述 / 品牌说明' : '标题 / 五点描述'}</span>
               <textarea
                 value={listingText}
-                onChange={(event) => setListingText(event.target.value)}
+                onChange={(event) => { setListingText(event.target.value); updateCurrentPlannerSession({ listingText: event.target.value }) }}
                 className={`${FIELD_CLASS} min-h-[138px] resize-y`}
                 placeholder={plannerMode === 'aplus'
                   ? 'Title: ...\n\nAbout this item\n- Bullet 1...\n- Bullet 2...\n\nBrand story / tone: ...'
@@ -2726,7 +2759,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                     <span className={LABEL_CLASS}>{label}</span>
                     <input
                       value={draft[field]}
-                      onChange={(event) => setDraft((current) => updateDraft(current, field, event.target.value))}
+                      onChange={(event) => changeProductDraft(field, event.target.value)}
                       className={FIELD_CLASS}
                       placeholder={placeholder}
                     />
@@ -2742,7 +2775,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                   <span className={LABEL_CLASS}>卖点</span>
                   <textarea
                     value={draft.sellingPoints}
-                    onChange={(event) => setDraft((current) => updateDraft(current, 'sellingPoints', event.target.value))}
+                    onChange={(event) => changeProductDraft('sellingPoints', event.target.value)}
                     className={`${FIELD_CLASS} min-h-[86px] resize-y`}
                     placeholder="一行一个卖点，或用分号分隔"
                   />
@@ -2751,7 +2784,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                   <span className={LABEL_CLASS}>包装清单</span>
                   <textarea
                     value={draft.packageIncludes}
-                    onChange={(event) => setDraft((current) => updateDraft(current, 'packageIncludes', event.target.value))}
+                    onChange={(event) => changeProductDraft('packageIncludes', event.target.value)}
                     className={`${FIELD_CLASS} min-h-[76px] resize-y`}
                     placeholder="例：1 mug, 1 lid, 1 straw"
                   />
@@ -2760,7 +2793,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                   <span className={LABEL_CLASS}>场景 / 构图</span>
                   <textarea
                     value={draft.scene}
-                    onChange={(event) => setDraft((current) => updateDraft(current, 'scene', event.target.value))}
+                    onChange={(event) => changeProductDraft('scene', event.target.value)}
                     className={`${FIELD_CLASS} min-h-[76px] resize-y`}
                     placeholder="例：白底产品构图 / 厨房台面场景 / 尺寸标注信息图"
                   />
@@ -2774,7 +2807,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                 <span className={LABEL_CLASS}>禁用元素</span>
                 <input
                   value={draft.forbidden}
-                  onChange={(event) => setDraft((current) => updateDraft(current, 'forbidden', event.target.value))}
+                  onChange={(event) => changeProductDraft('forbidden', event.target.value)}
                   className={FIELD_CLASS}
                   placeholder="例：do not show phone, laptop, gift box"
                 />
@@ -3493,7 +3526,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
                 </button>
               </div>
             </div>
-            {activeContextStale && <p role="status" className="mb-2 rounded-lg bg-amber-50 p-2 text-xs text-amber-800 dark:bg-amber-500/10 dark:text-amber-200">商品事实或本图片位的参考图分析已改变。建议点击“单图策划 / 版本”更新此方案；现在生图将使用当前确认的事实和参考图。</p>}
+            {activeContextStale && <p role="status" className="mb-2 rounded-lg bg-amber-50 p-2 text-xs text-amber-800 dark:bg-amber-500/10 dark:text-amber-200">此方案需要复核：{activeContextChanges.join('；')}。可点击“生成前检查”只更新受影响的模块，旧版本仍保留。</p>}
             {activeSlot && <p className="mb-2 text-[11px] text-gray-500">本次生图：{activeFacts ? `商品事实 v${activeFacts.versionNumber}` : '未绑定已确认事实'} · {Object.values(validAnalyses).filter((analysis) => referenceAppliesToSlot(analysis.usage, activeSlot)).length} 份参考图分析</p>}
             <textarea
               value={plannerMode === 'aplus' && !selectedAPlusPlan

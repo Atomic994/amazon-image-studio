@@ -43,6 +43,7 @@ export async function buildMaterialDeliveryZip(collection: MaterialCollection, v
     files[`images/${filename}`] = new Uint8Array(await blob.arrayBuffer())
     images.push({ file: `images/${filename}`, imageId: item.imageId, slot: item.slot, label: item.label, prompt: item.prompt,
       plannerModuleVersionId: item.category?.plannerModuleVersionId,
+      localEditProtection: item.localEditProtection ? { version: item.localEditProtection.version, baseImageId: item.localEditProtection.baseImageId, maskImageId: item.localEditProtection.maskImageId, outside: 'original-pixels', format: 'image/png' } : undefined,
       params: { size: item.params.size, quality: item.params.quality, output_format: item.params.output_format, output_compression: item.params.output_compression, n: item.params.n },
       dimensions: processed?.dimensions ?? (image.width && image.height ? { width: image.width, height: image.height } : undefined),
       originalDimensions: processed?.originalDimensions ?? (image.width && image.height ? { width: image.width, height: image.height } : undefined),
