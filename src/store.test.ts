@@ -7,6 +7,7 @@ import { getSelectedImageMentionLabel } from './lib/promptImageMentions'
 vi.mock('./lib/db', () => {
   const tasks = new Map<string, TaskRecord>()
   const amazonPlannerSessions = new Map<string, AmazonPlannerSession>()
+  const materialCollections = new Map<string, import('./types').MaterialCollection>()
   const images = new Map<string, StoredImage>()
   const thumbnails = new Map<string, StoredImageThumbnail>()
   let imageSeq = 0
@@ -35,6 +36,10 @@ vi.mock('./lib/db', () => {
     clearAmazonPlannerSessions: async () => {
       amazonPlannerSessions.clear()
     },
+    getAllMaterialCollections: async () => [...materialCollections.values()],
+    putMaterialCollection: async (collection: import('./types').MaterialCollection) => { materialCollections.set(collection.id, collection); return collection.id },
+    deleteMaterialCollection: async (id: string) => { materialCollections.delete(id) },
+    clearMaterialCollections: async () => { materialCollections.clear() },
     getImage: async (id: string) => images.get(id),
     getImageThumbnail: async (id: string) => thumbnails.get(id),
     getStoredFreshImageThumbnail: async (id: string) => thumbnails.get(id),
@@ -92,13 +97,123 @@ vi.mock('./lib/agentApi', () => ({
     }
   }),
 }))
-import { clearAmazonPlannerSessions, clearImages, clearTasks as clearStoredTasks, getAllAmazonPlannerSessions, getImage, putAmazonPlannerSession, putImage } from './lib/db'
+import { clearAmazonPlannerSessions, clearMaterialCollections, clearImages, clearTasks as clearStoredTasks, getAllAmazonPlannerSessions, getImage, putAmazonPlannerSession, putImage, putTask } from './lib/db'
+import { materialItemFromTask } from './lib/materialCollections'
+import { saveMaterialCollection, reuseMaterialItem } from './store'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
 import { callImageApi } from './lib/api'
 import { cleanStaleAgentInputDrafts, clearData, deleteImageIfUnreferenced, editOutputs, ensureImageCached, exportData, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, mergePersistedState, openSeedreamTaskInEditor, regenerateAgentAssistantMessage, removeTask, resolveInputImagesForRequest, retryTask, reuseConfig, submitAgentMessage, submitTask, submitTaskWithInput, useStore } from './store'
 
 const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
 const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
+
+beforeEach(async () => {
+  await clearMaterialCollections()
+  useStore.setState({ materialCollections: [], referenceImageUsages: {}, imageResultReviews: {}, imageFinalSelections: {}, reviewImageId: null, materialCollectionDraft: null, plannerRestoreRequest: null })
+})
+
+describe('local material and review persistence', () => {
+  beforeEach(async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('window', { requestIdleCallback: () => 0 })
+    await clearStoredTasks(); await clearImages(); await clearAmazonPlannerSessions()
+    useStore.setState({ settings: settingsWithConfiguredImageProfile(), tasks: [], inputImages: [], galleryInputDraft: null, imageEditorDrafts: {}, agentInputDrafts: {}, agentConversations: [], prompt: '', params: { ...DEFAULT_PARAMS }, pendingTaskCategory: null, reusedTaskApiProfileId: null, reusedTaskApiProfileMissing: false, maskDraft: null, showToast: vi.fn() })
+    vi.mocked(callImageApi).mockReset().mockResolvedValue({ images: [], actualParams: {} })
+  })
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
+
+  it('keeps all collection versions and references after deleting tasks and reopening the database', async () => {
+    const generated = task({ id: 'collected-task', outputImages: ['saved-v1'], inputImageIds: ['saved-ref'] })
+    for (const id of ['saved-v1', 'saved-v2', 'saved-ref', 'saved-style']) await putImage({ id, dataUrl: `data:image/png;base64,${id}`, source: 'generated', createdAt: 1 })
+    await putTask(generated)
+    useStore.setState({ tasks: [generated] })
+    const saved = await saveMaterialCollection({ title: 'Launch set', items: [materialItemFromTask(generated, 'saved-v1')], plannerSession: amazonPlannerSession({ referenceImageIds: ['saved-ref'], selectedStyleReferenceImageId: 'saved-style' }) })
+    await saveMaterialCollection({ title: saved.title, items: [materialItemFromTask({ ...generated, outputImages: ['saved-v2'] }, 'saved-v2')] }, saved.id, 'v2')
+    await removeTask(generated)
+    await clearAmazonPlannerSessions()
+    useStore.setState({ materialCollections: [] })
+    await initStore()
+    expect(useStore.getState().materialCollections[0].versions).toHaveLength(2)
+    for (const id of ['saved-v1', 'saved-v2', 'saved-ref', 'saved-style']) {
+      await deleteImageIfUnreferenced(id)
+      expect(await getImage(id)).toBeDefined()
+    }
+  })
+
+  it('filters scoped reference bytes at submission and preserves the ordered role contract on retry', async () => {
+    const refs = ['product-role', 'layout-role', 'style-role'].map((id) => ({ id, dataUrl: `data:image/png;base64,${id}` }))
+    for (const image of refs) await putImage({ ...image, createdAt: 1 })
+    const state = useStore.getState()
+    state.setInputImages(refs)
+    state.setReferenceImageUsage('layout-role', { purpose: 'composition', slots: ['MAIN'] })
+    state.setReferenceImageUsage('style-role', { purpose: 'style', slots: ['PT01'] })
+    state.setPrompt('Make MAIN')
+    state.setPendingTaskCategory({ mode: 'prompt-match', prompt: 'Make MAIN', category: { workflow: 'amazon-listing', amazonSlot: 'MAIN', plannerSessionId: 'session' } })
+    expect(await submitTask()).toBe(true)
+    await vi.advanceTimersByTimeAsync(0)
+    const generated = useStore.getState().tasks[0]
+    expect(generated.inputImageIds).toEqual(['product-role', 'layout-role'])
+    expect(callImageApi).toHaveBeenCalledWith(expect.objectContaining({ inputImageDataUrls: refs.slice(0, 2).map((image) => image.dataUrl), prompt: expect.stringContaining('Reference 2: Composition reference') }))
+    expect(generated.category?.plannerSessionId).toBe('session')
+    await retryTask(generated)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(vi.mocked(callImageApi).mock.calls[1][0].inputImageDataUrls).toEqual(refs.slice(0, 2).map((image) => image.dataUrl))
+  })
+
+  it('reuses a saved item from stored full references and persists final selection and notes', async () => {
+    await putImage({ id: 'reuse-ref', dataUrl: 'data:image/png;base64,full-original', createdAt: 1 })
+    const savedTask = task({ inputImageIds: ['reuse-ref'], referenceImageUsages: { 'reuse-ref': { purpose: 'style', slots: ['PT01'], note: 'Lighting' } }, category: { workflow: 'amazon-listing', amazonSlot: 'PT01', plannerSessionId: 'session' } })
+    await reuseMaterialItem(materialItemFromTask(savedTask, 'out'))
+    expect(useStore.getState().inputImages).toEqual([{ id: 'reuse-ref', dataUrl: 'data:image/png;base64,full-original' }])
+    expect(useStore.getState().referenceImageUsages['reuse-ref'].purpose).toBe('style')
+    useStore.getState().saveImageReview('root', 'v2', 'approved', 'Ready')
+    useStore.getState().saveImageReview('root', 'v3', 'approved', 'Final')
+    const persisted = mergePersistedState(getPersistedState(useStore.getState()), useStore.getState())
+    expect(persisted.imageFinalSelections).toEqual({ root: 'v3' })
+    expect(persisted.imageResultReviews.v2.note).toBe('Ready')
+    expect(persisted.imageResultReviews.v3.note).toBe('Final')
+  })
+
+  it('remaps explicit references after scope filtering and rejects references excluded from the current slot', async () => {
+    const refs = ['scope-product', 'scope-excluded', 'scope-style'].map((id) => ({ id, dataUrl: `data:image/png;base64,${id}` }))
+    for (const image of refs) await putImage({ ...image, createdAt: 1 })
+    const state = useStore.getState()
+    state.setInputImages(refs)
+    state.setReferenceImageUsage(refs[1].id, { purpose: 'composition', slots: ['PT01'] })
+    const configure = (prompt: string) => { state.setPrompt(prompt); state.setPendingTaskCategory({ mode: 'prompt-match', prompt, category: { workflow: 'amazon-listing', amazonSlot: 'MAIN' } }) }
+    configure(`Use ${getSelectedImageMentionLabel(2)} as style`)
+    expect(await submitTask()).toBe(true)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(vi.mocked(callImageApi).mock.calls[0][0].prompt).toContain('Use [image 2] as style')
+    expect(vi.mocked(callImageApi).mock.calls[0][0].inputImageDataUrls).toEqual([refs[0].dataUrl, refs[2].dataUrl])
+    configure(`Use ${getSelectedImageMentionLabel(1)} as layout`)
+    expect(await submitTask()).toBe(false)
+    expect(callImageApi).toHaveBeenCalledTimes(1)
+  })
+
+  it('round-trips collections, review choices and images through a backup without API credentials', async () => {
+    for (const id of ['backup-output', 'backup-ref']) await putImage({ id, dataUrl: 'data:image/png;base64,YQ==', createdAt: Date.now() })
+    const savedTask = task({ outputImages: ['backup-output'], inputImageIds: ['backup-ref'] })
+    const saved = await saveMaterialCollection({ title: 'Portable set', items: [materialItemFromTask(savedTask, 'backup-output')], plannerSession: amazonPlannerSession({ referenceImageIds: ['backup-ref'] }) })
+    useStore.getState().saveImageReview('backup-output', 'backup-output', 'approved', 'Keep it')
+    vi.stubGlobal('document', { createElement: () => ({ href: '', download: '', click: vi.fn() }) })
+    const objectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:local-backup')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    await exportData({ exportTasks: true, exportConfig: false })
+    const blob = objectURL.mock.calls[0][0] as Blob
+    const bytes = await blob.arrayBuffer()
+    const manifest = JSON.parse(strFromU8(unzipSync(new Uint8Array(bytes))['manifest.json'])) as ExportData
+    expect(manifest.settings).toBeUndefined()
+    expect(manifest.materialCollections?.[0].id).toBe(saved.id)
+    await clearMaterialCollections(); await clearImages()
+    useStore.setState({ materialCollections: [], imageResultReviews: {}, imageFinalSelections: {} })
+    expect(await importData({ arrayBuffer: async () => bytes } as File, { importConfig: false, importTasks: true })).toBe(true)
+    expect(useStore.getState().materialCollections[0].versions[0].plannerSession?.referenceImageIds).toEqual(['backup-ref'])
+    expect(useStore.getState().imageFinalSelections['backup-output']).toBe('backup-output')
+    expect(await getImage('backup-output')).toBeDefined()
+    expect(await getImage('backup-ref')).toBeDefined()
+  })
+})
 
 describe('independent editor workspaces and restored references', () => {
   beforeEach(async () => {

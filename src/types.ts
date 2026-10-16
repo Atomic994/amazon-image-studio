@@ -190,6 +190,19 @@ export interface TaskImageEditContext {
   userInstruction: string
 }
 
+export interface ReferenceImageUsage {
+  purpose: 'product' | 'style' | 'composition'
+  /** Empty means all image slots. */
+  slots: string[]
+  note: string
+}
+
+export interface ImageResultReview {
+  status: 'pending' | 'approved' | 'changes-requested'
+  note: string
+  updatedAt: number
+}
+
 // ===== 任务记录 =====
 
 export type TaskStatus = 'running' | 'done' | 'error'
@@ -268,7 +281,10 @@ export interface TaskRecord {
     aPlusType?: 'standard' | 'standard-large' | 'premium' | 'mobile'
     marketplaceId?: AmazonMarketplaceId
     styleReferenceImageId?: string
+    plannerSessionId?: string
+    plannerModuleVersionId?: string
   }
+  referenceImageUsages?: Record<string, ReferenceImageUsage>
 }
 
 export interface AmazonVisualSystem {
@@ -380,6 +396,9 @@ export interface AmazonPlannerSession {
   aPlusModuleSpecs?: Partial<Record<'standard' | 'standard-large' | 'premium' | 'mobile', AmazonPlannerSessionAPlusModuleSpec[]>>
   listingText: string
   referenceImageIds: string[]
+  referenceImageUsages?: Record<string, ReferenceImageUsage>
+  moduleVersions?: Record<string, PlannerModuleVersion[]>
+  selectedModuleVersions?: Record<string, string>
   draft: AmazonPlannerSessionDraft
   seriesStyleGuides: {
     listing: string
@@ -401,6 +420,52 @@ export interface AmazonPlannerSession {
   selectedAPlusPlanIndex: number | null
   createdAt: number
   updatedAt: number
+}
+
+export interface PlannerModuleVersion {
+  id: string
+  versionNumber: number
+  createdAt: number
+  instruction: string
+  mode: 'listing' | 'aplus'
+  plan: AmazonPlannerSessionImagePlan | AmazonPlannerSessionAPlusPlan
+}
+
+export interface MaterialCollectionItem {
+  id: string
+  imageId: string
+  slot: string
+  label: string
+  prompt: string
+  params: TaskParams
+  referenceImageIds: string[]
+  referenceImageUsages?: Record<string, ReferenceImageUsage>
+  category?: TaskRecord['category']
+  reviewNote?: string
+}
+
+export interface MaterialCollectionVersion {
+  id: string
+  versionNumber: number
+  createdAt: number
+  note: string
+  items: MaterialCollectionItem[]
+  plannerSession?: AmazonPlannerSession
+}
+
+export interface MaterialCollection {
+  id: string
+  title: string
+  description: string
+  versions: MaterialCollectionVersion[]
+  createdAt: number
+  updatedAt: number
+}
+
+export interface MaterialCollectionDraft {
+  title: string
+  items: MaterialCollectionItem[]
+  plannerSession?: AmazonPlannerSession
 }
 
 // ===== Agent 模式 =====
@@ -598,6 +663,9 @@ export interface ExportData {
   tasks?: TaskRecord[]
   agentConversations?: AgentConversation[]
   amazonPlannerSessions?: AmazonPlannerSession[]
+  materialCollections?: MaterialCollection[]
+  imageResultReviews?: Record<string, ImageResultReview>
+  imageFinalSelections?: Record<string, string>
   /** imageId → 图片信息 */
   imageFiles?: Record<string, {
     path: string

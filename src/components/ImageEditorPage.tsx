@@ -665,6 +665,7 @@ export default function ImageEditorPage() {
         ...(visualGuide ? [visualGuide] : []),
         ...referenceImages,
       ]
+      const sourceCategory = useStore.getState().tasks.find((task) => task.outputImages.includes(sourceImageId))?.category
       const taskId = await submitTaskWithInput({
         apiProfileId: profile.id,
         prompt: buildSeedreamEditPrompt({
@@ -674,7 +675,7 @@ export default function ImageEditorPage() {
         }),
         inputImages,
         params: createImageEditorParams(selectedResolution, profile, { width: sourceImage.naturalWidth, height: sourceImage.naturalHeight }),
-        category: { workflow: 'seedream-edit' },
+        category: { workflow: 'seedream-edit', productTitle: sourceCategory?.productTitle, amazonSlot: sourceCategory?.amazonSlot, plannerSessionId: sourceCategory?.plannerSessionId, plannerModuleVersionId: sourceCategory?.plannerModuleVersionId, marketplaceId: sourceCategory?.marketplaceId, aPlusType: sourceCategory?.aPlusType },
         imageEditContext: {
           engine: draft.engine,
           sourceImageId: draft.sourceImageId,
@@ -1061,6 +1062,7 @@ export default function ImageEditorPage() {
               </div>
               <div className="grid gap-2">
                 <button type="button" onClick={continueEditing} className="ios-button ios-button-filled flex h-10 items-center justify-center gap-2 px-4 text-sm font-semibold"><EditResultIcon />继续编辑</button>
+                <button type="button" onClick={() => useStore.getState().setReviewImageId(outputImageId)} className="ios-button ios-button-tinted h-10 text-sm font-semibold">对比结果与历史版本</button>
                 <div className="grid grid-cols-2 gap-2">
                   <button type="button" onClick={() => setLightboxImageId(outputImageId, latestTask.outputImages)} className="ios-button ios-button-plain h-9 text-sm font-medium">查看</button>
                   <button type="button" onClick={() => void downloadImageIds([outputImageId], `image-edit-${latestTask.id}`)} className="ios-button ios-button-plain flex h-9 items-center justify-center gap-2 text-sm font-medium"><DownloadIcon className="h-4 w-4" />下载</button>

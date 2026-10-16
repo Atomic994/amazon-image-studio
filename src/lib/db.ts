@@ -1,11 +1,12 @@
-import type { AmazonPlannerSession, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
+import type { AmazonPlannerSession, MaterialCollection, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
 
 const DB_NAME = 'amazon-image-studio'
-const DB_VERSION = 3
+const DB_VERSION = 4
 const STORE_TASKS = 'tasks'
 const STORE_IMAGES = 'images'
 const STORE_THUMBNAILS = 'thumbnails'
 const STORE_AMAZON_PLANNER_SESSIONS = 'amazonPlannerSessions'
+const STORE_MATERIAL_COLLECTIONS = 'materialCollections'
 const THUMBNAIL_MAX_SIZE = 720
 const THUMBNAIL_QUALITY = 0.9
 const THUMBNAIL_VERSION = 2
@@ -14,7 +15,9 @@ export const CURRENT_THUMBNAIL_VERSION = THUMBNAIL_VERSION
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
+    let blocked = false
     const req = indexedDB.open(DB_NAME, DB_VERSION)
+    req.onblocked = () => { blocked = true; reject(new Error('本地数据库正在升级，请关闭此网站的其他旧标签页后刷新')) }
     req.onupgradeneeded = (e) => {
       const db = (e.target as IDBOpenDBRequest).result
       if (!db.objectStoreNames.contains(STORE_TASKS)) {
@@ -29,8 +32,13 @@ function openDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_AMAZON_PLANNER_SESSIONS)) {
         db.createObjectStore(STORE_AMAZON_PLANNER_SESSIONS, { keyPath: 'id' })
       }
+      if (!db.objectStoreNames.contains(STORE_MATERIAL_COLLECTIONS)) db.createObjectStore(STORE_MATERIAL_COLLECTIONS, { keyPath: 'id' })
     }
-    req.onsuccess = () => resolve(req.result)
+    req.onsuccess = () => {
+      if (blocked) { req.result.close(); return }
+      req.result.onversionchange = () => req.result.close()
+      resolve(req.result)
+    }
     req.onerror = () => reject(req.error)
   })
 }
@@ -45,9 +53,12 @@ function dbTransaction<T>(
       new Promise((resolve, reject) => {
         const tx = db.transaction(storeName, mode)
         const store = tx.objectStore(storeName)
+        let value: T
         const req = fn(store)
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
+        req.onsuccess = () => { value = req.result }
+        tx.oncomplete = () => { db.close(); resolve(value) }
+        tx.onerror = () => { db.close(); reject(tx.error ?? req.error) }
+        tx.onabort = () => { db.close(); reject(tx.error ?? new Error('本地数据库写入已取消')) }
       }),
   )
 }
@@ -86,6 +97,19 @@ export function deleteAmazonPlannerSession(id: string): Promise<undefined> {
 
 export function clearAmazonPlannerSessions(): Promise<undefined> {
   return dbTransaction(STORE_AMAZON_PLANNER_SESSIONS, 'readwrite', (s) => s.clear())
+}
+
+export function getAllMaterialCollections(): Promise<MaterialCollection[]> {
+  return dbTransaction(STORE_MATERIAL_COLLECTIONS, 'readonly', (s) => s.getAll())
+}
+export function putMaterialCollection(collection: MaterialCollection): Promise<IDBValidKey> {
+  return dbTransaction(STORE_MATERIAL_COLLECTIONS, 'readwrite', (s) => s.put(collection))
+}
+export function deleteMaterialCollection(id: string): Promise<undefined> {
+  return dbTransaction(STORE_MATERIAL_COLLECTIONS, 'readwrite', (s) => s.delete(id))
+}
+export function clearMaterialCollections(): Promise<undefined> {
+  return dbTransaction(STORE_MATERIAL_COLLECTIONS, 'readwrite', (s) => s.clear())
 }
 
 // ===== Images =====

@@ -18,6 +18,11 @@ import type {
   SeedreamEditorDraft,
   TaskRecord,
   TaskImageEditContext,
+  ReferenceImageUsage,
+  ImageResultReview,
+  MaterialCollection,
+  MaterialCollectionDraft,
+  MaterialCollectionItem,
   ExportData,
   ResponsesApiResponse,
   ResponsesOutputItem,
@@ -35,6 +40,10 @@ import {
   getAllAmazonPlannerSessions,
   putAmazonPlannerSession,
   clearAmazonPlannerSessions as dbClearAmazonPlannerSessions,
+  getAllMaterialCollections,
+  putMaterialCollection,
+  deleteMaterialCollection as dbDeleteMaterialCollection,
+  clearMaterialCollections as dbClearMaterialCollections,
   getImage,
   getImageThumbnail,
   getStoredFreshImageThumbnail,
@@ -60,6 +69,9 @@ import { getTaskHistoryCategory } from './lib/taskHistory'
 import { isAmazonListingMainSlot } from './lib/listingPlanner'
 import { collectPlannerImageReferences } from './lib/plannerImageReferences'
 import { previewTranslationCache } from './lib/previewTranslationCache'
+import { normalizeReferenceUsage, normalizeReferenceUsages, referenceAppliesToSlot, referenceUsageContract } from './lib/referenceImageUsage'
+import { normalizeImageResultReviews } from './lib/imageVersions'
+import { appendMaterialCollectionVersion, collectMaterialImageIds } from './lib/materialCollections'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
 
 // ===== Image cache =====
@@ -149,6 +161,8 @@ function createNextSubmitTaskCategory(task: TaskRecord): NonNullable<TaskRecord[
 
   if (hasExplicitProductTitle || productTitle) category.productTitle = productTitle
   if (amazonSlot) category.amazonSlot = amazonSlot
+  if (task.category?.plannerSessionId) category.plannerSessionId = task.category.plannerSessionId
+  if (task.category?.plannerModuleVersionId) category.plannerModuleVersionId = task.category.plannerModuleVersionId
   if (workflow === 'amazon-aplus' && aPlusType) category.aPlusType = aPlusType
   category.marketplaceId = marketplaceId
   if (styleReferenceImageId && !(workflow === 'amazon-listing' && isAmazonListingMainSlot(amazonSlot))) {
@@ -613,6 +627,9 @@ export function getPersistedState(state: AppState) {
       : null,
     seedreamEditorDraft: state.seedreamEditorDraft,
     imageEditorDrafts: state.imageEditorDrafts,
+    referenceImageUsages: state.referenceImageUsages,
+    imageResultReviews: state.imageResultReviews,
+    imageFinalSelections: state.imageFinalSelections,
     agentConversations: state.agentConversations,
     activeAgentConversationId: state.activeAgentConversationId,
     agentInputDrafts: getPersistableAgentInputDrafts(state),
@@ -636,6 +653,53 @@ function normalizePersistedParams(value: unknown): TaskParams {
     params.moderation === 'auto' &&
     params.n === 1
   return isLegacyPngDefault ? { ...DEFAULT_PARAMS } : params
+}
+
+function normalizeImageSelections(value: unknown): Record<string, string> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.fromEntries(Object.entries(value).filter(([id, selected]) => id && typeof selected === 'string' && selected)) : {}
+}
+
+export async function saveMaterialCollection(draft: MaterialCollectionDraft, collectionId?: string, note = '') {
+  const existing = collectionId ? useStore.getState().materialCollections.find((item) => item.id === collectionId) : undefined
+  if (collectionId && !existing) throw new Error('原素材套组已不存在，请保存为新套组')
+  const collection = appendMaterialCollectionVersion(draft, existing, note)
+  for (const id of collectMaterialImageIds([collection])) {
+    if (!await getImage(id)) throw new Error('素材引用的原图已不存在，请重新选择图片后保存')
+  }
+  await putMaterialCollection(collection)
+  useStore.setState((state) => ({ materialCollections: [collection, ...state.materialCollections.filter((item) => item.id !== collection.id)] }))
+  return collection
+}
+
+export async function renameMaterialCollection(id: string, title: string) {
+  const collection = useStore.getState().materialCollections.find((item) => item.id === id)
+  if (!collection || !title.trim()) return
+  const next = { ...collection, title: title.trim(), updatedAt: Date.now() }
+  await putMaterialCollection(next)
+  useStore.setState((state) => ({ materialCollections: state.materialCollections.map((item) => item.id === id ? next : item) }))
+}
+
+export async function removeMaterialCollection(id: string) {
+  await dbDeleteMaterialCollection(id)
+  useStore.setState((state) => ({ materialCollections: state.materialCollections.filter((item) => item.id !== id) }))
+}
+
+export async function reuseMaterialItem(item: MaterialCollectionItem) {
+  const images: InputImage[] = []
+  for (const id of item.referenceImageIds) {
+    if (id === item.category?.styleReferenceImageId) continue
+    const dataUrl = await ensureImageCached(id)
+    if (!dataUrl) throw new Error('该素材的参考原图不存在，无法完整复用')
+    images.push({ id, dataUrl })
+  }
+  const state = useStore.getState()
+  state.clearMaskDraft()
+  state.setInputImages(images)
+  state.setParams(item.params)
+  state.setPrompt(item.prompt)
+  state.setPendingTaskCategory({ mode: 'prompt-match', prompt: item.prompt, category: item.category ?? {} })
+  useStore.setState({ referenceImageUsages: { ...state.referenceImageUsages, ...Object.fromEntries(images.map((image) => [image.id, normalizeReferenceUsage(item.referenceImageUsages?.[image.id])])) } })
 }
 
 export function mergePersistedState(persistedState: unknown, currentState: AppState): AppState {
@@ -671,6 +735,9 @@ export function mergePersistedState(persistedState: unknown, currentState: AppSt
     galleryInputDraft: galleryInputDraft && !isEmptyAgentInputDraft(galleryInputDraft) ? galleryInputDraft : null,
     seedreamEditorDraft: normalizeSeedreamEditorDraft(persisted.seedreamEditorDraft),
     imageEditorDrafts: normalizeImageEditorDrafts(persisted.imageEditorDrafts, persisted.seedreamEditorDraft),
+    referenceImageUsages: normalizeReferenceUsages(persisted.referenceImageUsages),
+    imageResultReviews: normalizeImageResultReviews(persisted.imageResultReviews),
+    imageFinalSelections: normalizeImageSelections(persisted.imageFinalSelections),
     agentConversations,
     activeAgentConversationId,
     agentInputDrafts,
@@ -724,6 +791,20 @@ interface AppState {
   setEditorSubmitting: (imageId: string, submitting: boolean) => void
   setSeedreamEditorDraft: (patch: Partial<SeedreamEditorDraft>) => void
   resetSeedreamEditorDraft: () => void
+  referenceImageUsages: Record<string, ReferenceImageUsage>
+  setReferenceImageUsage: (imageId: string, usage: Partial<ReferenceImageUsage>) => void
+  imageResultReviews: Record<string, ImageResultReview>
+  imageFinalSelections: Record<string, string>
+  reviewImageId: string | null
+  setReviewImageId: (imageId: string | null) => void
+  saveImageReview: (rootImageId: string, imageId: string, status: ImageResultReview['status'], note: string) => void
+  materialCollections: MaterialCollection[]
+  materialLibraryOpen: boolean
+  materialCollectionDraft: MaterialCollectionDraft | null
+  openMaterialLibrary: (draft?: MaterialCollectionDraft) => void
+  closeMaterialLibrary: () => void
+  plannerRestoreRequest: AmazonPlannerSession | null
+  requestPlannerRestore: (session: AmazonPlannerSession | null) => void
 
   // 参数
   params: TaskParams
@@ -833,6 +914,8 @@ interface AppState {
 }
 
 function isImageReferencedByState(state: AppState, imageId: string) {
+  if (collectMaterialImageIds(state.materialCollections).has(imageId)) return true
+  if (state.imageFinalSelections[imageId] || Object.values(state.imageFinalSelections).includes(imageId)) return true
   if (state.inputImages.some((img) => img.id === imageId)) return true
   if (state.galleryInputDraft?.inputImages.some((img) => img.id === imageId)) return true
   if (state.seedreamEditorDraft.sourceImageId === imageId || state.seedreamEditorDraft.referenceImageIds.includes(imageId)) return true
@@ -1213,6 +1296,24 @@ export const useStore = create<AppState>()(
       galleryInputDraft: null,
       seedreamEditorDraft: { ...DEFAULT_SEEDREAM_EDITOR_DRAFT },
       imageEditorDrafts: {},
+      referenceImageUsages: {},
+      setReferenceImageUsage: (imageId, usage) => set((state) => ({ referenceImageUsages: { ...state.referenceImageUsages, [imageId]: normalizeReferenceUsage({ ...state.referenceImageUsages[imageId], ...usage }) } })),
+      imageResultReviews: {},
+      imageFinalSelections: {},
+      reviewImageId: null,
+      setReviewImageId: (reviewImageId) => set({ reviewImageId }),
+      saveImageReview: (rootImageId, imageId, status, note) => set((state) => ({
+        imageResultReviews: { ...state.imageResultReviews, [imageId]: { status, note: note.trim().slice(0, 4000), updatedAt: Date.now() } },
+        imageFinalSelections: status === 'approved' ? { ...state.imageFinalSelections, [rootImageId]: imageId }
+          : Object.fromEntries(Object.entries(state.imageFinalSelections).filter(([root, selected]) => root !== rootImageId || selected !== imageId)),
+      })),
+      materialCollections: [],
+      materialLibraryOpen: false,
+      materialCollectionDraft: null,
+      openMaterialLibrary: (draft) => set({ materialLibraryOpen: true, materialCollectionDraft: draft ?? null }),
+      closeMaterialLibrary: () => set({ materialLibraryOpen: false, materialCollectionDraft: null }),
+      plannerRestoreRequest: null,
+      requestPlannerRestore: (plannerRestoreRequest) => set({ plannerRestoreRequest }),
       editorSubmittingImageIds: [],
       setSeedreamEditorDraft: (patch) => set((state) => {
         const next = normalizeSeedreamEditorDraft({
@@ -1897,6 +1998,8 @@ async function recoverFalTask(taskId: string) {
 /** 初始化：从 IndexedDB 加载任务，按需恢复输入图片，并清理孤立图片 */
 export async function initStore() {
   const storedTasks = await getAllTasks()
+  const materialCollections = await getAllMaterialCollections()
+  useStore.setState({ materialCollections })
   const { tasks, interruptedTasks } = markInterruptedOpenAIRunningTasks(storedTasks)
   await Promise.all(interruptedTasks.map((task) => putTask(task)))
   useStore.getState().setTasks(tasks)
@@ -1921,6 +2024,8 @@ export async function initStore() {
   // 收集所有任务引用的图片 id
   const plannerSessions = await getAllAmazonPlannerSessions()
   const referencedIds = collectPlannerImageReferences(plannerSessions, useStore.getState().settings)
+  for (const id of collectMaterialImageIds(materialCollections)) referencedIds.add(id)
+  for (const [root, selected] of Object.entries(useStore.getState().imageFinalSelections)) { referencedIds.add(root); referencedIds.add(selected) }
   const state = useStore.getState()
   const persistedInputImages = state.inputImages
   const galleryInputDraft = state.galleryInputDraft
@@ -2176,6 +2281,7 @@ export async function submitTaskWithInput(request: SubmitTaskWithInputRequest): 
     elapsed: null,
     category: request.category,
     imageEditContext,
+    referenceImageUsages: request.imageEditContext ? undefined : Object.fromEntries(storedImages.filter((image) => state.referenceImageUsages[image.id]).map((image) => [image.id, { ...state.referenceImageUsages[image.id], slots: [...state.referenceImageUsages[image.id].slots] }])),
   }
 
   useStore.getState().setTasks([task, ...useStore.getState().tasks])
@@ -2242,19 +2348,27 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     return false
   }
   const category = resolvePendingTaskCategory(pendingTaskCategory, trimmedPrompt)
+  const applicableInputImages = category.amazonSlot
+    ? inputImages.filter((image) => referenceAppliesToSlot(useStore.getState().referenceImageUsages[image.id], category.amazonSlot))
+    : inputImages
+  const scopedPrompt = remapImageMentionsForOrder(trimmedPrompt, inputImages, applicableInputImages)
+  if ((scopedPrompt.match(/@已移除图片/g) ?? []).length > (trimmedPrompt.match(/@已移除图片/g) ?? []).length) {
+    showToast('提示词引用了不适用于当前图片位的参考图，请调整参考图适用范围或移除该引用', 'error')
+    return false
+  }
   const inputImageLimit = getInputImageLimitForSettings(requestSettings)
-  if (inputImages.length > inputImageLimit) {
+  if (applicableInputImages.length > inputImageLimit) {
     showToast(`参考图数量不能超过 ${inputImageLimit} 张`, 'error')
     return false
   }
 
-  let orderedInputImages = inputImages
+  let orderedInputImages = applicableInputImages
   let maskImageId: string | null = null
   let maskTargetImageId: string | null = null
 
   if (maskDraft) {
     try {
-      orderedInputImages = orderInputImagesForMask(inputImages, maskDraft.targetImageId)
+      orderedInputImages = orderInputImagesForMask(applicableInputImages, maskDraft.targetImageId)
       const coverage = await validateMaskMatchesImage(maskDraft.maskDataUrl, orderedInputImages[0].dataUrl)
       if (coverage === 'full' && !options.allowFullMask) {
         setConfirmDialog({
@@ -2302,7 +2416,7 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
 
   const taskId = await submitTaskWithInput({
     apiProfileId: activeProfile.id,
-    prompt: trimmedPrompt,
+    prompt: remapImageMentionsForOrder(trimmedPrompt, inputImages, orderedInputImages),
     inputImages: orderedInputImages,
     params: normalizedParams,
     category,
@@ -2579,6 +2693,8 @@ function addSeedreamEditorDraftReferencedImageIds(target: Set<string>, draft = u
 async function addPlannerReferencedImageIds(target: Set<string>) {
   const sessions = await getAllAmazonPlannerSessions()
   for (const id of collectPlannerImageReferences(sessions, useStore.getState().settings)) target.add(id)
+  for (const id of collectMaterialImageIds(await getAllMaterialCollections())) target.add(id)
+  for (const [root, selected] of Object.entries(useStore.getState().imageFinalSelections)) { target.add(root); target.add(selected) }
 }
 
 function addTaskReferencedImageIds(target: Set<string>, task: TaskRecord) {
@@ -3855,7 +3971,7 @@ async function executeTask(taskId: string) {
 
     const result = await callImageApi({
       settings: requestSettings,
-      prompt: replaceImageMentionsForApi(task.prompt, inputDataUrls.length),
+      prompt: [replaceImageMentionsForApi(task.prompt, inputDataUrls.length), referenceUsageContract(task.inputImageIds, task.referenceImageUsages ?? {}, task.category?.styleReferenceImageId)].filter(Boolean).join('\n\n'),
       params: task.params,
       inputImageDataUrls: apiInputDataUrls,
       maskDataUrl: apiMaskDataUrl,
@@ -4208,6 +4324,7 @@ export async function reuseConfig(task: TaskRecord) {
     }
   }
   setInputImages(imgs)
+  useStore.setState((state) => ({ referenceImageUsages: { ...state.referenceImageUsages, ...Object.fromEntries(imgs.map((image) => [image.id, normalizeReferenceUsage(task.referenceImageUsages?.[image.id])])) } }))
   setPrompt(task.prompt)
   setPendingTaskCategory({
     mode: 'next-submit',
@@ -4372,6 +4489,8 @@ export async function clearData(options: ClearOptions = { clearConfig: true, cle
 
   if (options.clearTasks) {
     previewTranslationCache.clear()
+    await dbClearMaterialCollections()
+    useStore.setState({ materialCollections: [], imageResultReviews: {}, imageFinalSelections: {}, referenceImageUsages: {}, reviewImageId: null, materialCollectionDraft: null })
     await dbClearTasks()
     await dbClearAmazonPlannerSessions()
     await clearImages()
@@ -4499,6 +4618,7 @@ export async function exportData(options: ExportOptions = { exportConfig: true, 
   try {
     const tasks = options.exportTasks ? await getAllTasks() : []
     const amazonPlannerSessions = options.exportTasks ? await getAllAmazonPlannerSessions() : []
+    const materialCollections = options.exportTasks ? await getAllMaterialCollections() : []
     const images = options.exportTasks ? await getAllImages() : []
     const { settings, agentConversations } = useStore.getState()
     const exportedAt = Date.now()
@@ -4579,6 +4699,9 @@ export async function exportData(options: ExportOptions = { exportConfig: true, 
       manifest.tasks = tasks
       manifest.agentConversations = agentConversations
       manifest.amazonPlannerSessions = amazonPlannerSessions
+      manifest.materialCollections = materialCollections
+      manifest.imageResultReviews = useStore.getState().imageResultReviews
+      manifest.imageFinalSelections = useStore.getState().imageFinalSelections
       manifest.imageFiles = imageFiles
       manifest.thumbnailFiles = thumbnailFiles
     }
@@ -4665,6 +4788,14 @@ export async function importData(file: File, options: ImportOptions = { importCo
       for (const session of data.amazonPlannerSessions ?? []) {
         await putAmazonPlannerSession(session)
       }
+      for (const collection of data.materialCollections ?? []) {
+        if (collection && typeof collection.id === 'string' && Array.isArray(collection.versions)) await putMaterialCollection(collection)
+      }
+      useStore.setState((state) => ({
+        imageResultReviews: { ...state.imageResultReviews, ...normalizeImageResultReviews(data.imageResultReviews) },
+        imageFinalSelections: { ...state.imageFinalSelections, ...normalizeImageSelections(data.imageFinalSelections) },
+      }))
+      useStore.setState({ materialCollections: await getAllMaterialCollections() })
 
       const tasks = await getAllTasks()
       useStore.getState().setTasks(tasks)

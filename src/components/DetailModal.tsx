@@ -1002,6 +1002,7 @@ export default function DetailModal() {
 
           {/* 操作按钮 */}
           <div className="grid grid-cols-4 sm:flex gap-2 pt-4 border-t border-gray-100 dark:border-white/[0.08]">
+            <button type="button" disabled={!currentOutputImageId} onClick={() => { useStore.getState().setDetailTaskId(null); useStore.getState().setReviewImageId(currentOutputImageId) }} className="col-span-2 rounded-xl bg-indigo-50 px-3 py-2 text-sm font-medium text-indigo-700 disabled:opacity-40 dark:bg-indigo-500/10 dark:text-indigo-300">对比 / 版本</button>
             <button
               onClick={handleReuse}
               className="col-span-2 sm:flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-500/20 transition text-sm font-medium whitespace-nowrap"

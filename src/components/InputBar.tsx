@@ -11,6 +11,7 @@ import { dismissAllTooltips } from '../lib/tooltipDismiss'
 import { getSafeBoundingClientRect } from '../lib/domRect'
 import { collectAgentRoundOutputImageSlots } from '../lib/agentImageReferences'
 import { matchesTaskHistoryFilters } from '../lib/taskHistory'
+import { materialItemFromTask } from '../lib/materialCollections'
 import { useHintTooltip } from '../hooks/useHintTooltip'
 import { downloadImageIds, formatExportFileTime } from '../lib/downloadImages'
 import Select from './Select'
@@ -2025,6 +2026,13 @@ export default function InputBar() {
         {selectedTaskIds.length > 0 && (
           <div className="mb-3 flex justify-center lg:justify-end">
             <div className="ios-floating-chrome pointer-events-auto flex items-center rounded-full p-1">
+              <button type="button" onClick={() => {
+                const selected = tasks.filter((task) => selectedTaskIds.includes(task.id) && task.status === 'done')
+                const items = selected.flatMap((task) => task.outputImages.map((imageId) => materialItemFromTask(task, imageId)))
+                if (!items.length) { showToast('请先选择已生成图片的记录', 'info'); return }
+                useStore.getState().openMaterialLibrary({ title: selected[0]?.category?.productTitle || '我的素材套组', items })
+              }} className="px-2 py-2 text-xs font-semibold text-blue-600 dark:text-blue-300" title="把选中结果收藏为素材套组">存为套组</button>
+              <div className="mx-1 h-5 w-px bg-gray-200 dark:bg-white/20" />
               <button
                 onClick={clearSelection}
                 className="p-2 text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white transition-colors"

@@ -19,8 +19,8 @@
     "build": "tsc -b && vite build",
     "deploy:cf": "npm run build && wrangler deploy",
     "preview": "vite preview",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "vitest run --dir src",
+    "test:watch": "vitest --dir src"
   },
   "dependencies": {
     "@fal-ai/client": "^1.10.0",

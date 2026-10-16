@@ -184,8 +184,8 @@ function createAPlusExternalTextSchema(field: 'title' | 'body', marketplaceId?: 
   } as const
 }
 
-function createListingPlannerSchema(listingImageCount: number, marketplaceId?: AmazonMarketplaceId) {
-  const slots = getAmazonListingImageSlots(listingImageCount)
+function createListingPlannerSchema(listingImageCount: number, marketplaceId?: AmazonMarketplaceId, targetSlots?: string[]) {
+  const slots = targetSlots ?? getAmazonListingImageSlots(listingImageCount)
   return {
     type: 'object',
     additionalProperties: false,
@@ -525,10 +525,10 @@ function normalizeSeriesStyleGuide(payload: PlannerApiPayload): string {
   return typeof payload.seriesStyleGuide === 'string' ? payload.seriesStyleGuide.trim() : ''
 }
 
-function normalizeListingPlannerApiPayload(payload: PlannerApiPayload, listingImageCount: number, marketplaceId: AmazonMarketplaceId): PlannerApiResult {
+function normalizeListingPlannerApiPayload(payload: PlannerApiPayload, listingImageCount: number, marketplaceId: AmazonMarketplaceId, targetSlots?: string[]): PlannerApiResult {
   const parsed = normalizeParsedListing(payload)
   const seriesStyleGuide = normalizeSeriesStyleGuide(payload)
-  const slots = getAmazonListingImageSlots(listingImageCount)
+  const slots = targetSlots ?? getAmazonListingImageSlots(listingImageCount)
   const count = slots.length
   const plans = Array.isArray(payload.imagePlans)
     ? payload.imagePlans.map((plan, index) => normalizePlan(plan, index, slots)).filter((plan) => plan.prompt.trim() && plan.planMarkdown.trim()).slice(0, count)
@@ -927,6 +927,8 @@ export async function callAmazonPlannerApi(options: {
   baseDraft: AmazonPromptDraft
   profile: ApiProfile
   referenceImageDataUrls?: string[]
+  referenceImageDescriptions?: string[]
+  moduleRevision?: { plan: AmazonImagePlan | AmazonAPlusPlan; instruction: string; seriesStyleGuide: string }
   model?: string
   mode?: AmazonPlannerMode
   marketplaceId?: AmazonMarketplaceId
@@ -942,20 +944,42 @@ export async function callAmazonPlannerApi(options: {
   const marketplaceId = normalizeAmazonMarketplaceId(options.marketplaceId)
   const aPlusType = options.aPlusType ?? 'standard-large'
   const listingImageCount = normalizeListingImageCount(options.listingImageCount)
-  const aPlusModuleSpecs = normalizeAPlusModuleSpecs(aPlusType, options.aPlusModuleSpecs)
+  const allAPlusModuleSpecs = normalizeAPlusModuleSpecs(aPlusType, options.aPlusModuleSpecs)
+  const targetSlot = options.moduleRevision?.plan.slot
+  const aPlusModuleSpecs = targetSlot && mode === 'aplus' ? allAPlusModuleSpecs.filter((spec) => spec.slot === targetSlot) : allAPlusModuleSpecs
+  if (targetSlot && (mode === 'aplus' ? aPlusModuleSpecs.length !== 1 : !getAmazonListingImageSlots(listingImageCount).includes(targetSlot))) throw new Error('重新策划的图片位不在当前模块清单中')
   const aPlusGenerationTier = options.aPlusGenerationTier ?? '2K'
-  const schema = mode === 'aplus' ? createAPlusPlannerSchema(aPlusModuleSpecs, marketplaceId) : createListingPlannerSchema(listingImageCount, marketplaceId)
+  const schema = mode === 'aplus' ? createAPlusPlannerSchema(aPlusModuleSpecs, marketplaceId) : createListingPlannerSchema(listingImageCount, marketplaceId, targetSlot ? [targetSlot] : undefined)
   const proxyConfig = readClientDevProxyConfig()
   const useApiProxy = shouldUseApiProxy(options.profile.apiProxy, proxyConfig, options.profile.baseUrl)
   const useChatCompletions = options.profile.apiMode === 'chat'
   const isDeepSeekPlannerProfile = isOfficialDeepSeekPlannerProfile(options.profile)
-  const inputText = buildPlannerInputText(options.listingText, mode, aPlusType, {
+  const revisionInstructions = options.moduleRevision ? [
+    `Revise exactly ONE existing Amazon ${mode === 'aplus' ? 'A+ module' : 'Listing image'}: ${targetSlot}. Do not return or change any other image slot.`,
+    buildMarketplaceInstructionBlock(marketplaceId),
+    mode === 'aplus' ? formatAmazonAPlusReferenceMaterial(marketplaceId) : formatAmazonListingReferenceMaterial(marketplaceId),
+    PRODUCT_REFERENCE_FACTS_ONLY_PLANNER_GUIDE,
+    buildFieldLanguageRules(marketplaceId, { includeAPlusExternalText: mode === 'aplus' }),
+    'Preserve verified product facts, brand identity, module slot, module type and dimensions. Apply the user revision only to this module. Do not invent new claims.',
+    `Return JSON with product { title, category, color, material, audience, packageIncludes }, sellingPoints string[], seriesStyleGuide string, and ${mode === 'aplus' ? 'aPlusPlans' : 'imagePlans'} containing exactly one object for ${targetSlot}.`,
+    mode === 'aplus' ? 'The module must include slot, label, moduleType, planMarkdown, prompt, negativePrompt, textTitle and textBody.' : 'The image must include slot, label, planMarkdown, prompt and negativePrompt.',
+    'Write planMarkdown and labels in Simplified Chinese and image prompts in English. Echo existing metadata without changing it. Only return JSON; do not generate images.',
+    isDeepSeekPlannerProfile ? DEEPSEEK_TEXT_ONLY_PLANNER_GUARD : '',
+  ].filter(Boolean).join('\n\n') : ''
+  const inputText = (options.moduleRevision ? [
+    `SINGLE MODULE REVISION: ${targetSlot}`,
+    `Listing source:\n${options.listingText}`,
+    buildUserProductFactsText(options.baseDraft),
+    `Current series guide: ${options.moduleRevision.seriesStyleGuide}`,
+    `Current module JSON:\n${JSON.stringify(options.moduleRevision.plan)}`,
+    `Revision request:\n${options.moduleRevision.instruction.trim() || 'Improve this module while preserving its purpose and verified product facts.'}`,
+  ].join('\n\n') : buildPlannerInputText(options.listingText, mode, aPlusType, {
     includeReferenceImageInstruction: !isDeepSeekPlannerProfile,
     userProductFacts: isDeepSeekPlannerProfile ? buildUserProductFactsText(options.baseDraft) : '',
     listingImageCount,
     aPlusModuleSpecs,
     marketplaceId,
-  })
+  })) + (!isDeepSeekPlannerProfile && options.referenceImageDescriptions?.length ? `\n\nReference image roles, in attachment order:\n${options.referenceImageDescriptions.map((description, index) => `${index + 1}. ${description}`).join('\n')}\nOnly product references establish product facts. Honor each reference scope; other references only inform their stated visual role.` : '')
   const referenceImageDataUrls = isDeepSeekPlannerProfile
     ? []
     : options.referenceImageDataUrls ?? []
@@ -968,7 +992,7 @@ export async function callAmazonPlannerApi(options: {
           messages: [
             {
               role: 'system',
-              content: buildChatPlannerSystemPrompt(options.baseDraft, mode, aPlusType, {
+              content: revisionInstructions || buildChatPlannerSystemPrompt(options.baseDraft, mode, aPlusType, {
                 textOnlyReferenceGuard: isDeepSeekPlannerProfile,
                 listingImageCount,
                 aPlusModuleSpecs,
@@ -985,7 +1009,7 @@ export async function callAmazonPlannerApi(options: {
         }
       : {
           model,
-          instructions: buildPlannerInstructions(options.baseDraft, mode, aPlusType, {
+          instructions: revisionInstructions || buildPlannerInstructions(options.baseDraft, mode, aPlusType, {
             textOnlyReferenceGuard: isDeepSeekPlannerProfile,
             listingImageCount,
             aPlusModuleSpecs,
@@ -1007,7 +1031,7 @@ export async function callAmazonPlannerApi(options: {
   // One budget covers connection, body reads, retries, and backoff together.
   const linked = createLinkedAbortController(timeoutSeconds, options.signal)
   const signal = linked.controller.signal
-  const totalPlans = mode === 'aplus' ? aPlusModuleSpecs.length : listingImageCount
+  const totalPlans = targetSlot ? 1 : mode === 'aplus' ? aPlusModuleSpecs.length : listingImageCount
   const field = mode === 'aplus' ? 'aPlusPlans' : 'imagePlans'
   try {
     for (let attempt = 1; attempt <= MAX_PLANNER_ATTEMPTS; attempt++) {
@@ -1055,9 +1079,13 @@ export async function callAmazonPlannerApi(options: {
         signal.throwIfAborted()
         emit({ phase: 'validating', ...createPlannerPlanCounter(field).append(text) })
         const payload = parsePlannerPayload(text)
+        if (targetSlot) {
+          const revisedPlans = mode === 'aplus' ? payload.aPlusPlans : payload.imagePlans
+          if (revisedPlans?.length !== 1 || revisedPlans[0]?.slot !== targetSlot) throw new Error(`重新策划必须只返回 ${targetSlot} 的一份完整方案`)
+        }
         return mode === 'aplus'
           ? normalizeAPlusPlannerApiPayload(payload, aPlusType, aPlusGenerationTier, aPlusModuleSpecs, marketplaceId)
-          : normalizeListingPlannerApiPayload(payload, listingImageCount, marketplaceId)
+          : normalizeListingPlannerApiPayload(payload, listingImageCount, marketplaceId, targetSlot ? [targetSlot] : undefined)
       } catch (err) {
         signal.throwIfAborted()
         const streamUnsupported = body.stream && err instanceof PlannerHttpError && [400, 422].includes(err.status)

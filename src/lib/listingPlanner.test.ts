@@ -367,6 +367,49 @@ function createChatPlannerResponse(title = 'Recovered planner') {
   ])
 }
 
+describe('single module replanning', () => {
+  it.each(['chat', 'responses'] as const)('requests exactly one Listing slot using %s, with reference role guidance', async (apiMode) => {
+    const payload = createApiPayload('Revision')
+    payload.imagePlans = payload.imagePlans.filter((plan) => plan.slot === 'PT01')
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(apiMode === 'chat'
+      ? { choices: [{ message: { content: JSON.stringify(payload) }, finish_reason: 'stop' }] }
+      : { status: 'completed', output_text: JSON.stringify(payload) })))
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await callAmazonPlannerApi({ ...createPlannerRequest(apiMode), referenceImageDataUrls: ['data:image/png;base64,test'], referenceImageDescriptions: ['Style only; never copy its product'], moduleRevision: { plan: payload.imagePlans[0], instruction: 'Show the handle', seriesStyleGuide: 'Keep product facts' } })
+    expect(result.plans.map((plan) => plan.slot)).toEqual(['PT01'])
+    const body = JSON.parse(String((fetchMock.mock.calls as unknown as [string, RequestInit][])[0][1].body))
+    expect(JSON.stringify(body)).toContain('SINGLE MODULE REVISION: PT01')
+    expect(JSON.stringify(body)).toContain('Only product references establish product facts')
+    if (apiMode === 'responses') {
+      const schema = body.text.format.schema
+      expect(schema.properties.imagePlans.minItems).toBe(1)
+      expect(schema.properties.imagePlans.maxItems).toBe(1)
+      expect(schema.properties.imagePlans.items.properties.slot.enum).toEqual(['PT01'])
+    } else {
+      expect(body.response_format.type).toBe('json_object')
+      expect(body.messages[0].content).toContain('containing exactly one object for PT01')
+    }
+  })
+  it('requests one A+ module and preserves its type and dimensions', async () => {
+    const payload = createAPlusPayload('A+L')
+    payload.aPlusPlans = payload.aPlusPlans.slice(1, 2)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(payload) }, finish_reason: 'stop' }] }))))
+    const result = await callAmazonPlannerApi({ ...createPlannerRequest(), mode: 'aplus', aPlusType: 'standard-large', moduleRevision: { plan: payload.aPlusPlans[0] as never, instruction: 'Simplify', seriesStyleGuide: '' } })
+    expect(result.aPlusPlans).toHaveLength(1)
+    expect(result.aPlusPlans[0].slot).toBe('A+L02')
+    expect(result.aPlusPlans[0].moduleType).toBe(getAPlusModuleSpecs('standard-large')[1].moduleType)
+  })
+  it.each(['wrong-slot', 'extra-slot', 'empty'] as const)('rejects %s responses instead of replacing the current module', async (failure) => {
+    const original = createApiPayload().imagePlans[1]
+    const payload = createApiPayload()
+    payload.imagePlans = failure === 'wrong-slot' ? [payload.imagePlans[0]] : failure === 'extra-slot' ? payload.imagePlans : []
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(payload) }, finish_reason: 'stop' }] })))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(callAmazonPlannerApi({ ...createPlannerRequest(), moduleRevision: { plan: original, instruction: '', seriesStyleGuide: '' } })).rejects.toThrow('必须只返回 PT01')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('planner streaming and transient failure recovery', () => {
   beforeEach(() => { vi.useFakeTimers() })
 

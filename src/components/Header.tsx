@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store'
 import { useTooltip } from '../hooks/useTooltip'
+import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { dismissAllTooltips } from '../lib/tooltipDismiss'
 import ViewportTooltip from './ViewportTooltip'
 import HelpModal from './HelpModal'
@@ -31,6 +32,8 @@ export default function Header({ activeView, onNavigate }: HeaderProps) {
   const setShowSettings = useStore((s) => s.setShowSettings)
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
   const [showHelp, setShowHelp] = useState(false)
+  const [showMore, setShowMore] = useState(false)
+  useCloseOnEscape(showMore, () => setShowMore(false))
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null)
   const [isPwaInstalled, setIsPwaInstalled] = useState(isInstalledPwa)
   const isLocalApp = isLocalAppHostname(window.location.hostname)
@@ -113,7 +116,7 @@ export default function Header({ activeView, onNavigate }: HeaderProps) {
     <>
       <header data-no-drag-select className="safe-area-top fixed left-0 right-0 top-0 z-40 border-b border-black/[0.06] bg-white/75 shadow-[0_1px_0_rgba(255,255,255,0.5)] backdrop-blur-2xl dark:border-white/[0.08] dark:bg-gray-950/80 dark:shadow-none">
         <div className="safe-area-x safe-header-inner mx-auto flex max-w-7xl items-center justify-between gap-2 sm:gap-3">
-          <div className="flex min-w-0 items-center gap-1 sm:gap-3">
+          <div className="flex min-w-0 items-center sm:gap-3">
             <h1 className="hidden min-w-0 min-[520px]:block">
               <button
                 type="button"
@@ -123,42 +126,55 @@ export default function Header({ activeView, onNavigate }: HeaderProps) {
                 亚马逊图片工作台
               </button>
             </h1>
-            <nav className="flex shrink-0 items-center gap-1">
+            <nav className="flex shrink-0 items-center sm:gap-1">
               <button
                 type="button"
                 onClick={() => onNavigate('home')}
-                className={`h-8 rounded-[10px] px-2.5 text-xs font-semibold transition sm:px-3 ${activeView === 'home' ? 'bg-gray-900 text-white shadow-sm dark:bg-white dark:text-gray-900' : 'text-gray-500 hover:bg-black/[0.05] hover:text-gray-900 dark:text-gray-400 dark:hover:bg-white/[0.08] dark:hover:text-gray-100'}`}
+                className={`h-8 rounded-[10px] px-1.5 text-[11px] font-semibold transition sm:px-3 sm:text-xs ${activeView === 'home' ? 'bg-gray-900 text-white shadow-sm dark:bg-white dark:text-gray-900' : 'text-gray-500 hover:bg-black/[0.05] hover:text-gray-900 dark:text-gray-400 dark:hover:bg-white/[0.08] dark:hover:text-gray-100'}`}
               >
                 首页
               </button>
               <button
                 type="button"
                 onClick={() => onNavigate('editor')}
-                className={`h-8 rounded-[10px] px-2.5 text-xs font-semibold transition sm:px-3 ${activeView === 'editor' ? 'bg-[hsl(var(--primary))] text-white shadow-sm' : 'text-gray-500 hover:bg-black/[0.05] hover:text-gray-900 dark:text-gray-400 dark:hover:bg-white/[0.08] dark:hover:text-gray-100'}`}
+                className={`h-8 rounded-[10px] px-1.5 text-[11px] font-semibold transition sm:px-3 sm:text-xs ${activeView === 'editor' ? 'bg-[hsl(var(--primary))] text-white shadow-sm' : 'text-gray-500 hover:bg-black/[0.05] hover:text-gray-900 dark:text-gray-400 dark:hover:bg-white/[0.08] dark:hover:text-gray-100'}`}
               >
                 图片编辑
               </button>
               <button
                 type="button"
                 onClick={() => onNavigate('tagger')}
-                className={`h-8 rounded-[10px] px-2.5 text-xs font-semibold transition sm:px-3 ${activeView === 'tagger' ? 'bg-[hsl(var(--primary))] text-white shadow-sm' : 'text-gray-500 hover:bg-black/[0.05] hover:text-gray-900 dark:text-gray-400 dark:hover:bg-white/[0.08] dark:hover:text-gray-100'}`}
+                aria-label="AI 人物打标"
+                className={`h-8 rounded-[10px] px-1.5 text-[11px] font-semibold transition sm:px-3 sm:text-xs ${activeView === 'tagger' ? 'bg-[hsl(var(--primary))] text-white shadow-sm' : 'text-gray-500 hover:bg-black/[0.05] hover:text-gray-900 dark:text-gray-400 dark:hover:bg-white/[0.08] dark:hover:text-gray-100'}`}
               >
-                AI 人物打标
+                <span className="hidden sm:inline">AI </span>人物打标
               </button>
             </nav>
+            <button type="button" onClick={() => useStore.getState().openMaterialLibrary()} className="h-8 shrink-0 rounded-[10px] px-1.5 text-[11px] font-semibold text-[hsl(var(--primary))] transition hover:bg-[hsl(var(--ios-blue-tint))] sm:px-3 sm:text-xs">素材库</button>
           </div>
           <div className="flex shrink-0 items-center gap-1">
+            <div className="relative sm:hidden">
+              <button type="button" aria-label="更多操作" aria-expanded={showMore} onClick={() => setShowMore((value) => !value)} className="h-9 rounded-lg px-1.5 text-[11px] font-semibold text-gray-600 dark:text-gray-300">更多</button>
+              {showMore && <>
+                <button type="button" aria-label="关闭更多操作" onClick={() => setShowMore(false)} className="fixed inset-0 z-40 cursor-default" />
+                <div role="menu" aria-label="更多操作" className="absolute right-0 top-full z-50 mt-2 w-36 rounded-xl border border-gray-200 bg-white p-1.5 shadow-xl dark:border-white/[0.1] dark:bg-gray-900">
+                  <button type="button" role="menuitem" onClick={() => { setShowMore(false); setShowSettings(true, 'about') }} className="w-full rounded-lg px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-white/[0.08]">开源声明</button>
+                  {!isPwaInstalled && <button type="button" role="menuitem" onClick={() => { setShowMore(false); handleInstallClick() }} className="w-full rounded-lg px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-white/[0.08]">安装为应用</button>}
+                  <button type="button" role="menuitem" onClick={() => { setShowMore(false); setShowHelp(true) }} className="w-full rounded-lg px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-white/[0.08]">操作指南</button>
+                </div>
+              </>}
+            </div>
             <button
               type="button"
               onClick={() => setShowSettings(true, 'about')}
-              className="h-8 whitespace-nowrap rounded-[10px] px-2 text-[11px] font-semibold text-[hsl(var(--primary))] transition hover:bg-[hsl(var(--ios-blue-tint))] active:translate-y-px sm:px-2.5 sm:text-xs"
+              className="hidden h-8 whitespace-nowrap rounded-[10px] px-2 text-[11px] font-semibold text-[hsl(var(--primary))] transition hover:bg-[hsl(var(--ios-blue-tint))] active:translate-y-px sm:block sm:px-2.5 sm:text-xs"
             >
               开源声明
             </button>
             {!isPwaInstalled && (
               <div
-                className="relative"
                 {...installTooltip.handlers}
+                className="relative hidden sm:block"
               >
                 <Button
                   onClick={() => {
@@ -178,7 +194,7 @@ export default function Header({ activeView, onNavigate }: HeaderProps) {
               </div>
             )}
             <div
-              className="relative"
+              className="relative hidden sm:block"
               {...helpTooltip.handlers}
             >
               <Button
@@ -205,7 +221,7 @@ export default function Header({ activeView, onNavigate }: HeaderProps) {
                 onClick={() => setShowSettings(true)}
                 variant="plain"
                 size="icon"
-                className="text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100"
+                className="text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100 max-sm:!h-9 max-sm:!w-9 max-sm:!min-h-9 max-sm:!min-w-9"
                 aria-label="设置"
               >
                 <SettingsIcon className="h-5 w-5" />

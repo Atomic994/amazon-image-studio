@@ -19,6 +19,8 @@ import MaskEditorModal from './components/MaskEditorModal'
 import ImageContextMenu from './components/ImageContextMenu'
 import { useGlobalClickSuppression } from './lib/clickSuppression'
 import { previewTranslationCache } from './lib/previewTranslationCache'
+import ImageVersionReviewModal from './components/ImageVersionReviewModal'
+import MaterialLibraryModal from './components/MaterialLibraryModal'
 
 export type AppView = 'home' | 'editor' | 'tagger'
 
@@ -31,6 +33,7 @@ function getAppViewFromHash(): AppView {
 
 export default function App() {
   const setSettings = useStore((s) => s.setSettings)
+  const plannerRestoreRequest = useStore((s) => s.plannerRestoreRequest)
   const [view, setView] = useState<AppView>(getAppViewFromHash)
   const currentView = useRef(view)
   const scrollPositions = useRef<Record<AppView, number>>({ home: 0, editor: 0, tagger: 0 })
@@ -41,6 +44,11 @@ export default function App() {
     currentView.current = next
     setView(next)
   }, [])
+  useEffect(() => {
+    if (!plannerRestoreRequest) return
+    changeView('home')
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
+  }, [plannerRestoreRequest, changeView])
   useLayoutEffect(() => {
     if (!mounted.current) { mounted.current = true; return }
     window.scrollTo({ top: scrollPositions.current[view], behavior: 'instant' })
@@ -122,6 +130,8 @@ export default function App() {
       </main>
       {view === 'home' && <InputBar />}
       <DetailModal />
+      <ImageVersionReviewModal />
+      <MaterialLibraryModal />
       <Lightbox />
       <SettingsModal scope={view === 'editor' ? 'editor' : 'home'} />
       <ConfirmDialog />

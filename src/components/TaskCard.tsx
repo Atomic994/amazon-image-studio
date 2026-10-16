@@ -101,6 +101,7 @@ export default function TaskCard({
   const [streamPreviewLoaded, setStreamPreviewLoaded] = useState(false)
   const toggleTaskSelection = useStore((s) => s.toggleTaskSelection)
   const settings = useStore((s) => s.settings)
+  const isFinalResult = useStore((s) => Object.values(s.imageFinalSelections).some((imageId) => task.outputImages.includes(imageId)))
   const streamPreviewSrc = useStore((s) => s.streamPreviews[task.id] || '')
   const touchStartRef = useRef<{ x: number; y: number } | null>(null)
   const swipeResetTimerRef = useRef<number | null>(null)
@@ -596,6 +597,8 @@ export default function TaskCard({
               onTouchEnd={(e) => e.stopPropagation()}
               onTouchCancel={(e) => e.stopPropagation()}
             >
+              {isFinalResult && <span className="flex shrink-0 items-center rounded-lg bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300">最终稿</span>}
+              {task.outputImages.length > 0 && <button type="button" onClick={(event) => { event.stopPropagation(); useStore.getState().setReviewImageId(task.outputImages[0]) }} className="shrink-0 rounded-lg bg-blue-50 px-2 py-1 text-[11px] font-medium text-blue-700 hover:bg-blue-100 dark:bg-blue-500/10 dark:text-blue-300" aria-label="对比结果与版本">对比 / 版本</button>}
               <span className={`flex flex-shrink-0 items-center rounded px-1.5 py-0.5 text-xs ${historyCategory.workflow === 'seedream-edit' ? 'bg-blue-50 text-blue-700 dark:bg-blue-500/10 dark:text-blue-300' : 'bg-gray-100 text-gray-600 dark:bg-white/[0.04] dark:text-gray-300'}`}>
                 {getWorkflowLabel(historyCategory.workflow)}
               </span>
