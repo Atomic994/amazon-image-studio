@@ -22,6 +22,7 @@ import { previewTranslationCache } from './lib/previewTranslationCache'
 import ImageVersionReviewModal from './components/ImageVersionReviewModal'
 import MaterialLibraryModal from './components/MaterialLibraryModal'
 import GenerationQueueModal from './components/GenerationQueueModal'
+import ReferenceLibraryModal from './components/ReferenceLibraryModal'
 import { startGenerationQueueRunner } from './lib/generationQueueRunner'
 
 export type AppView = 'home' | 'editor' | 'tagger'
@@ -37,6 +38,7 @@ export default function App() {
   useEffect(() => startGenerationQueueRunner(), [])
   const setSettings = useStore((s) => s.setSettings)
   const plannerRestoreRequest = useStore((s) => s.plannerRestoreRequest)
+  const referenceLibrarySeed = useStore((s) => s.referenceLibrarySeed)
   const [view, setView] = useState<AppView>(getAppViewFromHash)
   const currentView = useRef(view)
   const scrollPositions = useRef<Record<AppView, number>>({ home: 0, editor: 0, tagger: 0 })
@@ -136,6 +138,7 @@ export default function App() {
       <ImageVersionReviewModal />
       <MaterialLibraryModal />
       <GenerationQueueModal />
+      {referenceLibrarySeed && <ReferenceLibraryModal seed={referenceLibrarySeed} slots={[]} saveOnly onClose={() => useStore.setState({ referenceLibrarySeed: null })} />}
       <Lightbox />
       <SettingsModal scope={view === 'editor' ? 'editor' : 'home'} />
       <ConfirmDialog />

@@ -8,6 +8,7 @@ import { plannerModuleKey } from './plannerModuleVersions'
 import { plannerContextForSlot, plannerVisualStyle } from './plannerContext'
 export { plannerVisualStyle } from './plannerContext'
 import { canApiProfileGenerateImages, validateApiProfile } from './apiProfiles'
+import { plannerThemeContract } from './plannerThemes'
 
 export interface PlannerGenerationSpec {
   slot: string; label: string; versionLabel: string; prompt: string; size: string; stale: boolean
@@ -33,7 +34,7 @@ export function buildPlannerGenerationSpec(session: AmazonPlannerSession, slot: 
   const key = plannerModuleKey(session.mode, slot)
   const version = session.moduleVersions?.[key]?.find((item) => item.id === session.selectedModuleVersions?.[key])
   const options = { ...plan, seriesStyleGuide: main ? null : session.seriesStyleGuides[session.mode], styleReferenceAttached: !!styleId, styleDensityMode: session.styleDensityMode, marketplaceId: session.marketplaceId, selectedVisualStyle: styleId ? plannerVisualStyle(session) : null }
-  const prompt = appendProductFactsContract(session.mode === 'aplus' ? buildAmazonAPlusPlanPrompt(options) : buildAmazonPlanPrompt(options), facts)
+  const prompt = appendProductFactsContract([session.mode === 'aplus' ? buildAmazonAPlusPlanPrompt(options) : buildAmazonPlanPrompt(options), plannerThemeContract(session, slot)].filter(Boolean).join('\n\n'), facts)
   const size = session.mode === 'aplus' ? (plan as AmazonPlannerSession['aPlusPlans'][number]).generationSize : session.resolution === '4k' ? '4096x4096' : '2048x2048'
   const errors: string[] = []
   const profileError = validateApiProfile(profile)

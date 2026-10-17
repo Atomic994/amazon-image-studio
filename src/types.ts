@@ -427,6 +427,8 @@ export interface AmazonPlannerSession {
   selectedUploadedStyleReferenceId?: string | null
   selectedUploadedStyleReferenceSnapshot?: AmazonUploadedStyleReference | null
   styleDensityMode?: AmazonStyleDensityMode
+  themeSettings?: PlannerThemeSettings
+  sourceCollection?: { collectionId: string; versionId: string }
   imagePlans: AmazonPlannerSessionImagePlan[]
   aPlusPlans: AmazonPlannerSessionAPlusPlan[]
   selectedPlanIndex: number | null
@@ -518,6 +520,49 @@ export interface ReferenceLibraryItem {
   analyses: ReferenceAnalysisSnapshot[]
   createdAt: number
   updatedAt: number
+  origin?: { kind: 'generated'; taskId?: string; plannerSessionId?: string; slot?: string }
+}
+
+export interface ReferenceLibrarySeed {
+  imageId: string
+  usage: ReferenceImageUsage
+  analyses: ReferenceAnalysisSnapshot[]
+  origin?: ReferenceLibraryItem['origin']
+}
+
+export interface PlannerThemeSettings {
+  theme: string
+  composition: string
+  lighting: string
+  constraints: string
+}
+
+export interface PlannerThemePreset {
+  id: string
+  title: string
+  description: string
+  scene: string
+  themeSettings: PlannerThemeSettings
+  density: AmazonStyleDensityMode
+  createdAt: number
+  updatedAt: number
+}
+
+export interface FinalSetSelection {
+  imageId: string
+  confirmedAt: number
+  contextFingerprint: string
+  plannerModuleVersionId?: string
+  item?: MaterialCollectionItem
+}
+
+export type FinalSetSelections = Record<string, Record<string, FinalSetSelection>>
+
+export interface FinalSetDeliverySnapshot {
+  scope: string
+  expectedSlots: string[]
+  missingSlots: string[]
+  confirmedAt: number
 }
 
 /** Immutable request inputs; credentials are resolved from the current profile only when dispatched. */
@@ -570,6 +615,7 @@ export interface PlannerSettingsSnapshot {
   guide: string
   layout: string
   marketplace: string
+  theme?: string
 }
 
 export interface LocalEditProtection {
@@ -603,6 +649,7 @@ export interface MaterialCollectionVersion {
   note: string
   items: MaterialCollectionItem[]
   plannerSession?: AmazonPlannerSession
+  finalSet?: FinalSetDeliverySnapshot
 }
 
 export interface MaterialCollection {
@@ -618,6 +665,7 @@ export interface MaterialCollectionDraft {
   title: string
   items: MaterialCollectionItem[]
   plannerSession?: AmazonPlannerSession
+  finalSet?: FinalSetDeliverySnapshot
 }
 
 // ===== Agent 模式 =====
@@ -817,6 +865,8 @@ export interface ExportData {
   amazonPlannerSessions?: AmazonPlannerSession[]
   materialCollections?: MaterialCollection[]
   referenceLibrary?: ReferenceLibraryItem[]
+  plannerThemePresets?: PlannerThemePreset[]
+  finalSetSelections?: FinalSetSelections
   generationQueue?: GenerationQueueItem[]
   imageResultReviews?: Record<string, ImageResultReview>
   imageFinalSelections?: Record<string, string>

@@ -30,16 +30,18 @@ export function appendMaterialCollectionVersion(draft: MaterialCollectionDraft, 
   if (!draft.items.length && !draft.plannerSession) throw new Error('请先选择生成图片或保存一份策划')
   const at = Date.now()
   const plannerSession = draft.plannerSession ?? existing?.versions[existing.versions.length - 1]?.plannerSession
-  const version = JSON.parse(JSON.stringify({ id: localId('collection-version'), versionNumber: Math.max(0, ...(existing?.versions.map((item) => item.versionNumber) ?? [])) + 1, createdAt: at, note: note.trim(), items: draft.items, plannerSession }))
+  const finalSet = draft.finalSet ? { ...draft.finalSet, missingSlots: [...new Set([...draft.finalSet.missingSlots, ...draft.finalSet.expectedSlots.filter((slot) => !draft.items.some((item) => (item.slot || `image:${item.imageId}`) === slot))])] } : undefined
+  const version = JSON.parse(JSON.stringify({ id: localId('collection-version'), versionNumber: Math.max(0, ...(existing?.versions.map((item) => item.versionNumber) ?? [])) + 1, createdAt: at, note: note.trim(), items: draft.items, plannerSession, finalSet }))
   return { id: existing?.id ?? localId('collection'), title: draft.title.trim() || existing?.title || '未命名素材套组', description: existing?.description ?? '', versions: [...(existing?.versions ?? []), version], createdAt: existing?.createdAt ?? at, updatedAt: at }
 }
 
 export function materialCollectionCandidates(draft: MaterialCollectionDraft, existing?: MaterialCollection): MaterialCollectionItem[] {
   const seen = new Set<string>()
-  const previous = existing?.versions[existing.versions.length - 1]?.items ?? []
+  const previous = draft.finalSet ? [] : existing?.versions[existing.versions.length - 1]?.items ?? []
   return [...draft.items, ...previous].filter((item) => {
-    if (seen.has(item.imageId)) return false
-    seen.add(item.imageId)
+    const key = `${item.slot}:${item.imageId}`
+    if (seen.has(key)) return false
+    seen.add(key)
     return true
   })
 }

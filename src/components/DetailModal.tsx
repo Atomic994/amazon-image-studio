@@ -18,6 +18,7 @@ import { CloseIcon, CodeIcon, CopyIcon, DownloadIcon, EditIcon, LinkIcon, TrashI
 import { useSheetDrag } from './Sheet'
 
 import ViewportTooltip from './ViewportTooltip'
+import { openOutputInReferenceLibrary } from '../store'
 
 export default function DetailModal() {
   const tasks = useStore((s) => s.tasks)
@@ -455,6 +456,7 @@ export default function DetailModal() {
                   下载图片
                 </ViewportTooltip>
               </div>
+              <button type="button" className="rounded bg-black/50 px-2 py-1 text-xs text-white" onClick={() => { openOutputInReferenceLibrary(currentOutputImageId, task.category); setDetailTaskId(null) }}>存入参考图库</button>
               {outputLen > 1 && (
                 <div className="relative group flex">
                   <button

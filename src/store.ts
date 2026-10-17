@@ -25,6 +25,10 @@ import type {
   MaterialCollectionDraft,
   MaterialCollectionItem,
   ReferenceLibraryItem,
+  ReferenceLibrarySeed,
+  PlannerThemePreset,
+  FinalSetSelection,
+  FinalSetSelections,
   GenerationQueueItem,
   ExportData,
   ResponsesApiResponse,
@@ -59,6 +63,8 @@ import {
   clearImages,
   storeImage,
   referenceLibraryDb,
+  plannerThemePresetsDb,
+  finalSetSelectionsDb,
   generationQueueDb,
 } from './lib/db'
 import { callImageApi } from './lib/api'
@@ -82,6 +88,9 @@ import { analysisMatchesInputs, buildReferenceAnalysisContract, referenceAnalysi
 import { normalizeImageResultReviews } from './lib/imageVersions'
 import { appendMaterialCollectionVersion, collectMaterialImageIds } from './lib/materialCollections'
 import { collectWorkflowImageIds } from './lib/workflowReferences'
+import { collectFinalSetImageIds, finalImageRoot, normalizeFinalSetSelections } from './lib/finalSets'
+import { referenceSeedFromOutput } from './lib/referenceLibrary'
+import { normalizePlannerThemePreset } from './lib/plannerThemes'
 import { queueSubmissionRef, restoreGenerationQueue } from './lib/generationQueueModel'
 import { withGenerationQueueRecovery } from './lib/generationQueueLock'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
@@ -717,6 +726,29 @@ export async function reuseMaterialItem(item: MaterialCollectionItem) {
   useStore.setState({ referenceImageUsages: { ...state.referenceImageUsages, ...Object.fromEntries(images.map((image) => [image.id, normalizeReferenceUsage(item.referenceImageUsages?.[image.id])])) } })
 }
 
+export function openOutputInReferenceLibrary(imageId: string, category?: TaskRecord['category']) {
+  const task = useStore.getState().tasks.find((row) => row.outputImages.includes(imageId) && (!category || (row.category?.plannerSessionId === category.plannerSessionId && row.category?.amazonSlot === category.amazonSlot && row.category?.plannerModuleVersionId === category.plannerModuleVersionId)))
+  const seed = referenceSeedFromOutput(imageId, task)
+  if (category) seed.origin = { kind: 'generated', taskId: task?.id, plannerSessionId: category.plannerSessionId, slot: category.amazonSlot }
+  useStore.setState({ referenceLibrarySeed: seed })
+}
+
+export async function saveFinalSetSelection(scope: string, slot: string, selection: FinalSetSelection, note: string) {
+  if (!await getImage(selection.imageId)) throw new Error('最终稿原图已不存在，请恢复本地数据备份')
+  const normalized = normalizeFinalSetSelections({ [scope]: { [slot]: selection } })[scope]?.[slot]
+  if (!normalized) throw new Error('最终稿来源记录不完整，请重新选择')
+  await finalSetSelectionsDb.put(scope, slot, normalized)
+  const state = useStore.getState()
+  state.saveImageReview(finalImageRoot(state.tasks, normalized.imageId), normalized.imageId, 'approved', note)
+  useStore.setState((current) => ({ finalSetSelections: { ...current.finalSetSelections, [scope]: { ...current.finalSetSelections[scope], [slot]: normalized } } }))
+}
+
+async function readFinalSetSelections(): Promise<FinalSetSelections> {
+  const selections: FinalSetSelections = Object.create(null)
+  for (const row of await finalSetSelectionsDb.getAll()) (selections[row.scope] ??= {})[row.slot] = row.selection
+  return normalizeFinalSetSelections(selections)
+}
+
 export function mergePersistedState(persistedState: unknown, currentState: AppState): AppState {
   if (!persistedState || typeof persistedState !== 'object') return currentState
 
@@ -815,6 +847,9 @@ interface AppState {
   saveImageReview: (rootImageId: string, imageId: string, status: ImageResultReview['status'], note: string) => void
   materialCollections: MaterialCollection[]
   referenceLibrary: ReferenceLibraryItem[]
+  referenceLibrarySeed: ReferenceLibrarySeed | null
+  plannerThemePresets: PlannerThemePreset[]
+  finalSetSelections: FinalSetSelections
   generationQueue: GenerationQueueItem[]
   generationQueuePaused: boolean
   generationQueueConcurrency: 1 | 2
@@ -936,6 +971,8 @@ interface AppState {
 }
 
 function isImageReferencedByState(state: AppState, imageId: string) {
+  if (collectFinalSetImageIds(state.finalSetSelections).has(imageId)) return true
+  if (state.referenceLibrarySeed?.imageId === imageId) return true
   if (collectWorkflowImageIds(state.referenceLibrary, state.generationQueue).has(imageId)) return true
   if (collectMaterialImageIds(state.materialCollections).has(imageId)) return true
   if (state.imageFinalSelections[imageId] || Object.values(state.imageFinalSelections).includes(imageId)) return true
@@ -1337,6 +1374,9 @@ export const useStore = create<AppState>()(
       })),
       materialCollections: [],
       referenceLibrary: [],
+      referenceLibrarySeed: null,
+      plannerThemePresets: [],
+      finalSetSelections: {},
       generationQueue: [],
       generationQueuePaused: true,
       generationQueueConcurrency: 1,
@@ -2069,8 +2109,10 @@ export async function initStore() {
   const materialCollections = await getAllMaterialCollections()
   const referenceLibrary = await referenceLibraryDb.getAll()
   const generationQueue = await generationQueueDb.getAll()
+  const plannerThemePresets = (await plannerThemePresetsDb.getAll()).map(normalizePlannerThemePreset).filter((row): row is PlannerThemePreset => !!row)
+  const finalSetSelections = await readFinalSetSelections()
   void referenceAnalysisCache.prune().catch(() => { /* Cache cleanup must not block existing local work. */ })
-  useStore.setState({ materialCollections, referenceLibrary, generationQueue, generationQueuePaused: true })
+  useStore.setState({ materialCollections, referenceLibrary, plannerThemePresets, finalSetSelections, generationQueue, generationQueuePaused: true })
   const { tasks, restoredQueue } = await withGenerationQueueRecovery(async () => {
     const fresh = await getAllTasks()
     const { tasks, interruptedTasks } = markInterruptedOpenAIRunningTasks(fresh)
@@ -2109,6 +2151,7 @@ export async function initStore() {
   const referencedIds = collectPlannerImageReferences(plannerSessions, useStore.getState().settings)
   for (const id of collectMaterialImageIds(materialCollections)) referencedIds.add(id)
   for (const id of collectWorkflowImageIds(referenceLibrary, generationQueue)) referencedIds.add(id)
+  for (const id of collectFinalSetImageIds(finalSetSelections)) referencedIds.add(id)
   for (const [root, selected] of Object.entries(useStore.getState().imageFinalSelections)) { referencedIds.add(root); referencedIds.add(selected) }
   const state = useStore.getState()
   const persistedInputImages = state.inputImages
@@ -2822,6 +2865,7 @@ async function addPlannerReferencedImageIds(target: Set<string>) {
   for (const id of collectPlannerImageReferences(sessions, useStore.getState().settings)) target.add(id)
   for (const id of collectMaterialImageIds(await getAllMaterialCollections())) target.add(id)
   for (const id of collectWorkflowImageIds(await referenceLibraryDb.getAll(), await generationQueueDb.getAll())) target.add(id)
+  for (const id of collectFinalSetImageIds(await readFinalSetSelections())) target.add(id)
   for (const [root, selected] of Object.entries(useStore.getState().imageFinalSelections)) { target.add(root); target.add(selected) }
 }
 
@@ -4663,8 +4707,10 @@ export async function clearData(options: ClearOptions = { clearConfig: true, cle
     await referenceAnalysisCache.clear()
     await dbClearMaterialCollections()
     await referenceLibraryDb.clear()
+    await plannerThemePresetsDb.clear()
+    await finalSetSelectionsDb.clear()
     await generationQueueDb.clear()
-    useStore.setState({ referenceLibrary: [], generationQueue: [], generationQueueReady: true })
+    useStore.setState({ referenceLibrary: [], referenceLibrarySeed: null, plannerThemePresets: [], finalSetSelections: {}, generationQueue: [], generationQueueReady: true })
     useStore.setState({ materialCollections: [], imageResultReviews: {}, imageFinalSelections: {}, referenceImageUsages: {}, reviewImageId: null, materialCollectionDraft: null })
     await dbClearTasks()
     await dbClearAmazonPlannerSessions()
@@ -4882,6 +4928,8 @@ export async function exportData(options: ExportOptions = { exportConfig: true, 
       manifest.amazonPlannerSessions = amazonPlannerSessions
       manifest.materialCollections = materialCollections
       manifest.referenceLibrary = referenceLibrary
+      manifest.plannerThemePresets = (await plannerThemePresetsDb.getAll()).map(normalizePlannerThemePreset).filter((row): row is PlannerThemePreset => !!row)
+      manifest.finalSetSelections = await readFinalSetSelections()
       manifest.generationQueue = generationQueue
       manifest.imageResultReviews = useStore.getState().imageResultReviews
       manifest.imageFinalSelections = useStore.getState().imageFinalSelections
@@ -4975,6 +5023,8 @@ export async function importData(file: File, options: ImportOptions = { importCo
         if (collection && typeof collection.id === 'string' && Array.isArray(collection.versions)) await putMaterialCollection(collection)
       }
       for (const item of data.referenceLibrary ?? []) if (item?.id && item.imageId && Array.isArray(item.analyses)) await referenceLibraryDb.put(item)
+      for (const raw of Array.isArray(data.plannerThemePresets) ? data.plannerThemePresets : []) { const item = normalizePlannerThemePreset(raw); if (item) await plannerThemePresetsDb.put(item) }
+      for (const [scope, rows] of Object.entries(normalizeFinalSetSelections(data.finalSetSelections))) for (const [slot, selection] of Object.entries(rows)) await finalSetSelectionsDb.put(scope, slot, selection)
       for (const item of data.generationQueue ?? []) if (item?.id && item.request?.prompt && Array.isArray(item.request.inputImageIds)) {
         await generationQueueDb.put({ ...item, status: item.status === 'running' ? 'interrupted' : item.status, error: item.status === 'running' ? '备份中的任务执行状态未知，请核对后重试' : item.error })
       }
@@ -4982,7 +5032,7 @@ export async function importData(file: File, options: ImportOptions = { importCo
         imageResultReviews: { ...state.imageResultReviews, ...normalizeImageResultReviews(data.imageResultReviews) },
         imageFinalSelections: { ...state.imageFinalSelections, ...normalizeImageSelections(data.imageFinalSelections) },
       }))
-      useStore.setState({ materialCollections: await getAllMaterialCollections(), referenceLibrary: await referenceLibraryDb.getAll(), generationQueue: await generationQueueDb.getAll(), generationQueuePaused: true })
+      useStore.setState({ materialCollections: await getAllMaterialCollections(), referenceLibrary: await referenceLibraryDb.getAll(), plannerThemePresets: await plannerThemePresetsDb.getAll(), finalSetSelections: await readFinalSetSelections(), generationQueue: await generationQueueDb.getAll(), generationQueuePaused: true })
 
       const tasks = await getAllTasks()
       useStore.getState().setTasks(tasks)

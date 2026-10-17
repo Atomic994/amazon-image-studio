@@ -76,6 +76,10 @@ import { plannerContextForSlot, plannerStyleInstructions, upgradePlannerContextB
 import ProductContextPanel from './ProductContextPanel'
 import ReferenceLibraryModal, { type ReferenceLibrarySeed } from './ReferenceLibraryModal'
 import PlannerGenerationDialog from './PlannerGenerationDialog'
+import PlannerThemeModal, { type AppliedPlannerTheme } from './PlannerThemeModal'
+import FinalSetOverviewModal from './FinalSetOverviewModal'
+import { finalSetScope } from '../lib/finalSets'
+import { hasPlannerTheme, normalizePlannerTheme, plannerThemeContract } from '../lib/plannerThemes'
 import PlannerCreativeModal from './PlannerCreativeModal'
 import { buildPlannerGenerationSpec } from '../lib/plannerGeneration'
 import { enqueueGenerationRequests } from '../lib/generationQueueRunner'
@@ -476,6 +480,9 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   const [contextEpoch, setContextEpoch] = useState(0)
   const contextEpochRef = useRef(0)
   const [referenceLibrary, setReferenceLibrary] = useState<{ seed?: ReferenceLibrarySeed } | null>(null)
+  const [themeSettings, setThemeSettings] = useState(() => normalizePlannerTheme())
+  const [showThemePresets, setShowThemePresets] = useState(false)
+  const [finalOverview, setFinalOverview] = useState<AmazonPlannerSession | null>(null)
   const [generationDialog, setGenerationDialog] = useState<'inspect' | 'queue' | null>(null)
   const [creativeTarget, setCreativeTarget] = useState<string | null>(null)
   const [isCreativePlanning, setIsCreativePlanning] = useState(false)
@@ -555,7 +562,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       marketplaceId,
       selectedVisualStyle: usesStyleReferenceForActivePlan ? selectedVisualStyle : null,
     }) : ''
-  const activePrompt = baseActivePrompt ? appendProductFactsContract(baseActivePrompt, activeFacts) : ''
+  const activePrompt = baseActivePrompt ? appendProductFactsContract([baseActivePrompt, plannerThemeContract({ themeSettings, draft }, activeSlot)].filter(Boolean).join('\n\n'), activeFacts) : ''
   const activePlanMarkdown = plannerMode === 'aplus' ? selectedAPlusPlan?.planMarkdown ?? '' : selectedPlan?.planMarkdown ?? ''
   const activePlanPreview = activePlanMarkdown
     ? [
@@ -886,6 +893,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
           : null
       ),
       styleDensityMode: overrides.styleDensityMode ?? styleDensityMode,
+      themeSettings: normalizePlannerTheme(overrides.themeSettings ?? themeSettings),
+      sourceCollection: hasOverride('sourceCollection') ? overrides.sourceCollection : existing?.sourceCollection,
       imagePlans: overrides.imagePlans ?? imagePlans,
       aPlusPlans: overrides.aPlusPlans ?? aPlusPlansWithSizes,
       selectedPlanIndex: hasOverride('selectedPlanIndex') ? overrides.selectedPlanIndex ?? null : selectedPlanIndex,
@@ -1588,6 +1597,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       ...latestSession,
       id: createPlannerSessionId(),
       createdAt: Date.now(),
+      sourceCollection: undefined,
       listingText: latestSession.listingText,
       mode: result.mode,
       marketplaceId: visibleMarketplaceId,
@@ -1865,6 +1875,16 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     updateCurrentPlannerSession({ styleDensityMode: mode })
   }
 
+  const applyThemePreset = async (preset: AppliedPlannerTheme) => {
+    const snapshot = plannerSnapshotRef.current()
+    const nextDraft = { ...snapshot.draft, scene: preset.scene }
+    const nextTheme = normalizePlannerTheme(preset.themeSettings)
+    const session = await savePlannerSession({ ...snapshot, themeSettings: nextTheme, draft: nextDraft, styleDensityMode: preset.density })
+    setThemeSettings(nextTheme); setDraft(fromSessionDraft(nextDraft)); setStyleDensityMode(preset.density)
+    upsertPlannerSessionList(session)
+    showToast('主题与场景已应用，已有方案的变化会显示在复核提示中', 'success')
+  }
+
   const selectPlan = (index: number) => {
     const plan = imagePlans[index]
     setSelectedPlanIndex(plan ? index : null)
@@ -1990,6 +2010,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     setContextEpoch(++contextEpochRef.current)
     setProductFacts(emptyProductFactsState())
     setReferenceAnalyses({})
+    setThemeSettings(normalizePlannerTheme()); setShowThemePresets(false); setFinalOverview(null)
     setAnalysisTarget(null)
     setModuleVersions({}); setSelectedModuleVersions({})
     setListingText('')
@@ -2013,6 +2034,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
 
   const restorePlannerSession = async (savedSession: AmazonPlannerSession) => {
     const session = upgradePlannerContextBaseline(savedSession)
+    setShowThemePresets(false); setFinalOverview(null)
     stopCreativePlanning()
     setCreativeTarget(null)
     setGenerationDialog(null); setReferenceLibrary(null)
@@ -2177,6 +2199,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       showToast(`历史参考图只恢复了 ${restoredReferences.length}/${session.referenceImageIds.length} 张，缺失原图请重新上传`, 'info')
     }
     setDraft(fromSessionDraft(session.draft))
+    setThemeSettings(normalizePlannerTheme(session.themeSettings))
     setProductFacts(normalizeProductFactsState(session.productFacts))
     setReferenceAnalyses(session.referenceAnalyses ?? {})
     setSeriesStyleGuides(session.seriesStyleGuides)
@@ -2303,6 +2326,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   return (
     <>
     {referenceLibrary && isActive && <ReferenceLibraryModal seed={referenceLibrary.seed} slots={plannerMode === 'aplus' ? aPlusSpecs : getAmazonListingImageSlots(listingImageCount).map((slot) => ({ slot, label: imagePlans.find((plan) => plan.slot === slot)?.label || slot }))} onUse={useLibraryReferences} onClose={() => setReferenceLibrary(null)} />}
+    {showThemePresets && isActive && <PlannerThemeModal session={createPlannerSessionSnapshot()} onApply={applyThemePreset} onClose={() => setShowThemePresets(false)} />}
+    {finalOverview && isActive && <FinalSetOverviewModal session={finalOverview} scope={finalSetScope(finalOverview)} title={finalOverview.title} onClose={() => setFinalOverview(null)} />}
     {generationDialog && isActive && <PlannerGenerationDialog mode={generationDialog} specs={generationSpecs} activeSlot={activeSlot} busy={isRevising} log={revisionLog.state}
       onCopyLog={() => void copyTextToClipboard(formatPlannerLogForCopy(revisionLog.state)).catch(() => showToast('复制日志失败', 'error'))}
       onStop={stopModuleRevision} onSubmit={submitPlannerSlots} onClose={() => setGenerationDialog(null)}
@@ -2375,6 +2400,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <button type="button" onClick={collectPlanner} disabled={!imagePlans.length && !aPlusPlans.length} className="ios-button inline-flex h-10 items-center gap-2 bg-[hsl(var(--muted))] px-3 text-sm font-medium text-gray-700 disabled:opacity-40 dark:text-gray-200">收藏整套素材</button>
+            <button type="button" onClick={() => setFinalOverview(plannerSnapshotRef.current())} disabled={!(plannerMode === 'aplus' ? aPlusPlans.length : imagePlans.length) || isPlanning || isRevising || isCreativePlanning} className="ios-button h-10 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 disabled:opacity-40 dark:bg-emerald-500/10 dark:text-emerald-300">整套最终稿总览</button>
+            <button type="button" onClick={() => setShowThemePresets(true)} disabled={isPlanning || isRevising || isCreativePlanning} className="ios-button h-10 bg-[hsl(var(--muted))] px-3 text-sm font-medium text-gray-700 disabled:opacity-40 dark:text-gray-200">主题 / 场景预设{hasPlannerTheme(themeSettings) ? ' · 已应用' : ''}</button>
             <button type="button" onClick={() => { setStylePreview(null); setGenerationDialog('queue') }} disabled={!(plannerMode === 'aplus' ? aPlusPlans.length : imagePlans.length) || isPlanning || isRevising || isCreativePlanning || isAnalyzing} className="ios-button h-10 bg-blue-50 px-3 text-sm font-medium text-blue-700 disabled:opacity-40 dark:bg-blue-500/10 dark:text-blue-300">整套生成</button>
             <button type="button" onClick={() => useStore.setState({ generationQueueOpen: true })} className="ios-button h-10 bg-[hsl(var(--muted))] px-3 text-sm text-gray-700 dark:text-gray-200">生成队列{generationQueue.some((item) => ['queued', 'running'].includes(item.status)) ? `（${generationQueue.filter((item) => ['queued', 'running'].includes(item.status)).length}）` : ''}</button>
             <label className="inline-flex h-10 items-center gap-2 rounded-[var(--ios-radius-md)] bg-[hsl(var(--muted))] px-3 text-sm font-medium text-gray-600 dark:text-gray-300">

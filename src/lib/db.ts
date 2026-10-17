@@ -1,8 +1,8 @@
-import type { AmazonPlannerSession, GenerationQueueItem, MaterialCollection, ReferenceLibraryItem, ReferenceAnalysisCacheEntry, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
+import type { AmazonPlannerSession, FinalSetSelection, PlannerThemePreset, GenerationQueueItem, MaterialCollection, ReferenceLibraryItem, ReferenceAnalysisCacheEntry, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
 import { sortGenerationQueue } from './generationQueueModel'
 
 const DB_NAME = 'amazon-image-studio'
-const DB_VERSION = 6
+const DB_VERSION = 7
 const STORE_TASKS = 'tasks'
 const STORE_IMAGES = 'images'
 const STORE_THUMBNAILS = 'thumbnails'
@@ -11,6 +11,8 @@ const STORE_MATERIAL_COLLECTIONS = 'materialCollections'
 const STORE_REFERENCE_ANALYSIS_CACHE = 'referenceAnalysisCache'
 const STORE_REFERENCE_LIBRARY = 'referenceLibrary'
 const STORE_GENERATION_QUEUE = 'generationQueue'
+const STORE_PLANNER_THEME_PRESETS = 'plannerThemePresets'
+const STORE_FINAL_SET_SELECTIONS = 'finalSetSelections'
 const THUMBNAIL_MAX_SIZE = 720
 const THUMBNAIL_QUALITY = 0.9
 const THUMBNAIL_VERSION = 2
@@ -40,6 +42,8 @@ function openDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_REFERENCE_ANALYSIS_CACHE)) db.createObjectStore(STORE_REFERENCE_ANALYSIS_CACHE, { keyPath: 'id' })
       if (!db.objectStoreNames.contains(STORE_REFERENCE_LIBRARY)) db.createObjectStore(STORE_REFERENCE_LIBRARY, { keyPath: 'id' })
       if (!db.objectStoreNames.contains(STORE_GENERATION_QUEUE)) db.createObjectStore(STORE_GENERATION_QUEUE, { keyPath: 'id' })
+      if (!db.objectStoreNames.contains(STORE_PLANNER_THEME_PRESETS)) db.createObjectStore(STORE_PLANNER_THEME_PRESETS, { keyPath: 'id' })
+      if (!db.objectStoreNames.contains(STORE_FINAL_SET_SELECTIONS)) db.createObjectStore(STORE_FINAL_SET_SELECTIONS, { keyPath: 'id' })
     }
     req.onsuccess = () => {
       if (blocked) { req.result.close(); return }
@@ -131,6 +135,18 @@ export const referenceLibraryDb = {
   put: (entry: ReferenceLibraryItem) => dbTransaction(STORE_REFERENCE_LIBRARY, 'readwrite', (s) => s.put(entry)),
   remove: (id: string) => dbTransaction(STORE_REFERENCE_LIBRARY, 'readwrite', (s) => s.delete(id)),
   clear: () => dbTransaction(STORE_REFERENCE_LIBRARY, 'readwrite', (s) => s.clear()),
+}
+export const plannerThemePresetsDb = {
+  getAll: (): Promise<PlannerThemePreset[]> => dbTransaction(STORE_PLANNER_THEME_PRESETS, 'readonly', (s) => s.getAll()),
+  put: (entry: PlannerThemePreset) => dbTransaction(STORE_PLANNER_THEME_PRESETS, 'readwrite', (s) => s.put(entry)),
+  remove: (id: string) => dbTransaction(STORE_PLANNER_THEME_PRESETS, 'readwrite', (s) => s.delete(id)),
+  clear: () => dbTransaction(STORE_PLANNER_THEME_PRESETS, 'readwrite', (s) => s.clear()),
+}
+export const finalSetSelectionsDb = {
+  getAll: (): Promise<Array<{ id: string; scope: string; slot: string; selection: FinalSetSelection }>> => dbTransaction(STORE_FINAL_SET_SELECTIONS, 'readonly', (s) => s.getAll()),
+  put: (scope: string, slot: string, selection: FinalSetSelection) => dbTransaction(STORE_FINAL_SET_SELECTIONS, 'readwrite', (s) => s.put({ id: JSON.stringify([scope, slot]), scope, slot, selection })),
+  remove: (scope: string, slot: string) => dbTransaction(STORE_FINAL_SET_SELECTIONS, 'readwrite', (s) => s.delete(JSON.stringify([scope, slot]))),
+  clear: () => dbTransaction(STORE_FINAL_SET_SELECTIONS, 'readwrite', (s) => s.clear()),
 }
 export const generationQueueDb = {
   getAll: (): Promise<GenerationQueueItem[]> => dbTransaction<GenerationQueueItem[]>(STORE_GENERATION_QUEUE, 'readonly', (s) => s.getAll()).then(sortGenerationQueue),

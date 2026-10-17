@@ -62,6 +62,7 @@ export async function buildMaterialDeliveryZip(collection: MaterialCollection, v
     savedVersion: { id: version.id, number: version.versionNumber, createdAt: version.createdAt, note: version.note },
     exportedAt: Date.now(), imageProcessing: options.mode === 'original' && options.format === 'original' ? 'original bytes; no resize or upscaling' : options.mode,
     aPlusCopyFile: copyPlans.length ? 'APlus-copy.md' : undefined,
+    finalSet: version.finalSet ? { scope: version.finalSet.scope, expectedSlots: version.finalSet.expectedSlots, missingSlots: version.finalSet.missingSlots, confirmedAt: version.finalSet.confirmedAt } : undefined,
     planner: version.plannerSession ? { mode: version.plannerSession.mode, marketplaceId: version.plannerSession.marketplaceId, productFacts: factsSnapshot(confirmedProductFacts(version.plannerSession.productFacts)) } : undefined,
     images,
   }

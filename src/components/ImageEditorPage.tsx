@@ -4,6 +4,7 @@ import { downloadImageIds } from '../lib/downloadImages'
 import { loadImage } from '../lib/canvasImage'
 import { createProtectedEditGuide, validateProtectedEditInputs } from '../lib/localEditProtection'
 import MaskEditorModal from './MaskEditorModal'
+import { openOutputInReferenceLibrary } from '../store'
 import { formatPlannerElapsed } from '../lib/plannerRunLog'
 import {
   appendSeedreamQuickAction,
@@ -1104,6 +1105,7 @@ export default function ImageEditorPage() {
                 <div className="grid grid-cols-2 gap-2">
                   <button type="button" onClick={() => setLightboxImageId(outputImageId, latestTask.outputImages)} className="ios-button ios-button-plain h-9 text-sm font-medium">查看</button>
                   <button type="button" onClick={() => void downloadImageIds([outputImageId], `image-edit-${latestTask.id}`)} className="ios-button ios-button-plain flex h-9 items-center justify-center gap-2 text-sm font-medium"><DownloadIcon className="h-4 w-4" />下载</button>
+                  <button type="button" onClick={() => openOutputInReferenceLibrary(outputImageId, latestTask.category)} className="ios-button ios-button-plain h-9 px-3 text-sm font-medium">存入参考图库</button>
                 </div>
               </div>
             </div>

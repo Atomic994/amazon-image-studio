@@ -14,9 +14,20 @@ vi.mock('./lib/db', () => {
   const analysisCache = new Map<string, import('./types').ReferenceAnalysisCacheEntry>()
   const library = new Map<string, import('./types').ReferenceLibraryItem>()
   const queue = new Map<string, import('./types').GenerationQueueItem>()
+  const themes = new Map<string, import('./types').PlannerThemePreset>()
+  const finalSets = new Map<string, { id: string; scope: string; slot: string; selection: import('./types').FinalSetSelection }>()
 
   return {
     CURRENT_THUMBNAIL_VERSION: 2,
+    plannerThemePresetsDb: {
+      getAll: async () => [...themes.values()], put: async (item: import('./types').PlannerThemePreset) => { themes.set(item.id, item) },
+      remove: async (id: string) => { themes.delete(id) }, clear: async () => { themes.clear() },
+    },
+    finalSetSelectionsDb: {
+      getAll: async () => [...finalSets.values()],
+      put: async (scope: string, slot: string, selection: import('./types').FinalSetSelection) => { const id = JSON.stringify([scope, slot]); finalSets.set(id, { id, scope, slot, selection }) },
+      remove: async (scope: string, slot: string) => { finalSets.delete(JSON.stringify([scope, slot])) }, clear: async () => { finalSets.clear() },
+    },
     referenceLibraryDb: {
       getAll: async () => [...library.values()], put: async (item: import('./types').ReferenceLibraryItem) => { library.set(item.id, item) },
       remove: async (id: string) => { library.delete(id) }, clear: async () => { library.clear() },
@@ -116,7 +127,7 @@ vi.mock('./lib/agentApi', () => ({
     }
   }),
 }))
-import { clearAmazonPlannerSessions, clearMaterialCollections, clearImages, clearTasks as clearStoredTasks, getAllAmazonPlannerSessions, getImage, putAmazonPlannerSession, putImage, putTask, referenceLibraryDb, generationQueueDb } from './lib/db'
+import { clearAmazonPlannerSessions, clearMaterialCollections, clearImages, clearTasks as clearStoredTasks, getAllAmazonPlannerSessions, getImage, putAmazonPlannerSession, putImage, putTask, referenceLibraryDb, generationQueueDb, plannerThemePresetsDb, finalSetSelectionsDb } from './lib/db'
 import { materialItemFromTask } from './lib/materialCollections'
 import { confirmProductFacts, emptyProductFactsState } from './lib/productFacts'
 import { normalizeReferenceAnalysis } from './lib/referenceAnalysis'
@@ -129,6 +140,8 @@ import { stopImageTask } from './store'
 import * as falImageApi from './lib/falAiImageApi'
 import * as localEdit from './lib/localEditProtection'
 import * as customImageApi from './lib/openaiCompatibleImageApi'
+import { openOutputInReferenceLibrary, saveFinalSetSelection } from './store'
+import { BUILTIN_PLANNER_THEMES, createPlannerThemePreset } from './lib/plannerThemes'
 import { callAgentResponsesApi, callBatchImageSingle } from './lib/agentApi'
 import { callImageApi } from './lib/api'
 import { cleanStaleAgentInputDrafts, clearData, deleteImageIfUnreferenced, editOutputs, ensureImageCached, exportData, getErrorToastMessage, getPersistedState, getTaskApiProfile, importData, initStore, markInterruptedOpenAIRunningTasks, mergePersistedState, openSeedreamTaskInEditor, regenerateAgentAssistantMessage, removeTask, resolveInputImagesForRequest, retryTask, reuseConfig, submitAgentMessage, submitTask, submitTaskWithInput, useStore } from './store'
@@ -137,6 +150,8 @@ const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
 const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
 
 beforeEach(async () => {
+  await plannerThemePresetsDb.clear(); await finalSetSelectionsDb.clear()
+  useStore.setState({ plannerThemePresets: [], finalSetSelections: {}, referenceLibrarySeed: null })
   await clearMaterialCollections()
   await referenceLibraryDb.clear(); await generationQueueDb.clear()
   useStore.setState({ referenceLibrary: [], generationQueue: [], generationQueuePaused: true, generationQueueReady: false, generationQueueOpen: false, generationQueueMessage: '' })
@@ -400,6 +415,26 @@ describe('local material and review persistence', () => {
     expect(await getImage('original-facts-source')).toBeDefined()
   })
 
+  it('retains confirmed final originals, masks and reference provenance after deleting a task and restarting', async () => {
+    for (const id of ['final-output', 'final-reference', 'final-mask']) await putImage({ id, dataUrl: `data:image/png;base64,${id}`, createdAt: 1 })
+    const generated = task({ id: 'final-task', outputImages: ['final-output'], inputImageIds: ['final-reference'], localEditProtection: { version: 1, baseImageId: 'final-reference', maskImageId: 'final-mask', baseHash: 'base', maskHash: 'mask' } })
+    useStore.setState({ tasks: [generated] }); await putTask(generated)
+    const item = materialItemFromTask(generated, 'final-output')
+    await saveFinalSetSelection('planner:one:listing', 'MAIN', { imageId: 'final-output', contextFingerprint: 'submitted-context', confirmedAt: 1, item }, 'Checked')
+    await removeTask(generated); await initStore()
+    expect(useStore.getState().finalSetSelections['planner:one:listing'].MAIN.item?.localEditProtection?.maskImageId).toBe('final-mask')
+    for (const id of ['final-output', 'final-reference', 'final-mask']) { await deleteImageIfUnreferenced(id); expect(await getImage(id)).toBeDefined() }
+    await expect(saveFinalSetSelection('planner:one:listing', 'PT01', { imageId: 'not-present', contextFingerprint: 'context', confirmedAt: 2 }, '')).rejects.toThrow('已不存在')
+  })
+
+  it('keeps the selected slot as reference provenance when identical pixels were generated for different slots', () => {
+    const main = task({ id: 'main', outputImages: ['same-image'], category: { plannerSessionId: 'suite', amazonSlot: 'MAIN', plannerModuleVersionId: 'main-plan' } })
+    const detail = task({ id: 'detail', outputImages: ['same-image'], category: { plannerSessionId: 'suite', amazonSlot: 'PT01', plannerModuleVersionId: 'detail-plan' } })
+    useStore.setState({ tasks: [detail, main] })
+    openOutputInReferenceLibrary('same-image', main.category)
+    expect(useStore.getState().referenceLibrarySeed).toMatchObject({ usage: { purpose: 'composition' }, analyses: [], origin: { taskId: 'main', slot: 'MAIN' } })
+  })
+
   it('remaps explicit references after scope filtering and rejects references excluded from the current slot', async () => {
     const refs = ['scope-product', 'scope-excluded', 'scope-style'].map((id) => ({ id, dataUrl: `data:image/png;base64,${id}` }))
     for (const image of refs) await putImage({ ...image, createdAt: 1 })
@@ -418,6 +453,7 @@ describe('local material and review persistence', () => {
   })
 
   it('round-trips collections, review choices and images through a backup without API credentials', async () => {
+    const theme = createPlannerThemePreset({ ...BUILTIN_PLANNER_THEMES[0], title: 'Saved home scene' }); await plannerThemePresetsDb.put(theme)
     for (const id of ['backup-output', 'backup-ref']) await putImage({ id, dataUrl: 'data:image/png;base64,YQ==', createdAt: Date.now() })
     const draft = emptyProductFactsState(); draft.draft.productName = 'Portable lamp'
     const facts = confirmProductFacts(draft, 'source', ['backup-ref'])
@@ -429,6 +465,7 @@ describe('local material and review persistence', () => {
     await generationQueueDb.putMany(queue)
     const saved = await saveMaterialCollection({ title: 'Portable set', items: [materialItemFromTask(savedTask, 'backup-output')], plannerSession: amazonPlannerSession({ referenceImageIds: ['backup-ref'], productFacts: facts, referenceAnalyses: { 'backup-ref': analysis } }) })
     useStore.getState().saveImageReview('backup-output', 'backup-output', 'approved', 'Keep it')
+    await saveFinalSetSelection('planner:portable:listing', 'MAIN', { imageId: 'backup-output', contextFingerprint: 'portable-context', confirmedAt: 1, item: materialItemFromTask(savedTask, 'backup-output') }, 'Keep it')
     vi.stubGlobal('document', { createElement: () => ({ href: '', download: '', click: vi.fn() }) })
     const objectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:local-backup')
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
@@ -438,9 +475,11 @@ describe('local material and review persistence', () => {
     const manifest = JSON.parse(strFromU8(unzipSync(new Uint8Array(bytes))['manifest.json'])) as ExportData
     expect(manifest.settings).toBeUndefined()
     expect(manifest.materialCollections?.[0].id).toBe(saved.id)
+    expect(manifest.plannerThemePresets?.[0].title).toBe('Saved home scene')
+    expect(manifest.finalSetSelections?.['planner:portable:listing'].MAIN.imageId).toBe('backup-output')
     expect(manifest.referenceLibrary?.[0].title).toBe('Portable input'); expect(manifest.generationQueue?.[0].id).toBe(queue[0].id)
     expect(JSON.stringify(manifest)).not.toContain(profile.apiKey)
-    await clearMaterialCollections(); await clearImages(); await referenceLibraryDb.clear(); await generationQueueDb.clear()
+    await clearMaterialCollections(); await clearImages(); await referenceLibraryDb.clear(); await generationQueueDb.clear(); await plannerThemePresetsDb.clear(); await finalSetSelectionsDb.clear()
     useStore.setState({ materialCollections: [], imageResultReviews: {}, imageFinalSelections: {} })
     expect(await importData({ arrayBuffer: async () => bytes } as File, { importConfig: false, importTasks: true })).toBe(true)
     expect(useStore.getState().materialCollections[0].versions[0].plannerSession?.referenceImageIds).toEqual(['backup-ref'])
@@ -452,6 +491,8 @@ describe('local material and review persistence', () => {
     expect(await getImage('backup-ref')).toBeDefined()
     expect(useStore.getState().referenceLibrary[0].analyses[0].analysis.summary).toBe('Round base')
     expect(useStore.getState().generationQueue[0].status).toBe('queued'); expect(useStore.getState().generationQueuePaused).toBe(true)
+    expect(useStore.getState().plannerThemePresets[0].themeSettings).toEqual(theme.themeSettings)
+    expect(useStore.getState().finalSetSelections['planner:portable:listing'].MAIN.item?.referenceImageIds).toEqual(['backup-ref'])
   })
 })
 

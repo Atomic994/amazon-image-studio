@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { DEFAULT_PARAMS } from '../types'
-import { openImageInSeedreamEditor, useStore } from '../store'
+import { openImageInSeedreamEditor, openOutputInReferenceLibrary, useStore } from '../store'
 import { buildImageVersionHistory } from '../lib/imageVersions'
 import { materialItemFromTask } from '../lib/materialCollections'
 import { localId } from '../lib/localId'
@@ -82,6 +82,7 @@ export default function ImageVersionReviewModal() {
       <div className="mt-3 flex flex-wrap gap-2">{versions.map((version) => <button key={version.imageId} type="button" aria-pressed={version.imageId === current.imageId} onClick={() => setRightId(version.imageId)} className={`${BUTTON} ${version.imageId === current.imageId ? 'ring-2 ring-blue-400/50' : ''}`}>{versionLabel(version.imageId)}{reviews[version.imageId]?.status === 'changes-requested' ? ' · 待修改' : ''}</button>)}</div>
       <label className="mt-4 block text-xs font-medium text-gray-600 dark:text-gray-300">审核意见 / 下一次编辑要求<textarea aria-label="图片版本审核意见" value={note} onChange={(event) => setNote(event.target.value)} rows={2} maxLength={4000} placeholder="例如：保留构图，修正商品颜色和文字。" className="mt-2 w-full rounded-xl border border-gray-200 bg-white p-3 text-sm dark:border-white/[0.1] dark:bg-gray-950 dark:text-gray-100" /></label>
       <div className="mt-3 flex flex-wrap gap-2"><button type="button" onClick={() => save('approved')} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white">通过并设为最终稿</button><button type="button" onClick={() => save('changes-requested')} className={BUTTON}>标记需要修改</button><button type="button" onClick={() => save(reviews[current.imageId]?.status ?? 'pending')} className={BUTTON}>保存意见</button><button type="button" onClick={edit} className={BUTTON}>编辑当前版本</button><button type="button" onClick={collect} className={BUTTON}>收藏当前版本</button></div>
+      <button type="button" onClick={() => { openOutputInReferenceLibrary(current.imageId, current.task?.category ?? saved?.item.category); close() }} className={`${BUTTON} mt-3`}>存入参考图库</button>
       <details className="mt-4 text-xs text-gray-500"><summary className="cursor-pointer">查看本版本提示词与生成时间</summary><p className="mt-2">{current.createdAt ? new Date(current.createdAt).toLocaleString('zh-CN') : saved ? `收藏时间：${new Date(saved.createdAt).toLocaleString('zh-CN')}` : '原始图片（生成记录未保留）'}</p><pre className="mt-2 whitespace-pre-wrap break-words">{current.task?.imageEditContext?.userInstruction || current.task?.prompt || saved?.item.prompt || '原始图片，无生成提示词。'}</pre></details>
     </div>
   </Sheet>, document.body)

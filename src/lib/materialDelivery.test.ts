@@ -9,6 +9,13 @@ import { confirmProductFacts, emptyProductFactsState } from './productFacts'
 const item = (id: string, slot = 'MAIN'): MaterialCollectionItem => ({ id, imageId: id, label: 'Product', slot, params: { ...DEFAULT_PARAMS }, referenceImageIds: ['private-source'], prompt: 'A product photograph' })
 const readImage = async (id: string) => ({ id, dataUrl: 'data:image/png;base64,YWJj', width: 1024, height: 1024 })
 describe('single material version delivery ZIP', () => {
+  it('exports only confirmed final outputs and explicitly records missing slots', async () => {
+    const finalSet = { scope: 'planner:set:listing', expectedSlots: ['MAIN', 'PT01'], missingSlots: ['PT01'], confirmedAt: 10 }
+    const collection = appendMaterialCollectionVersion({ title: 'Confirmed outputs', items: [item('selected')], finalSet })
+    const result = await buildMaterialDeliveryZip(collection, collection.versions[0].id, readImage)
+    const manifest = JSON.parse(strFromU8(unzipSync(result.bytes)['manifest.json']))
+    expect(manifest.finalSet).toEqual(finalSet); expect(manifest.images.map((row: { imageId: string }) => row.imageId)).toEqual(['selected'])
+  })
   it('packages only the selected version with product, slot and set version names; preserves bytes', async () => {
     let collection = appendMaterialCollectionVersion({ title: 'Desk Lamp', items: [item('old')] })
     collection = appendMaterialCollectionVersion({ title: 'Desk Lamp', items: [item('new', 'PT01')] }, collection)
