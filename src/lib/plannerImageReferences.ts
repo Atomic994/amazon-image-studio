@@ -4,6 +4,7 @@ export function collectPlannerImageReferences(sessions: AmazonPlannerSession[], 
   const ids = new Set<string>()
   const add = (id: unknown) => { if (typeof id === 'string' && id.trim()) ids.add(id) }
   for (const session of sessions) {
+    for (const product of session.productComposition?.products ?? []) for (const id of product.imageIds) add(id)
     for (const id of session.referenceImageIds ?? []) add(id)
     for (const version of session.productFacts?.versions ?? []) for (const id of version.sourceImageIds ?? []) add(id)
     for (const analysis of Object.values(session.referenceAnalyses ?? {})) add(analysis.imageId)

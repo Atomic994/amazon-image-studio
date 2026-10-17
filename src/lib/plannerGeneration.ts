@@ -2,13 +2,15 @@ import type { AmazonPlannerSession, ApiProfile, GenerationQueueRequest, Referenc
 import { DEFAULT_PARAMS } from '../types'
 import { appendProductFactsContract, confirmedProductFacts, contextFingerprint } from './productFacts'
 import { analysisMatchesInputs, plannerContextChangeReasons } from './referenceAnalysis'
-import { REFERENCE_PURPOSE_LABELS, normalizeReferenceUsage, referenceAppliesToSlot } from './referenceImageUsage'
+import { REFERENCE_PURPOSE_LABELS } from './referenceImageUsage'
 import { buildAmazonAPlusPlanPrompt, buildAmazonPlanPrompt, isAmazonListingMainSlot } from './listingPlanner'
 import { plannerModuleKey } from './plannerModuleVersions'
 import { plannerContextForSlot, plannerVisualStyle } from './plannerContext'
 export { plannerVisualStyle } from './plannerContext'
 import { canApiProfileGenerateImages, validateApiProfile } from './apiProfiles'
 import { plannerThemeContract } from './plannerThemes'
+import { categoryRuleContract, categoryRuleErrors } from './categoryRules'
+import { plannerReferenceIds, plannerReferenceUsage, productCompositionContract, productCompositionErrors } from './productComposition'
 
 export interface PlannerGenerationSpec {
   slot: string; label: string; versionLabel: string; prompt: string; size: string; stale: boolean
@@ -25,18 +27,19 @@ export function buildPlannerGenerationSpec(session: AmazonPlannerSession, slot: 
   if (!plan) throw new Error(`图片位 ${slot} 已不存在，请重新选择`)
   const main = session.mode === 'listing' && isAmazonListingMainSlot(slot)
   const styleId = !main ? session.selectedStyleReferenceImageId : undefined
-  const ids = session.referenceImageIds.filter((id) => referenceAppliesToSlot(session.referenceImageUsages?.[id], slot))
+  const ids = plannerReferenceIds(session, slot)
   const excludedIds = session.referenceImageIds.filter((id) => !ids.includes(id))
   if (styleId && !ids.includes(styleId)) ids.push(styleId)
-  const usages = Object.fromEntries(ids.filter((id) => id !== styleId).map((id) => [id, normalizeReferenceUsage(session.referenceImageUsages?.[id])]))
+  const usages = Object.fromEntries(ids.filter((id) => id !== styleId).map((id) => [id, plannerReferenceUsage(session, id)]))
   const analyses = Object.fromEntries(Object.entries(session.referenceAnalyses ?? {}).filter(([id, value]) => ids.includes(id) && id !== styleId && analysisMatchesInputs(value, id, usages[id])))
   const facts = confirmedProductFacts(session.productFacts)
   const key = plannerModuleKey(session.mode, slot)
   const version = session.moduleVersions?.[key]?.find((item) => item.id === session.selectedModuleVersions?.[key])
   const options = { ...plan, seriesStyleGuide: main ? null : session.seriesStyleGuides[session.mode], styleReferenceAttached: !!styleId, styleDensityMode: session.styleDensityMode, marketplaceId: session.marketplaceId, selectedVisualStyle: styleId ? plannerVisualStyle(session) : null }
-  const prompt = appendProductFactsContract([session.mode === 'aplus' ? buildAmazonAPlusPlanPrompt(options) : buildAmazonPlanPrompt(options), plannerThemeContract(session, slot)].filter(Boolean).join('\n\n'), facts)
+  const prompt = appendProductFactsContract([session.mode === 'aplus' ? buildAmazonAPlusPlanPrompt(options) : buildAmazonPlanPrompt(options), plannerThemeContract(session, slot), categoryRuleContract(session.categoryRule, session.mode === 'aplus' ? 'aplus' : 'image'), productCompositionContract(session, ids, slot)].filter(Boolean).join('\n\n'), facts)
   const size = session.mode === 'aplus' ? (plan as AmazonPlannerSession['aPlusPlans'][number]).generationSize : session.resolution === '4k' ? '4096x4096' : '2048x2048'
   const errors: string[] = []
+  errors.push(...categoryRuleErrors(session.categoryRule), ...productCompositionErrors(session, slot))
   const profileError = validateApiProfile(profile)
   if (profileError) errors.push(`生图配置不完整：${profileError}`)
   if (!canApiProfileGenerateImages(profile)) errors.push('当前配置不支持生成图片')
@@ -45,7 +48,7 @@ export function buildPlannerGenerationSpec(session: AmazonPlannerSession, slot: 
   if (!prompt.trim()) errors.push('生图提示词为空')
   const staleReasons = plannerContextChangeReasons(version?.context, plannerContextForSlot(session, slot, analyses))
   const request: GenerationQueueRequest = { apiProfileId: profile.id, profileIdentity: generationProfileIdentity(profile), prompt, inputImageIds: ids,
-    params: { ...DEFAULT_PARAMS, size, n: 1 }, referenceImageUsages: usages, productFactsSnapshot: facts, referenceAnalysisSnapshots: Object.values(analyses),
+    params: { ...DEFAULT_PARAMS, size, n: 1 }, referenceImageUsages: usages, productFactsSnapshot: facts, referenceAnalysisSnapshots: Object.values(analyses), categoryRuleSnapshot: session.categoryRule ? structuredClone(session.categoryRule) : undefined, productCompositionSnapshot: session.productComposition ? structuredClone(session.productComposition) : undefined,
     category: { productTitle: session.draft.productTitle.trim(), workflow: session.mode === 'aplus' ? 'amazon-aplus' : 'amazon-listing', amazonSlot: slot, plannerSessionId: session.id,
       plannerModuleVersionId: version?.id, productFactsVersionId: facts?.id, marketplaceId: session.marketplaceId, ...(session.mode === 'aplus' ? { aPlusType: session.aPlusType } : {}), ...(styleId ? { styleReferenceImageId: styleId } : {}) },
   }

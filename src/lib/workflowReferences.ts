@@ -7,6 +7,7 @@ export function collectWorkflowImageIds(library: ReferenceLibraryItem[], queue: 
     for (const analysis of item.analyses ?? []) ids.add(analysis.imageId)
   }
   for (const item of queue) {
+    for (const product of item.request.productCompositionSnapshot?.products ?? []) for (const id of product.imageIds) ids.add(id)
     for (const id of item.request.inputImageIds) ids.add(id)
     for (const id of item.request.productFactsSnapshot?.sourceImageIds ?? []) ids.add(id)
     for (const analysis of item.request.referenceAnalysisSnapshots ?? []) ids.add(analysis.imageId)

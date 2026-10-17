@@ -17,11 +17,12 @@ import { ChevronLeftIcon, ChevronRightIcon, CloseIcon, CopyIcon } from './icons'
 
 const BUTTON = 'inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-gray-200 bg-white px-2.5 text-xs font-medium text-gray-700 transition hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/[0.08] dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-white/[0.06]'
 
-export default function APlusModulePreviewModal({ modules, initialIndex, profile, onClose }: {
+export default function APlusModulePreviewModal({ modules, initialIndex, profile, onClose, terminologyContext = '' }: {
   modules: PlannerModulePreview[]
   initialIndex: number
   profile: ApiProfile | null
   onClose: () => void
+  terminologyContext?: string
 }) {
   const [index, setIndex] = useState(Math.min(Math.max(0, initialIndex), modules.length - 1))
   const [view, setView] = useState<'source' | 'zh'>('source')
@@ -35,7 +36,8 @@ export default function APlusModulePreviewModal({ modules, initialIndex, profile
   const showToast = useStore((state) => state.showToast)
   const module = modules[index]
   const content = module?.content ?? ''
-  const translationKey = JSON.stringify([content, profile?.provider, profile?.baseUrl, profile?.apiMode, profile?.model])
+  const cacheSource = terminologyContext ? `${content}\n\nCATEGORY TRANSLATION CONTEXT: ${terminologyContext}` : content
+  const translationKey = JSON.stringify([cacheSource, profile?.provider, profile?.baseUrl, profile?.apiMode, profile?.model])
   const translated = translation?.key === translationKey ? translation.text : ''
   const displayed = view === 'zh' && translated ? translated : content
   const { state: log, reset: resetLog, start: startLog, add: addLog, progress: progressLog, finish: finishLog } = useTranslationRunLog()
@@ -53,7 +55,7 @@ export default function APlusModulePreviewModal({ modules, initialIndex, profile
   useEffect(() => {
     controllerRef.current?.abort()
     controllerRef.current = null
-    const cached = profile && content ? previewTranslationCache.get(content, profile, { touch: false }) : undefined
+    const cached = profile && content ? previewTranslationCache.get(cacheSource, profile, { touch: false }) : undefined
     setTranslation(cached ? { key: translationKey, text: cached.text, cached: true } : null)
     resetLog()
     setView('source')
@@ -102,7 +104,7 @@ export default function APlusModulePreviewModal({ modules, initialIndex, profile
         finishLog('success', '已复用本次窗口中的译文，未发起 LLM 请求；浏览器本地缓存不可用。')
         return
       }
-      const cached = previewTranslationCache.get(content, profile)
+      const cached = previewTranslationCache.get(cacheSource, profile)
       if (cached) {
         setTranslation({ key: translationKey, text: cached.text, cached: true })
         setView('zh')
@@ -115,11 +117,11 @@ export default function APlusModulePreviewModal({ modules, initialIndex, profile
     controllerRef.current = controller
     setBusy(true)
     try {
-      const result = await translatePlannerPreviewText({ text: content, profile, signal: controller.signal,
+      const result = await translatePlannerPreviewText({ text: content, terminologyContext, profile, signal: controller.signal,
         onProgress: (progress) => { if (controllerRef.current === controller && !controller.signal.aborted) progressLog(progress) },
       })
       if (controllerRef.current !== controller || controller.signal.aborted) return
-      const cached = previewTranslationCache.put(content, profile, result)
+      const cached = previewTranslationCache.put(cacheSource, profile, result)
       setTranslation({ key: translationKey, text: result, cached })
       setView('zh')
       addLog(cached ? '完整译文已保存到浏览器本地，30 天未使用后自动清理。' : '浏览器本地缓存不可用或空间不足，本次译文仍可在当前窗口查看。', cached ? 'info' : 'warning')
@@ -157,7 +159,7 @@ export default function APlusModulePreviewModal({ modules, initialIndex, profile
       <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-gray-100 px-4 py-2 dark:border-white/[0.08]">
         <div className="ios-segmented inline-flex h-8 items-center p-0.5" role="tablist" aria-label="预览语言">
           <button type="button" role="tab" aria-selected={view === 'source'} onClick={() => setView('source')} className={`ios-segment h-7 px-3 text-xs font-medium ${view === 'source' ? 'text-gray-900 dark:text-white' : 'text-gray-500'}`}>原文</button>
-          <button type="button" role="tab" aria-selected={view === 'zh'} disabled={!translated} onClick={() => { if (busy) { if (profile) previewTranslationCache.get(content, profile); setView('zh') } else void translate() }} className={`ios-segment h-7 px-3 text-xs font-medium disabled:opacity-40 ${view === 'zh' ? 'text-gray-900 dark:text-white' : 'text-gray-500'}`}>中文</button>
+          <button type="button" role="tab" aria-selected={view === 'zh'} disabled={!translated} onClick={() => { if (busy) { if (profile) previewTranslationCache.get(cacheSource, profile); setView('zh') } else void translate() }} className={`ios-segment h-7 px-3 text-xs font-medium disabled:opacity-40 ${view === 'zh' ? 'text-gray-900 dark:text-white' : 'text-gray-500'}`}>中文</button>
         </div>
         <button type="button" onClick={busy ? cancel : () => void translate()} className={BUTTON} title={profile ? `使用 AI 策划模型 ${profile.model}` : '未配置 AI 策划模型'}>{busy ? '停止翻译' : '翻译为中文'}</button>
         {translated && <button type="button" onClick={() => void translate(true)} disabled={busy} className={BUTTON} title="忽略旧缓存重新请求模型，成功后更新缓存">重新翻译</button>}

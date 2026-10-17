@@ -77,6 +77,11 @@ import ProductContextPanel from './ProductContextPanel'
 import ReferenceLibraryModal, { type ReferenceLibrarySeed } from './ReferenceLibraryModal'
 import PlannerGenerationDialog from './PlannerGenerationDialog'
 import PlannerThemeModal, { type AppliedPlannerTheme } from './PlannerThemeModal'
+import CategoryRuleModal from './CategoryRuleModal'
+import ProductCompositionModal from './ProductCompositionModal'
+import type { CategoryRuleSnapshot, ProductComposition, InputImage } from '../types'
+import { categoryRuleContract, categoryRuleErrors } from '../lib/categoryRules'
+import { plannerReferenceIds, plannerReferenceUsage, productCompositionContract, productCompositionErrors, normalizeProductComposition } from '../lib/productComposition'
 import FinalSetOverviewModal from './FinalSetOverviewModal'
 import { finalSetScope } from '../lib/finalSets'
 import { hasPlannerTheme, normalizePlannerTheme, plannerThemeContract } from '../lib/plannerThemes'
@@ -470,6 +475,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   const [selectedPlanIndex, setSelectedPlanIndex] = useState<number | null>(null)
   const [selectedAPlusPlanIndex, setSelectedAPlusPlanIndex] = useState<number | null>(null)
   const [plannerSessions, setPlannerSessions] = useState<AmazonPlannerSession[]>([])
+  const plannerHistoryRevision = useStore((state) => state.plannerHistoryRevision)
   const [currentPlannerSessionId, setCurrentPlannerSessionId] = useState<string | null>(null)
   const [moduleVersions, setModuleVersions] = useState<Record<string, PlannerModuleVersion[]>>({})
   const [selectedModuleVersions, setSelectedModuleVersions] = useState<Record<string, string>>({})
@@ -482,6 +488,10 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   const [referenceLibrary, setReferenceLibrary] = useState<{ seed?: ReferenceLibrarySeed } | null>(null)
   const [themeSettings, setThemeSettings] = useState(() => normalizePlannerTheme())
   const [showThemePresets, setShowThemePresets] = useState(false)
+  const [categoryRule, setCategoryRule] = useState<CategoryRuleSnapshot>()
+  const [productComposition, setProductComposition] = useState<ProductComposition>()
+  const [showCategoryRules, setShowCategoryRules] = useState(false)
+  const [showProductComposition, setShowProductComposition] = useState(false)
   const [finalOverview, setFinalOverview] = useState<AmazonPlannerSession | null>(null)
   const [generationDialog, setGenerationDialog] = useState<'inspect' | 'queue' | null>(null)
   const [creativeTarget, setCreativeTarget] = useState<string | null>(null)
@@ -541,7 +551,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   const hasStyleReference = Boolean(selectedStyleImage?.imageId)
   const usesStyleReferenceForActivePlan = styleReferenceRequired && hasStyleReference
   const activeSlot = plannerMode === 'aplus' ? selectedAPlusPlan?.slot : selectedPlan?.slot
-  const activeReferences = inputImages.filter((image) => referenceAppliesToSlot(referenceImageUsages[image.id], activeSlot))
+  const activeReferenceIds = plannerReferenceIds({ referenceImageIds: inputImages.map((image) => image.id), referenceImageUsages, productComposition } as AmazonPlannerSession, activeSlot)
+  const activeReferences = inputImages.filter((image) => activeReferenceIds.includes(image.id))
   const effectiveReferenceCount = activeReferences.length + (usesStyleReferenceForActivePlan && selectedStyleImage?.imageId && !activeReferences.some((image) => image.id === selectedStyleImage.imageId) ? 1 : 0)
   const styleReferenceLimitExceeded = usesStyleReferenceForActivePlan && effectiveReferenceCount > inputImageLimit
   const activeFacts = confirmedProductFacts(productFacts)
@@ -562,7 +573,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       marketplaceId,
       selectedVisualStyle: usesStyleReferenceForActivePlan ? selectedVisualStyle : null,
     }) : ''
-  const activePrompt = baseActivePrompt ? appendProductFactsContract([baseActivePrompt, plannerThemeContract({ themeSettings, draft }, activeSlot)].filter(Boolean).join('\n\n'), activeFacts) : ''
+  const activePrompt = baseActivePrompt ? appendProductFactsContract([baseActivePrompt, plannerThemeContract({ themeSettings, draft }, activeSlot), categoryRuleContract(categoryRule, plannerMode === 'aplus' ? 'aplus' : 'image'), productCompositionContract({ productComposition, productFacts }, activeReferenceIds, activeSlot)].filter(Boolean).join('\n\n'), activeFacts) : ''
   const activePlanMarkdown = plannerMode === 'aplus' ? selectedAPlusPlan?.planMarkdown ?? '' : selectedPlan?.planMarkdown ?? ''
   const activePlanPreview = activePlanMarkdown
     ? [
@@ -725,7 +736,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     return () => {
       cancelled = true
     }
-  }, [showToast])
+  }, [showToast, plannerHistoryRevision])
 
   useEffect(() => {
     return () => {
@@ -808,6 +819,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       mode: 'prompt-match',
       prompt: activePrompt,
       productFactsSnapshot: activeFacts,
+      categoryRuleSnapshot: categoryRule,
+      productCompositionSnapshot: productComposition,
       referenceAnalysisSnapshots: Object.values(validAnalyses),
       category: {
         productTitle: draft.productTitle.trim(),
@@ -894,6 +907,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       ),
       styleDensityMode: overrides.styleDensityMode ?? styleDensityMode,
       themeSettings: normalizePlannerTheme(overrides.themeSettings ?? themeSettings),
+      categoryRule: hasOverride('categoryRule') ? overrides.categoryRule : categoryRule,
+      productComposition: hasOverride('productComposition') ? overrides.productComposition : productComposition,
       sourceCollection: hasOverride('sourceCollection') ? overrides.sourceCollection : existing?.sourceCollection,
       imagePlans: overrides.imagePlans ?? imagePlans,
       aPlusPlans: overrides.aPlusPlans ?? aPlusPlansWithSizes,
@@ -998,6 +1013,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   }
 
   const applyPrompt = (options: { requireStyle?: boolean } = {}) => {
+    const contextErrors = [...categoryRuleErrors(categoryRule), ...productCompositionErrors(createPlannerSessionSnapshot(), activeSlot)]
+    if (contextErrors.length) { showToast(contextErrors.join('；'), 'error'); return false }
     if (plannerMode === 'aplus' && !selectedAPlusPlan) {
       showToast('请先 AI 策划并选择一个 A+ 模块', 'error')
       return false
@@ -1021,6 +1038,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       mode: 'prompt-match',
       prompt: activePrompt,
       productFactsSnapshot: activeFacts,
+      categoryRuleSnapshot: categoryRule,
+      productCompositionSnapshot: productComposition,
       referenceAnalysisSnapshots: Object.values(validAnalyses),
       category: {
         productTitle: draft.productTitle.trim(),
@@ -1686,6 +1705,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     const requestSession = plannerSnapshotRef.current()
     const requestEpoch = contextEpochRef.current
     try {
+      const contextErrors = [...categoryRuleErrors(requestSession.categoryRule), ...productCompositionErrors(requestSession)]
+      if (contextErrors.length) throw new Error(contextErrors.join('；'))
       const currentMarketplaceId = marketplaceId
       const resolvedReferences = await resolveInputImagesForRequest(inputImages, controller.signal)
       const analyses = await resolveReferenceAnalyses(resolvedReferences, referenceImageUsages, referenceAnalyses, plannerProfile)
@@ -1698,7 +1719,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
         baseDraft: draft,
         profile: plannerProfile,
         referenceImageDataUrls: referencePayload.dataUrls,
-        referenceImageDescriptions: resolvedReferences.map((image) => referenceAnalysisDescription(referenceImageUsages[image.id], analyses[image.id])),
+        referenceImageDescriptions: resolvedReferences.map((image) => referenceAnalysisDescription(plannerReferenceUsage({ productComposition, referenceImageUsages }, image.id), analyses[image.id] && analysisMatchesInputs(analyses[image.id], image.id, plannerReferenceUsage({ productComposition, referenceImageUsages }, image.id)) ? analyses[image.id] : undefined)),
         confirmedProductFacts: buildProductFactsContract(activeFacts),
         planningStyleContext: plannerStyleInstructions(requestSession),
         mode: plannerMode,
@@ -1777,7 +1798,9 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     const snapshot = plannerSnapshotRef.current()
     const plan = (target.mode === 'listing' ? snapshot.imagePlans : snapshot.aPlusPlans).find((item) => item.slot === target.slot)
     if (!plan) { setRevisionError('没有找到此图片位，请重新选择'); return }
-    const references = inputImages.filter((image) => referenceAppliesToSlot(referenceImageUsages[image.id], target.slot))
+    const contextErrors = [...categoryRuleErrors(snapshot.categoryRule), ...productCompositionErrors(snapshot, target.slot)]
+    if (contextErrors.length) { setRevisionError(contextErrors.join('；')); return false }
+    const references = inputImages.filter((image) => plannerReferenceIds(plannerSnapshotRef.current(), target.slot).includes(image.id))
     const controller = new AbortController()
     revisionControllerRef.current = controller
     setIsRevising(true)
@@ -1793,7 +1816,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
         listingText: snapshot.listingText, baseDraft: fromSessionDraft(snapshot.draft), profile: plannerProfile,
         mode: target.mode, marketplaceId: snapshot.marketplaceId, listingImageCount: getSessionListingImageCount(snapshot),
         aPlusType: snapshot.aPlusType, aPlusModuleSpecs: aPlusSpecs, aPlusGenerationTier: resolutionTier,
-        referenceImageDataUrls: payload.dataUrls, referenceImageDescriptions: resolved.map((image) => referenceAnalysisDescription(referenceImageUsages[image.id], analyses[image.id])),
+        referenceImageDataUrls: payload.dataUrls, referenceImageDescriptions: resolved.map((image) => referenceAnalysisDescription(plannerReferenceUsage({ productComposition, referenceImageUsages }, image.id), analyses[image.id] && analysisMatchesInputs(analyses[image.id], image.id, plannerReferenceUsage({ productComposition, referenceImageUsages }, image.id)) ? analyses[image.id] : undefined)),
         confirmedProductFacts: buildProductFactsContract(confirmedProductFacts(snapshot.productFacts)),
         planningStyleContext: plannerStyleInstructions(snapshot, target.slot),
         moduleRevision: { plan: plan as AmazonImagePlan | AmazonAPlusPlan, instruction, seriesStyleGuide: snapshot.seriesStyleGuides[target.mode] },
@@ -1836,15 +1859,17 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     if (!creativeTarget || creativeControllerRef.current || plannerAbortControllerRef.current || revisionControllerRef.current || isAnalyzing) return
     if (!plannerProfile || plannerProfileValidation) { setCreativeError(plannerProfileValidation || '请先配置 AI 策划接口'); return }
     const snapshot = plannerSnapshotRef.current(), slot = creativeTarget, epoch = contextEpochRef.current
+    const contextErrors = [...categoryRuleErrors(snapshot.categoryRule), ...productCompositionErrors(snapshot, slot)]
+    if (contextErrors.length) { setCreativeError(contextErrors.join('；')); return }
     const controller = new AbortController(); creativeControllerRef.current = controller
     setIsCreativePlanning(true); setCreativeError('')
-    const references = inputImages.filter((image) => referenceAppliesToSlot(referenceImageUsages[image.id], slot))
+    const references = inputImages.filter((image) => plannerReferenceIds(plannerSnapshotRef.current(), slot).includes(image.id))
     creativeLog.start({ model: plannerProfile.model, apiMode: plannerApiLabel, mode: `${slot} 创意方向（${count} 个）`, totalPlans: 0, referenceCount: references.length, apiKey: plannerProfile.apiKey })
     try {
       const resolved = await resolveInputImagesForRequest(references, controller.signal)
       const analyses = await resolveReferenceAnalyses(resolved, referenceImageUsages, referenceAnalyses, plannerProfile)
       const payload = await prepareReferencePayloadForRequest(resolved.map((image) => image.dataUrl), controller.signal)
-      const directions = await planCreativeDirections({ session: snapshot, slot, count, instruction, profile: plannerProfile, images: payload.dataUrls, referenceDescriptions: resolved.map((image) => referenceAnalysisDescription(referenceImageUsages[image.id], analyses[image.id])), signal: controller.signal,
+      const directions = await planCreativeDirections({ session: snapshot, slot, count, instruction, profile: plannerProfile, images: payload.dataUrls, referenceDescriptions: resolved.map((image) => referenceAnalysisDescription(plannerReferenceUsage({ productComposition, referenceImageUsages }, image.id), analyses[image.id] && analysisMatchesInputs(analyses[image.id], image.id, plannerReferenceUsage({ productComposition, referenceImageUsages }, image.id)) ? analyses[image.id] : undefined)), signal: controller.signal,
         onProgress: (event) => { if (creativeControllerRef.current === controller && !controller.signal.aborted) creativeLog.progress(event) } })
       if (controller.signal.aborted || creativeControllerRef.current !== controller || epoch !== contextEpochRef.current || plannerSnapshotRef.current().id !== snapshot.id) return
       const latest = plannerSnapshotRef.current(), key = plannerModuleKey(snapshot.mode, slot), history = latest.moduleVersions?.[key] ?? []
@@ -2010,6 +2035,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     setContextEpoch(++contextEpochRef.current)
     setProductFacts(emptyProductFactsState())
     setReferenceAnalyses({})
+    setCategoryRule(undefined); setProductComposition(undefined)
+    setShowCategoryRules(false); setShowProductComposition(false)
     setThemeSettings(normalizePlannerTheme()); setShowThemePresets(false); setFinalOverview(null)
     setAnalysisTarget(null)
     setModuleVersions({}); setSelectedModuleVersions({})
@@ -2033,6 +2060,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
   }
 
   const restorePlannerSession = async (savedSession: AmazonPlannerSession) => {
+    setShowCategoryRules(false); setShowProductComposition(false)
     const session = upgradePlannerContextBaseline(savedSession)
     setShowThemePresets(false); setFinalOverview(null)
     stopCreativePlanning()
@@ -2200,6 +2228,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     }
     setDraft(fromSessionDraft(session.draft))
     setThemeSettings(normalizePlannerTheme(session.themeSettings))
+    setCategoryRule(session.categoryRule ? structuredClone(session.categoryRule) : undefined)
+    setProductComposition(normalizeProductComposition(session.productComposition))
     setProductFacts(normalizeProductFactsState(session.productFacts))
     setReferenceAnalyses(session.referenceAnalyses ?? {})
     setSeriesStyleGuides(session.seriesStyleGuides)
@@ -2327,6 +2357,17 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
     <>
     {referenceLibrary && isActive && <ReferenceLibraryModal seed={referenceLibrary.seed} slots={plannerMode === 'aplus' ? aPlusSpecs : getAmazonListingImageSlots(listingImageCount).map((slot) => ({ slot, label: imagePlans.find((plan) => plan.slot === slot)?.label || slot }))} onUse={useLibraryReferences} onClose={() => setReferenceLibrary(null)} />}
     {showThemePresets && isActive && <PlannerThemeModal session={createPlannerSessionSnapshot()} onApply={applyThemePreset} onClose={() => setShowThemePresets(false)} />}
+    {showCategoryRules && isActive && <CategoryRuleModal current={categoryRule} onClose={() => setShowCategoryRules(false)} onApply={async (value) => { await savePlannerSession({ categoryRule: value }); setCategoryRule(value); showToast('品类规则和当前参数已应用，已有方案请查看复核提示', 'success') }} />}
+    {showProductComposition && isActive && <ProductCompositionModal session={createPlannerSessionSnapshot()} slots={plannerMode === 'aplus' ? aPlusSpecs : getAmazonListingImageSlots(listingImageCount).map((slot) => ({ slot, label: slot }))} onClose={() => setShowProductComposition(false)} onApply={async (value, images: InputImage[]) => {
+      const ids = [...new Set([...inputImages.map((image) => image.id), ...images.map((image) => image.id)])]
+      const usages = { ...referenceImageUsages }
+      for (const image of images) usages[image.id] = normalizeReferenceUsage({ purpose: 'product', slots: [], note: '' })
+      for (const product of value?.products ?? []) for (const id of product.imageIds) usages[id] = plannerReferenceUsage({ productComposition: value, referenceImageUsages: usages }, id)
+      await savePlannerSession({ productComposition: value, referenceImageIds: ids, referenceImageUsages: usages })
+      setProductComposition(value); setInputImages([...inputImages, ...images.filter((image) => !inputImages.some((row) => row.id === image.id))])
+      for (const id of ids) if (usages[id]) setReferenceImageUsage(id, usages[id])
+      showToast(value ? '商品组合已确认，已有方案请查看复核提示' : '已恢复单商品，请复核原有方案', 'success')
+    }} />}
     {finalOverview && isActive && <FinalSetOverviewModal session={finalOverview} scope={finalSetScope(finalOverview)} title={finalOverview.title} onClose={() => setFinalOverview(null)} />}
     {generationDialog && isActive && <PlannerGenerationDialog mode={generationDialog} specs={generationSpecs} activeSlot={activeSlot} busy={isRevising} log={revisionLog.state}
       onCopyLog={() => void copyTextToClipboard(formatPlannerLogForCopy(revisionLog.state)).catch(() => showToast('复制日志失败', 'error'))}
@@ -2356,6 +2397,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
       <APlusModulePreviewModal
         modules={showPromptPreview ? [currentPromptPreview] : modulePreviews}
         initialIndex={showPromptPreview ? 0 : modulePreviewIndex ?? 0}
+        terminologyContext={categoryRuleContract(categoryRule, 'translation')}
         profile={plannerProfile}
         onClose={() => { setModulePreviewIndex(null); setShowPromptPreview(false) }}
       />
@@ -2402,6 +2444,8 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
             <button type="button" onClick={collectPlanner} disabled={!imagePlans.length && !aPlusPlans.length} className="ios-button inline-flex h-10 items-center gap-2 bg-[hsl(var(--muted))] px-3 text-sm font-medium text-gray-700 disabled:opacity-40 dark:text-gray-200">收藏整套素材</button>
             <button type="button" onClick={() => setFinalOverview(plannerSnapshotRef.current())} disabled={!(plannerMode === 'aplus' ? aPlusPlans.length : imagePlans.length) || isPlanning || isRevising || isCreativePlanning} className="ios-button h-10 bg-emerald-50 px-3 text-sm font-medium text-emerald-700 disabled:opacity-40 dark:bg-emerald-500/10 dark:text-emerald-300">整套最终稿总览</button>
             <button type="button" onClick={() => setShowThemePresets(true)} disabled={isPlanning || isRevising || isCreativePlanning} className="ios-button h-10 bg-[hsl(var(--muted))] px-3 text-sm font-medium text-gray-700 disabled:opacity-40 dark:text-gray-200">主题 / 场景预设{hasPlannerTheme(themeSettings) ? ' · 已应用' : ''}</button>
+            <button type="button" onClick={() => setShowCategoryRules(true)} disabled={isPlanning || isRevising || isCreativePlanning} className="ios-button h-10 bg-[hsl(var(--muted))] px-3 text-sm font-medium text-gray-700 disabled:opacity-40 dark:text-gray-200">商品品类规则{categoryRule ? ` · ${categoryRule.preset.title}` : ''}</button>
+            <button type="button" onClick={() => setShowProductComposition(true)} disabled={isPlanning || isRevising || isCreativePlanning} className="ios-button h-10 bg-[hsl(var(--muted))] px-3 text-sm font-medium text-gray-700 disabled:opacity-40 dark:text-gray-200">多商品组合{productComposition ? ` · ${productComposition.products.length} 件` : ''}</button>
             <button type="button" onClick={() => { setStylePreview(null); setGenerationDialog('queue') }} disabled={!(plannerMode === 'aplus' ? aPlusPlans.length : imagePlans.length) || isPlanning || isRevising || isCreativePlanning || isAnalyzing} className="ios-button h-10 bg-blue-50 px-3 text-sm font-medium text-blue-700 disabled:opacity-40 dark:bg-blue-500/10 dark:text-blue-300">整套生成</button>
             <button type="button" onClick={() => useStore.setState({ generationQueueOpen: true })} className="ios-button h-10 bg-[hsl(var(--muted))] px-3 text-sm text-gray-700 dark:text-gray-200">生成队列{generationQueue.some((item) => ['queued', 'running'].includes(item.status)) ? `（${generationQueue.filter((item) => ['queued', 'running'].includes(item.status)).length}）` : ''}</button>
             <label className="inline-flex h-10 items-center gap-2 rounded-[var(--ios-radius-md)] bg-[hsl(var(--muted))] px-3 text-sm font-medium text-gray-600 dark:text-gray-300">
@@ -2756,7 +2800,7 @@ export default function AmazonPlanner({ isActive = true }: { isActive?: boolean 
             <input ref={cameraInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handleFileUpload} />
           </div>
 
-          <ProductContextPanel sessionKey={String(contextEpoch)} listingText={listingText} draft={toSessionDraft(draft)} images={inputImages} usages={referenceImageUsages}
+          <ProductContextPanel sessionKey={String(contextEpoch)} listingText={listingText} draft={toSessionDraft(draft)} images={inputImages} usages={referenceImageUsages} categoryRule={categoryRule} primaryProductImageIds={productComposition?.products[0]?.imageIds}
             facts={productFacts} analyses={validAnalyses} profile={plannerProfile} disabled={isPlanning || isRevising || isCreativePlanning} analysisTarget={analysisTarget}
             onCloseAnalysis={() => setAnalysisTarget(null)} onBusy={setIsAnalyzing}
             onFacts={async (value, persist = false) => {

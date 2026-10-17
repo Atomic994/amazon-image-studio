@@ -1,4 +1,4 @@
-import type { AmazonPlannerSession, PlannerThemePreset, PlannerThemeSettings } from '../types'
+import type { AmazonPlannerSession, PlannerThemePreset, PlannerThemeSettings, PlannerThemeContent, PlannerThemeVersion } from '../types'
 import { localId } from './localId'
 
 const clean = (value: unknown, max = 2400) => typeof value === 'string' ? value.trim().slice(0, max) : ''
@@ -16,18 +16,31 @@ export function plannerThemeContract(session: Pick<AmazonPlannerSession, 'themeS
     'Use these directions for detail images and A+ modules only. Preserve the selected visual palette and all confirmed product facts. Do not invent product features, included accessories or claims. MAIN stays on clean white without scene props.'].join('\n')
 }
 /** Whitelist reusable creative settings; never save product facts, images, Listing copy or API configuration. */
-export function createPlannerThemePreset(input: Partial<PlannerThemePreset>, existing?: PlannerThemePreset): PlannerThemePreset {
+function themeContent(input: Partial<PlannerThemePreset>): PlannerThemeContent {
   const title = clean(input.title, 100)
   if (!title) throw new Error('请填写预设名称')
+  return { title, description: clean(input.description, 600), scene: clean(input.scene), themeSettings: normalizePlannerTheme(input.themeSettings), density: input.density === 'minimal' ? 'minimal' : 'rich' }
+}
+export function plannerThemeVersions(preset: PlannerThemePreset): PlannerThemeVersion[] {
+  return preset.versions?.length ? preset.versions : [{ id: `${preset.id}:legacy`, versionNumber: 1, createdAt: preset.updatedAt, note: '原有预设', content: themeContent(preset) }]
+}
+export function createPlannerThemePreset(input: Partial<PlannerThemePreset>, existing?: PlannerThemePreset, note = '编辑预设'): PlannerThemePreset {
+  const content = themeContent(input)
   const at = Date.now()
-  return { id: existing?.id ?? localId('theme'), title, description: clean(input.description, 600), scene: clean(input.scene), themeSettings: normalizePlannerTheme(input.themeSettings), density: input.density === 'minimal' ? 'minimal' : 'rich', createdAt: existing?.createdAt ?? at, updatedAt: at }
+  const versions = existing ? structuredClone(plannerThemeVersions(existing)) : []
+  if (!existing || JSON.stringify(themeContent(existing)) !== JSON.stringify(content)) versions.push({ id: localId('theme-version'), versionNumber: Math.max(0, ...versions.map((row) => row.versionNumber)) + 1, createdAt: at, note: clean(note, 300), content: structuredClone(content) })
+  return { id: existing?.id ?? localId('theme'), ...content, createdAt: existing?.createdAt ?? at, updatedAt: at, versions }
 }
 export function normalizePlannerThemePreset(input: unknown): PlannerThemePreset | null {
   if (!input || typeof input !== 'object') return null
   const row = input as Partial<PlannerThemePreset>
   if (typeof row.id !== 'string' || !row.id || typeof row.title !== 'string' || !row.title.trim()) return null
   const normalized = createPlannerThemePreset(row)
-  return { ...normalized, id: row.id.slice(0, 160), createdAt: typeof row.createdAt === 'number' && Number.isFinite(row.createdAt) ? row.createdAt : normalized.createdAt, updatedAt: typeof row.updatedAt === 'number' && Number.isFinite(row.updatedAt) ? row.updatedAt : normalized.updatedAt }
+  const versions = (Array.isArray(row.versions) ? row.versions : []).flatMap((entry) => {
+    try { return entry && typeof entry.id === 'string' && Number.isSafeInteger(entry.versionNumber) && entry.versionNumber > 0 && Number.isFinite(entry.createdAt) ? [{ id: entry.id, versionNumber: entry.versionNumber, createdAt: entry.createdAt, note: clean(entry.note, 300), content: themeContent(entry.content) }] : [] } catch { return [] }
+  }).filter((entry, index, rows) => rows.findIndex((other) => other.id === entry.id || other.versionNumber === entry.versionNumber) === index).sort((a, b) => a.versionNumber - b.versionNumber)
+  const result = { ...normalized, id: row.id.slice(0, 160), createdAt: typeof row.createdAt === 'number' && Number.isFinite(row.createdAt) ? row.createdAt : normalized.createdAt, updatedAt: typeof row.updatedAt === 'number' && Number.isFinite(row.updatedAt) ? row.updatedAt : normalized.updatedAt }
+  return { ...result, versions: versions.length ? versions : plannerThemeVersions({ ...result, versions: undefined }) }
 }
 const builtin = (id: string, title: string, description: string, scene: string, theme: string, composition: string, lighting: string): PlannerThemePreset => ({
   id: `builtin:${id}`, title, description, scene, themeSettings: { theme, composition, lighting, constraints: '只展示已确认的商品和配件，不新增虚构功能、认证、Logo 或包装。' }, density: 'rich', createdAt: 0, updatedAt: 0,

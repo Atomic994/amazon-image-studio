@@ -111,7 +111,10 @@ export function plannerContextChangeReasons(previous: PlannerSourceContext | und
   const changes: string[] = []
   if (previous.productFactsVersionId !== current.productFactsVersionId) changes.push('商品事实版本已变化')
   if (previous.referenceFingerprint !== current.referenceFingerprint) changes.push('参考图、用途或分析已变化')
-  const labels = { listing: 'Listing 内容已变化', product: '商品信息或场景要求已变化', visual: '视觉风格已变化', density: '信息密度已变化', guide: '整套风格要求已变化', layout: '图片数量或模块规格已变化', marketplace: '目标站点已变化', theme: '主题预设要求已变化' } as const
-  if (previous.planningSettings && current.planningSettings) for (const key of Object.keys(labels) as Array<keyof typeof labels>) if ((previous.planningSettings[key] ?? (key === 'theme' ? contextFingerprint(null) : undefined)) !== (current.planningSettings[key] ?? (key === 'theme' ? contextFingerprint(null) : undefined))) changes.push(labels[key])
+  const labels = { listing: 'Listing 内容已变化', product: '商品信息或场景要求已变化', visual: '视觉风格已变化', density: '信息密度已变化', guide: '整套风格要求已变化', layout: '图片数量或模块规格已变化', marketplace: '目标站点已变化', theme: '主题预设要求已变化', category: '品类规则或事实已变化', composition: '商品组合身份或图片位范围已变化' } as const
+  if (previous.planningSettings && current.planningSettings) for (const key of Object.keys(labels) as Array<keyof typeof labels>) {
+    const fallback = ['theme', 'category', 'composition'].includes(key) ? contextFingerprint(null) : undefined
+    if ((previous.planningSettings[key] ?? fallback) !== (current.planningSettings[key] ?? fallback)) changes.push(labels[key])
+  }
   return changes
 }

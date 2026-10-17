@@ -8,6 +8,7 @@ import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { useModalFocus } from '../hooks/useModalFocus'
 import { usePreventBackgroundScroll } from '../hooks/usePreventBackgroundScroll'
 import { Sheet } from './Sheet'
+import PlannerThemeHistory from './PlannerThemeHistory'
 
 const BUTTON = 'rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 disabled:opacity-40 dark:border-white/10 dark:bg-gray-900 dark:text-gray-200'
 const FIELD = 'mt-1 w-full rounded-lg border border-gray-200 bg-white p-2 text-sm dark:border-white/10 dark:bg-gray-950 dark:text-gray-100'
@@ -23,7 +24,10 @@ export default function PlannerThemeModal({ session, onApply, onClose }: { sessi
   const choose = (preset: PlannerThemePreset) => { setDraft(structuredClone(preset)); setEditingId(preset.id.startsWith('builtin:') ? '' : preset.id); setError(''); setDeleting('') }
   const save = () => attempt(async () => {
     if (!editingId && saved.length >= 200) throw new Error('已保存 200 套预设，请先整理不再使用的预设')
-    const preset = createPlannerThemePreset(draft, saved.find((item) => item.id === editingId))
+    const previous = saved.find((item) => item.id === editingId)
+    const latest = editingId ? (await plannerThemePresetsDb.getAll()).find((item) => item.id === editingId) : undefined
+    if (editingId && (!latest || latest.updatedAt !== previous?.updatedAt)) throw new Error('此预设已在另一处变化，请重新载入后保存')
+    const preset = createPlannerThemePreset(draft, latest)
     await plannerThemePresetsDb.put(preset)
     useStore.setState((state) => ({ plannerThemePresets: [preset, ...state.plannerThemePresets.filter((item) => item.id !== preset.id)] }))
     setEditingId(preset.id); setDraft(preset); useStore.getState().showToast('主题预设已保存到本地', 'success')
@@ -39,7 +43,8 @@ export default function PlannerThemeModal({ session, onApply, onClose }: { sessi
       {([['theme', '主题方向'], ['composition', '画面布局'], ['lighting', '光线要求'], ['constraints', '额外限制']] as const).map(([key, label]) => <label key={key} className="block">{label}<textarea aria-label={label} rows={2} maxLength={2400} value={draft.themeSettings[key]} onChange={(event) => setDraft({ ...draft, themeSettings: { ...draft.themeSettings, [key]: event.target.value } })} className={FIELD} /></label>)}
       <label className="block">信息密度<select aria-label="预设信息密度" value={draft.density} onChange={(event) => setDraft({ ...draft, density: event.target.value === 'minimal' ? 'minimal' : 'rich' })} className={FIELD}><option value="rich">信息丰富</option><option value="minimal">简约</option></select></label>
     </fieldset></div>
-      <p className="mt-4 text-xs text-gray-500">保存内容仅包含主题、场景、光线、布局及密度，不包含商品事实、Listing、参考图片或 API 配置。应用后会提示哪些已有方案需要复核，并将新要求用于后续策划和生图。</p>
+      <PlannerThemeHistory key={editingId} preset={saved.find((item) => item.id === editingId)} disabled={busy} onRestored={choose} onBusy={setBusy} />
+      <p className="mt-4 text-xs text-gray-500">保存内容仅包含主题、场景、光线、布局及密度，不包含商品事实、Listing、参考图片或 API 配置。每次修改保存为新版本，历史版本可以比较和恢复。应用后会提示哪些已有方案需要复核，并将新要求用于后续策划和生图。</p>
       {error && <p role="alert" className="mt-3 text-xs text-red-600">{error}</p>}
       <div className="sticky bottom-0 mt-4 flex flex-wrap gap-2 rounded-xl bg-white/95 p-3 dark:bg-gray-900/95"><button type="button" disabled={busy} className="rounded-lg bg-blue-600 px-3 py-2 text-sm font-semibold text-white disabled:opacity-40" onClick={() => void attempt(async () => { await onApply(draft); onClose() })}>{busy ? '正在处理…' : '应用到当前策划'}</button><button type="button" disabled={busy || !draft.title.trim()} className={BUTTON} onClick={() => void save()}>{editingId ? '更新此预设' : '保存为我的预设'}</button>{editingId && <button type="button" disabled={busy} className={BUTTON} onClick={() => setEditingId('')}>另存为新预设</button>}<button type="button" disabled={busy} className={BUTTON} onClick={() => void attempt(async () => { await onApply({ scene: '', themeSettings: normalizePlannerTheme(), density: session.styleDensityMode ?? 'rich' }); onClose() })}>清除当前主题和场景</button></div>
     </div>

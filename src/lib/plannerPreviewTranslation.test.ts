@@ -17,6 +17,16 @@ function sse(events: unknown[]) {
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('module translation through the configured planner LLM', () => {
+  it('adds category terminology guidance without changing the exact source or translation-only scope', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse('chat'))
+    vi.stubGlobal('fetch', fetchMock)
+    await translatePlannerPreviewText({ text: source, profile: profile(), terminologyContext: 'Keep 3000 K; never invent electrical certifications.' })
+    const init = (fetchMock.mock.calls as unknown as [string, RequestInit][])[0][1]
+    const body = JSON.parse(String(init.body))
+    expect(body.messages[1].content).toBe(source)
+    expect(body.messages[0].content).toContain('Keep 3000 K')
+    expect(body.messages[0].content).toContain('Do not add, summarize, omit')
+  })
   it.each(['chat', 'responses'] as const)('uses the exact %s planner configuration without image tools or planner schema', async (apiMode) => {
     const config = profile(apiMode)
     const fetchMock = vi.fn(async () => jsonResponse(apiMode))

@@ -1,11 +1,12 @@
 import type { AmazonPlannerSession, PlannerSettingsSnapshot, ReferenceAnalysisSnapshot } from '../types'
 import { confirmedProductFacts, contextFingerprint } from './productFacts'
 import { plannerSourceContext } from './referenceAnalysis'
-import { referenceAppliesToSlot } from './referenceImageUsage'
 import { getStylePresetById } from './stylePresets'
 import { getCustomStyleReferenceVisualMeta } from './styleReferences'
 import { normalizeListingImageCount, normalizeAPlusModuleSpecs, type AmazonAPlusModuleSpec } from './listingPlanner'
 import { hasPlannerTheme, normalizePlannerTheme, plannerThemeContract } from './plannerThemes'
+import { categoryRuleContract } from './categoryRules'
+import { plannerReferenceIds, plannerReferenceUsage, productCompositionContract, compositionProductsForSlot } from './productComposition'
 
 export function plannerVisualStyle(session: AmazonPlannerSession) {
   if (session.selectedCustomStyleReferenceSnapshot) return getCustomStyleReferenceVisualMeta(session.selectedCustomStyleReferenceSnapshot)
@@ -29,11 +30,14 @@ export function plannerSettingsSnapshot(session: AmazonPlannerSession, slot: str
     layout: contextFingerprint(aplus ? { type: session.aPlusType, specs: normalizeAPlusModuleSpecs(session.aPlusType, session.aPlusModuleSpecs?.[session.aPlusType] as Array<Partial<AmazonAPlusModuleSpec>> | undefined), module: plan && 'uploadSize' in plan ? [plan.slot, plan.moduleType, plan.uploadSize] : null } : { count: normalizeListingImageCount(session.listingImageCount), kind: plan && 'kind' in plan ? plan.kind : undefined }),
     marketplace: contextFingerprint(session.marketplaceId ?? 'us'),
     theme: contextFingerprint(main || !hasPlannerTheme(session.themeSettings) ? null : normalizePlannerTheme(session.themeSettings)),
+    ...(session.categoryRule ? { category: contextFingerprint({ title: session.categoryRule.preset.title, fields: session.categoryRule.preset.fields, instructions: session.categoryRule.preset.instructions, values: session.categoryRule.values }) } : {}),
+    ...(session.productComposition ? { composition: contextFingerprint(compositionProductsForSlot(session.productComposition, slot)) } : {}),
   }
 }
 export function plannerContextForSlot(session: AmazonPlannerSession, slot: string, analyses: Record<string, ReferenceAnalysisSnapshot> = session.referenceAnalyses ?? {}) {
-  const ids = session.referenceImageIds.filter((id) => referenceAppliesToSlot(session.referenceImageUsages?.[id], slot))
-  return { ...plannerSourceContext(ids, session.referenceImageUsages ?? {}, analyses, confirmedProductFacts(session.productFacts)), planningSettings: plannerSettingsSnapshot(session, slot) }
+  const ids = plannerReferenceIds(session, slot)
+  const usages = Object.fromEntries(ids.map((id) => [id, plannerReferenceUsage(session, id)]))
+  return { ...plannerSourceContext(ids, usages, analyses, confirmedProductFacts(session.productFacts)), planningSettings: plannerSettingsSnapshot(session, slot) }
 }
 /** Establish comparison settings from the saved history itself, before the user changes them. */
 export function upgradePlannerContextBaseline(session: AmazonPlannerSession): AmazonPlannerSession {
@@ -53,5 +57,5 @@ export function upgradePlannerContextBaseline(session: AmazonPlannerSession): Am
   return next
 }
 export function plannerStyleInstructions(session: AmazonPlannerSession, slot?: string) {
-  return [`User-selected visual context (source data): ${JSON.stringify(slot === 'MAIN' ? null : plannerVisualStyle(session))}\nInformation density: ${slot === 'MAIN' ? 'product-only; no on-image text' : session.styleDensityMode ?? 'rich'}. Follow this visual system while preserving confirmed product facts. MAIN must remain a clean white product image without decorative props or on-image copy.`, plannerThemeContract(session, slot)].filter(Boolean).join('\n\n')
+  return [`User-selected visual context (source data): ${JSON.stringify(slot === 'MAIN' ? null : plannerVisualStyle(session))}\nInformation density: ${slot === 'MAIN' ? 'product-only; no on-image text' : session.styleDensityMode ?? 'rich'}. Follow this visual system while preserving confirmed product facts. MAIN must remain a clean white product image without decorative props or on-image copy.`, plannerThemeContract(session, slot), categoryRuleContract(session.categoryRule, slot?.startsWith('A+') || (!slot && session.mode === 'aplus') ? 'aplus' : 'listing'), productCompositionContract(session, plannerReferenceIds(session, slot), slot)].filter(Boolean).join('\n\n')
 }

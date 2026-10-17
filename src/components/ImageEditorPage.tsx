@@ -4,6 +4,10 @@ import { downloadImageIds } from '../lib/downloadImages'
 import { loadImage } from '../lib/canvasImage'
 import { createProtectedEditGuide, validateProtectedEditInputs } from '../lib/localEditProtection'
 import MaskEditorModal from './MaskEditorModal'
+import PatchTransferModal from './PatchTransferModal'
+import { patchImageIds } from '../lib/patchTransfer'
+import { categoryRuleContract } from '../lib/categoryRules'
+import { productCompositionContract } from '../lib/productComposition'
 import { openOutputInReferenceLibrary } from '../store'
 import { formatPlannerElapsed } from '../lib/plannerRunLog'
 import {
@@ -297,6 +301,7 @@ export default function ImageEditorPage() {
   const [pickerMode, setPickerMode] = useState<PickerMode | null>(null)
   const [uploadingSource, setUploadingSource] = useState(false)
   const [regionEditor, setRegionEditor] = useState<{ sourceImageId: string; initialMaskDataUrl?: string } | null>(null)
+  const [patchEditorSource, setPatchEditorSource] = useState<string | null>(null)
   const [protectedPreview, setProtectedPreview] = useState<{ source: string; mask: string; dataUrl: string } | null>(null)
   const submitting = Boolean(draft.sourceImageId && submittingImageIds.includes(draft.sourceImageId))
   const [now, setNow] = useState(Date.now)
@@ -321,10 +326,11 @@ export default function ImageEditorPage() {
   const requestedImageIds = [
     ...(draft.sourceImageId ? [draft.sourceImageId] : []),
     ...draft.referenceImageIds,
+    ...patchImageIds(draft.patchTransfer),
     ...(outputImageId ? [outputImageId] : []),
   ]
   const imageDataUrls = useImageDataUrls(requestedImageIds)
-  const sourceDataUrl = draft.sourceImageId ? imageDataUrls[draft.sourceImageId] : null
+  const sourceDataUrl = draft.sourceImageId ? imageDataUrls[draft.patchTransfer?.compositeImageId ?? draft.sourceImageId] : null
   useEffect(() => {
     let cancelled = false
     if (sourceDataUrl && draft.sourceImageId && draft.localEditMaskId && draft.protectUneditedArea !== false) {
@@ -674,7 +680,8 @@ export default function ImageEditorPage() {
     setEditorSubmitting(sourceImageId, true)
     let visualGuide: InputImage | null = null
     try {
-      const source = imageDataUrls[draft.sourceImageId] ?? await ensureImageCached(draft.sourceImageId)
+      const requestBaseId = draft.patchTransfer?.compositeImageId ?? draft.sourceImageId
+      const source = imageDataUrls[requestBaseId] ?? await ensureImageCached(requestBaseId)
       if (!source) throw new Error('主图已不存在，请重新选择')
       const sourceImage = await loadImage(source)
       const referenceImages: InputImage[] = []
@@ -683,13 +690,14 @@ export default function ImageEditorPage() {
         if (!dataUrl) throw new Error('有参考图已不存在，请移除后重试')
         referenceImages.push({ id, dataUrl })
       }
-      const protectedMask = draft.localEditMaskId && draft.protectUneditedArea !== false ? await ensureImageCached(draft.localEditMaskId) : null
+      const protectionMaskId = draft.patchTransfer?.maskImageId ?? draft.localEditMaskId
+      const protectedMask = protectionMaskId && (draft.patchTransfer || draft.protectUneditedArea !== false) ? await ensureImageCached(protectionMaskId) : null
       if (draft.localEditMaskId && draft.protectUneditedArea !== false && !protectedMask) throw new Error('修改区域已不存在，请重新选择后生成')
       let guideDataUrl = await createSeedreamVisualGuideDataUrl(source, draft.annotations)
       if (protectedMask) { await validateProtectedEditInputs(source, protectedMask); guideDataUrl = await createProtectedEditGuide(guideDataUrl ?? source, protectedMask) }
       if (guideDataUrl) visualGuide = await createInputImageFromDataUrl(guideDataUrl)
       const inputImages = [
-        { id: draft.sourceImageId, dataUrl: source },
+        { id: requestBaseId, dataUrl: source },
         ...(visualGuide ? [visualGuide] : []),
         ...referenceImages,
       ]
@@ -697,25 +705,30 @@ export default function ImageEditorPage() {
       const sourceItem = useStore.getState().materialCollections.flatMap((collection) => collection.versions.flatMap((version) => version.items)).find((item) => item.imageId === sourceImageId)
       const sourceCategory = sourceTask?.category ?? sourceItem?.category
       const productFactsSnapshot = draft.preserveProductFacts === false ? undefined : sourceTask?.productFactsSnapshot ?? sourceItem?.productFactsSnapshot
+      const categoryRuleSnapshot = sourceTask?.categoryRuleSnapshot ?? sourceItem?.categoryRuleSnapshot
+      const productCompositionSnapshot = draft.preserveProductFacts === false ? undefined : sourceTask?.productCompositionSnapshot ?? sourceItem?.productCompositionSnapshot
       const taskId = await submitTaskWithInput({
         apiProfileId: profile.id,
-        prompt: buildSeedreamEditPrompt({
+        prompt: [buildSeedreamEditPrompt({
           instruction: draft.instruction,
           hasVisualGuide: Boolean(visualGuide),
           referenceCount: referenceImages.length,
           hasProtectedMask: !!protectedMask,
-        }),
+        }), draft.patchTransfer ? 'The first image already contains the exact original artwork placed at the intended location. Preserve its protected internal pixels. Edit only the cyan fusion boundary shown in the guide, matching surrounding material, light and edges; never redesign or rewrite the artwork.' : '', categoryRuleContract(categoryRuleSnapshot, 'image'), productCompositionContract({ productComposition: productCompositionSnapshot }, [], sourceCategory?.amazonSlot)].filter(Boolean).join('\n\n'),
         inputImages,
         params: createImageEditorParams(selectedResolution, profile, { width: sourceImage.naturalWidth, height: sourceImage.naturalHeight }),
         category: { workflow: 'seedream-edit', productTitle: sourceCategory?.productTitle, amazonSlot: sourceCategory?.amazonSlot, plannerSessionId: sourceCategory?.plannerSessionId, plannerModuleVersionId: sourceCategory?.plannerModuleVersionId, productFactsVersionId: productFactsSnapshot?.id, marketplaceId: sourceCategory?.marketplaceId, aPlusType: sourceCategory?.aPlusType },
         productFactsSnapshot,
-        localEditProtection: protectedMask ? { baseImageId: sourceImageId, maskImageId: draft.localEditMaskId! } : undefined,
+        categoryRuleSnapshot,
+        productCompositionSnapshot,
+        localEditProtection: protectedMask ? { baseImageId: requestBaseId, maskImageId: protectionMaskId! } : undefined,
         imageEditContext: {
           engine: draft.engine,
           sourceImageId: draft.sourceImageId,
           visualGuideImageId: visualGuide?.id ?? null,
           referenceImageIds: draft.referenceImageIds,
           userInstruction: draft.instruction.trim(),
+          patchTransfer: draft.patchTransfer ? structuredClone(draft.patchTransfer) : undefined,
         },
       })
       if (taskId) updateWorkspace(sourceImageId, { latestTaskId: taskId })
@@ -733,6 +746,7 @@ export default function ImageEditorPage() {
     const previousSourceId = draft.sourceImageId
     setDraft({
       sourceImageId: outputImageId,
+      patchTransfer: undefined,
       annotations: [],
       instruction: '',
       latestTaskId: null,
@@ -1016,8 +1030,9 @@ export default function ImageEditorPage() {
             <textarea id="seedream-instruction" disabled={uploadingSource} value={draft.instruction} onChange={(event) => setDraft({ instruction: event.target.value })} rows={6} placeholder="例如：删除红色箭头指向的文字，其余产品结构、光影和背景保持不变。" className="ios-field mt-3 w-full resize-y px-3 py-2.5 text-sm leading-6 text-gray-900 placeholder:text-gray-400 dark:text-gray-100" />
             {inheritedFacts && <label className="mt-3 flex items-start gap-2 text-xs leading-relaxed text-gray-600 dark:text-gray-300"><input type="checkbox" checked={draft.preserveProductFacts !== false} onChange={(event) => setDraft({ preserveProductFacts: event.target.checked })} className="mt-0.5" /><span>保持来源商品事实 v{inheritedFacts.versionNumber}（{inheritedFacts.facts.productName || '已确认商品'}）。需要主动改变商品颜色、结构等事实时，可取消勾选。</span></label>}
             <div className="mt-3 rounded-xl border border-blue-100 bg-blue-50/50 p-3 text-xs text-gray-600 dark:border-blue-500/20 dark:bg-blue-500/5 dark:text-gray-300">
-              <div className="flex flex-wrap items-center gap-2"><button type="button" disabled={!draft.sourceImageId || uploadingSource} onClick={() => void openRegionEditor()} className="rounded-lg border border-blue-200 bg-white px-3 py-2 font-semibold text-blue-700 disabled:opacity-40 dark:border-blue-500/20 dark:bg-gray-900 dark:text-blue-300">{draft.localEditMaskId ? '调整可修改区域' : '选择可修改区域'}</button>{draft.localEditMaskId && <label className="flex items-center gap-2"><input type="checkbox" aria-label="保护未修改区域" checked={draft.protectUneditedArea !== false} onChange={(event) => setDraft({ protectUneditedArea: event.target.checked })} />保护未修改区域</label>}</div>
-              <p className="mt-2 leading-relaxed">{draft.localEditMaskId && draft.protectUneditedArea !== false ? '青色区域允许修改，其余区域使用原图。结果按原图尺寸保存为 PNG；所选生成分辨率只影响模型返回的编辑内容。' : '需要只改一处时，先涂抹可修改区域。文字、箭头等标注只用于表达编辑要求。'}</p>
+              <div className="mb-3 flex flex-wrap gap-2"><button type="button" disabled={!draft.sourceImageId || uploadingSource || submitting || isRunning} onClick={() => setPatchEditorSource(draft.sourceImageId)} className="rounded-lg bg-blue-600 px-3 py-2 font-semibold text-white disabled:opacity-40">{draft.patchTransfer ? '调整来源图案贴入' : '来源图案精确贴入'}</button>{draft.patchTransfer && <button type="button" disabled={submitting || isRunning} onClick={() => setDraft({ patchTransfer: undefined, localEditMaskId: null, annotations: [] })} className="rounded-lg border bg-white px-3 py-2 dark:bg-gray-900">移除精确贴图</button>}</div>
+              <div className="flex flex-wrap items-center gap-2"><button type="button" disabled={!draft.sourceImageId || uploadingSource || !!draft.patchTransfer} onClick={() => void openRegionEditor()} className="rounded-lg border border-blue-200 bg-white px-3 py-2 font-semibold text-blue-700 disabled:opacity-40 dark:border-blue-500/20 dark:bg-gray-900 dark:text-blue-300">{draft.localEditMaskId ? '调整可修改区域' : '选择可修改区域'}</button>{draft.localEditMaskId && <label className="flex items-center gap-2"><input type="checkbox" aria-label="保护未修改区域" disabled={!!draft.patchTransfer} checked={draft.protectUneditedArea !== false} onChange={(event) => setDraft({ protectUneditedArea: event.target.checked })} />保护未修改区域</label>}</div>
+              <p className="mt-2 leading-relaxed">{draft.patchTransfer ? '精确贴图已启用：来源图案内部和远处背景锁定，只融合青色边缘。可调整贴入区域或先移除精确贴图。' : draft.localEditMaskId && draft.protectUneditedArea !== false ? '青色区域允许修改，其余区域使用原图。结果按原图尺寸保存为 PNG；所选生成分辨率只影响模型返回的编辑内容。' : '需要只改一处时，先涂抹可修改区域。文字、箭头等标注只用于表达编辑要求。'}</p>
             </div>
 
             <div className="mt-4 flex items-center justify-between gap-3">
@@ -1116,6 +1131,11 @@ export default function ImageEditorPage() {
       </section>
 
       {pickerMode && <HistoryImagePicker mode={pickerMode} tasks={tasks} onSelect={handleHistorySelect} onClose={() => setPickerMode(null)} />}
+      {patchEditorSource && <PatchTransferModal baseImageId={patchEditorSource} referenceImageIds={draft.referenceImageIds} initial={draft.patchTransfer} onClose={() => setPatchEditorSource(null)} onApply={(value) => {
+        const owner = useStore.getState().imageEditorDrafts[patchEditorSource]
+        updateWorkspace(patchEditorSource, { patchTransfer: value, localEditMaskId: value.maskImageId, protectUneditedArea: true, annotations: [], instruction: owner?.instruction.trim() ? owner.instruction : '保持已贴入的原始图案内部不变，只融合边缘的材质、光线和阴影。' })
+        showToast('已贴入原始图案，生成时只允许修改融合边缘', 'success')
+      }} />}
       {regionEditor && <MaskEditorModal editor={{ ...regionEditor, onClose: () => setRegionEditor(null), onRemove: () => updateWorkspace(regionEditor.sourceImageId, { localEditMaskId: null }), onSave: async (maskDataUrl) => {
         const image = await createInputImageFromDataUrl(maskDataUrl)
         updateWorkspace(regionEditor.sourceImageId, { localEditMaskId: image.id, protectUneditedArea: true })

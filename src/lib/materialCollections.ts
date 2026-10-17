@@ -1,6 +1,7 @@
 import type { AmazonPlannerSession, MaterialCollection, MaterialCollectionDraft, MaterialCollectionItem, TaskRecord } from '../types'
 import { collectPlannerImageReferences } from './plannerImageReferences'
 import { localId } from './localId'
+import { patchImageIds } from './patchTransfer'
 
 export function materialItemFromTask(task: TaskRecord, imageId: string): MaterialCollectionItem {
   return {
@@ -8,15 +9,21 @@ export function materialItemFromTask(task: TaskRecord, imageId: string): Materia
     prompt: task.prompt, params: { ...task.params }, referenceImageIds: [...task.inputImageIds],
     referenceImageUsages: task.referenceImageUsages ? JSON.parse(JSON.stringify(task.referenceImageUsages)) : undefined,
     category: task.category ? { ...task.category } : undefined,
+    categoryRuleSnapshot: task.categoryRuleSnapshot ? structuredClone(task.categoryRuleSnapshot) : undefined,
+    productCompositionSnapshot: task.productCompositionSnapshot ? structuredClone(task.productCompositionSnapshot) : undefined,
     productFactsSnapshot: task.productFactsSnapshot ? JSON.parse(JSON.stringify(task.productFactsSnapshot)) : undefined,
     referenceAnalysisSnapshots: task.referenceAnalysisSnapshots ? JSON.parse(JSON.stringify(task.referenceAnalysisSnapshots)) : undefined,
     localEditProtection: task.localEditProtection ? { ...task.localEditProtection } : undefined,
+    imageEditContext: task.imageEditContext ? structuredClone(task.imageEditContext) : undefined,
   }
 }
 export function collectMaterialImageIds(collections: MaterialCollection[]): Set<string> {
   const ids = new Set<string>()
   for (const collection of collections) for (const version of collection.versions) {
     for (const item of version.items) {
+      for (const product of item.productCompositionSnapshot?.products ?? []) for (const id of product.imageIds) ids.add(id)
+      for (const id of patchImageIds(item.imageEditContext?.patchTransfer)) ids.add(id)
+      if (item.imageEditContext) { ids.add(item.imageEditContext.sourceImageId); for (const id of item.imageEditContext.referenceImageIds) ids.add(id) }
       ids.add(item.imageId); for (const id of item.referenceImageIds) ids.add(id)
       for (const id of item.productFactsSnapshot?.sourceImageIds ?? []) ids.add(id)
       for (const snapshot of item.referenceAnalysisSnapshots ?? []) ids.add(snapshot.imageId)

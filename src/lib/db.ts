@@ -1,8 +1,9 @@
-import type { AmazonPlannerSession, FinalSetSelection, PlannerThemePreset, GenerationQueueItem, MaterialCollection, ReferenceLibraryItem, ReferenceAnalysisCacheEntry, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
+import type { AmazonPlannerSession, FinalSetSelection, PlannerThemePreset, CategoryRulePreset, GenerationQueueItem, MaterialCollection, ReferenceLibraryItem, ReferenceAnalysisCacheEntry, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
 import { sortGenerationQueue } from './generationQueueModel'
 
 const DB_NAME = 'amazon-image-studio'
-const DB_VERSION = 7
+const DB_VERSION = 8
+const STORE_CATEGORY_RULES = 'categoryRulePresets'
 const STORE_TASKS = 'tasks'
 const STORE_IMAGES = 'images'
 const STORE_THUMBNAILS = 'thumbnails'
@@ -44,6 +45,7 @@ function openDB(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_GENERATION_QUEUE)) db.createObjectStore(STORE_GENERATION_QUEUE, { keyPath: 'id' })
       if (!db.objectStoreNames.contains(STORE_PLANNER_THEME_PRESETS)) db.createObjectStore(STORE_PLANNER_THEME_PRESETS, { keyPath: 'id' })
       if (!db.objectStoreNames.contains(STORE_FINAL_SET_SELECTIONS)) db.createObjectStore(STORE_FINAL_SET_SELECTIONS, { keyPath: 'id' })
+      if (!db.objectStoreNames.contains(STORE_CATEGORY_RULES)) db.createObjectStore(STORE_CATEGORY_RULES, { keyPath: 'id' })
     }
     req.onsuccess = () => {
       if (blocked) { req.result.close(); return }
@@ -141,6 +143,12 @@ export const plannerThemePresetsDb = {
   put: (entry: PlannerThemePreset) => dbTransaction(STORE_PLANNER_THEME_PRESETS, 'readwrite', (s) => s.put(entry)),
   remove: (id: string) => dbTransaction(STORE_PLANNER_THEME_PRESETS, 'readwrite', (s) => s.delete(id)),
   clear: () => dbTransaction(STORE_PLANNER_THEME_PRESETS, 'readwrite', (s) => s.clear()),
+}
+export const categoryRulePresetsDb = {
+  getAll: (): Promise<CategoryRulePreset[]> => dbTransaction(STORE_CATEGORY_RULES, 'readonly', (s) => s.getAll()),
+  put: (entry: CategoryRulePreset) => dbTransaction(STORE_CATEGORY_RULES, 'readwrite', (s) => s.put(entry)),
+  remove: (id: string) => dbTransaction(STORE_CATEGORY_RULES, 'readwrite', (s) => s.delete(id)),
+  clear: () => dbTransaction(STORE_CATEGORY_RULES, 'readwrite', (s) => s.clear()),
 }
 export const finalSetSelectionsDb = {
   getAll: (): Promise<Array<{ id: string; scope: string; slot: string; selection: FinalSetSelection }>> => dbTransaction(STORE_FINAL_SET_SELECTIONS, 'readonly', (s) => s.getAll()),

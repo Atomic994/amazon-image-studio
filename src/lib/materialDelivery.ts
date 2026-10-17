@@ -49,6 +49,7 @@ export async function buildMaterialDeliveryZip(collection: MaterialCollection, v
       originalDimensions: processed?.originalDimensions ?? (image.width && image.height ? { width: image.width, height: image.height } : undefined),
       targetDimensions: processed && options.mode !== 'original' ? processed.targetDimensions : undefined,
       delivery: { mode: options.mode, format: blob.type, ...(processed ? { allowUpscale: options.allowUpscale, background: options.background, sourceRegion: processed.layout.source, destinationRegion: processed.layout.destination } : {}) },
+      categoryRule: item.categoryRuleSnapshot, productComposition: item.productCompositionSnapshot, imageEditContext: item.imageEditContext,
       reviewNote: item.reviewNote, productFacts: factsSnapshot(item.productFactsSnapshot), referenceAnalyses: analysesSnapshot(item.referenceAnalysisSnapshots),
       references: item.referenceImageIds.map((id) => ({ imageId: id, usage: normalizeReferenceUsage(item.referenceImageUsages?.[id]) })),
     })

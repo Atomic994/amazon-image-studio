@@ -1,6 +1,7 @@
 import type { AmazonPlannerSession, FinalSetSelections, ImageResultReview, MaterialCollection, MaterialCollectionDraft, MaterialCollectionItem, MaterialCollectionVersion, TaskRecord } from '../types'
 import { getAmazonListingImageSlots, getAPlusModuleSpecs, normalizeAPlusModuleSpecs } from './listingPlanner'
 import { materialItemFromTask } from './materialCollections'
+import { patchImageIds } from './patchTransfer'
 import { plannerContextForSlot } from './plannerContext'
 import { plannerContextChangeReasons } from './referenceAnalysis'
 import { contextFingerprint } from './productFacts'
@@ -36,6 +37,9 @@ export function collectFinalSetImageIds(selections: FinalSetSelections): Set<str
     const item = row.item
     if (!item) continue
     for (const id of item.referenceImageIds) ids.add(id)
+    for (const product of item.productCompositionSnapshot?.products ?? []) for (const id of product.imageIds) ids.add(id)
+    for (const id of patchImageIds(item.imageEditContext?.patchTransfer)) ids.add(id)
+    if (item.imageEditContext) { ids.add(item.imageEditContext.sourceImageId); for (const id of item.imageEditContext.referenceImageIds) ids.add(id) }
     for (const id of item.productFactsSnapshot?.sourceImageIds ?? []) ids.add(id)
     for (const analysis of item.referenceAnalysisSnapshots ?? []) ids.add(analysis.imageId)
     if (item.localEditProtection) { ids.add(item.localEditProtection.baseImageId); ids.add(item.localEditProtection.maskImageId) }

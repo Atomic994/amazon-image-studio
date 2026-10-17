@@ -180,6 +180,7 @@ export interface SeedreamEditorDraft {
   preserveProductFacts?: boolean
   localEditMaskId?: string | null
   protectUneditedArea?: boolean
+  patchTransfer?: PatchTransferSnapshot
   annotations: SeedreamAnnotation[]
   resolution: SeedreamEditorResolution
   latestTaskId: string | null
@@ -193,6 +194,7 @@ export interface TaskImageEditContext {
   visualGuideImageId?: string | null
   referenceImageIds: string[]
   userInstruction: string
+  patchTransfer?: PatchTransferSnapshot
 }
 
 export interface ReferenceImageUsage {
@@ -294,6 +296,8 @@ export interface TaskRecord {
   }
   referenceImageUsages?: Record<string, ReferenceImageUsage>
   productFactsSnapshot?: ProductFactsVersion
+  categoryRuleSnapshot?: CategoryRuleSnapshot
+  productCompositionSnapshot?: ProductComposition
   referenceAnalysisSnapshots?: ReferenceAnalysisSnapshot[]
   generationQueueRef?: string
 }
@@ -428,6 +432,8 @@ export interface AmazonPlannerSession {
   selectedUploadedStyleReferenceSnapshot?: AmazonUploadedStyleReference | null
   styleDensityMode?: AmazonStyleDensityMode
   themeSettings?: PlannerThemeSettings
+  categoryRule?: CategoryRuleSnapshot
+  productComposition?: ProductComposition
   sourceCollection?: { collectionId: string; versionId: string }
   imagePlans: AmazonPlannerSessionImagePlan[]
   aPlusPlans: AmazonPlannerSessionAPlusPlan[]
@@ -546,6 +552,55 @@ export interface PlannerThemePreset {
   density: AmazonStyleDensityMode
   createdAt: number
   updatedAt: number
+  versions?: PlannerThemeVersion[]
+}
+
+export type PlannerThemeContent = Pick<PlannerThemePreset, 'title' | 'description' | 'scene' | 'themeSettings' | 'density'>
+export interface PlannerThemeVersion {
+  id: string
+  versionNumber: number
+  createdAt: number
+  note: string
+  content: PlannerThemeContent
+}
+
+export interface CategoryRuleField { key: string; label: string; required: boolean }
+export interface CategoryRulePreset {
+  id: string
+  title: string
+  description: string
+  fields: CategoryRuleField[]
+  instructions: { analysis: string; listing: string; translation: string; image: string; aplus: string }
+  revision: number
+  createdAt: number
+  updatedAt: number
+}
+export interface CategoryRuleSnapshot { preset: CategoryRulePreset; values: Record<string, string> }
+
+export interface CompositionProduct {
+  id: string
+  role: 'primary' | 'secondary'
+  title: string
+  relationship: 'included' | 'prop'
+  facts: ProductFacts
+  imageIds: string[]
+  /** Empty means all slots; props are always excluded from MAIN. */
+  slots: string[]
+}
+export interface ProductComposition { products: CompositionProduct[]; confirmedAt: number }
+
+export interface NormalizedFrame { x: number; y: number; width: number; height: number }
+export interface PatchTransferSpec {
+  sourceImageId: string
+  sourceFrame: NormalizedFrame
+  targetFrame: NormalizedFrame
+  fit: 'contain' | 'stretch'
+  edgePx: number
+  coreInsetPx: number
+}
+export interface PatchTransferSnapshot extends PatchTransferSpec {
+  compositeImageId: string
+  maskImageId: string
 }
 
 export interface FinalSetSelection {
@@ -575,6 +630,8 @@ export interface GenerationQueueRequest {
   category: NonNullable<TaskRecord['category']>
   referenceImageUsages: Record<string, ReferenceImageUsage>
   productFactsSnapshot?: ProductFactsVersion
+  categoryRuleSnapshot?: CategoryRuleSnapshot
+  productCompositionSnapshot?: ProductComposition
   referenceAnalysisSnapshots?: ReferenceAnalysisSnapshot[]
 }
 
@@ -616,6 +673,8 @@ export interface PlannerSettingsSnapshot {
   layout: string
   marketplace: string
   theme?: string
+  category?: string
+  composition?: string
 }
 
 export interface LocalEditProtection {
@@ -638,8 +697,11 @@ export interface MaterialCollectionItem {
   category?: TaskRecord['category']
   reviewNote?: string
   productFactsSnapshot?: ProductFactsVersion
+  categoryRuleSnapshot?: CategoryRuleSnapshot
+  productCompositionSnapshot?: ProductComposition
   referenceAnalysisSnapshots?: ReferenceAnalysisSnapshot[]
   localEditProtection?: LocalEditProtection
+  imageEditContext?: TaskImageEditContext
 }
 
 export interface MaterialCollectionVersion {
@@ -866,6 +928,7 @@ export interface ExportData {
   materialCollections?: MaterialCollection[]
   referenceLibrary?: ReferenceLibraryItem[]
   plannerThemePresets?: PlannerThemePreset[]
+  categoryRulePresets?: CategoryRulePreset[]
   finalSetSelections?: FinalSetSelections
   generationQueue?: GenerationQueueItem[]
   imageResultReviews?: Record<string, ImageResultReview>

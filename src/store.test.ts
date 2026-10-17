@@ -4,6 +4,7 @@ import { DEFAULT_PARAMS } from './types'
 import { createDefaultFalProfile, createDefaultOpenAIProfile, createDefaultVolcengineProfile, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, getHomeApiProfile, normalizeSettings } from './lib/apiProfiles'
 import type { AgentConversation, AmazonPlannerSession, ExportData, StoredImage, StoredImageThumbnail, TaskRecord } from './types'
 import { getSelectedImageMentionLabel } from './lib/promptImageMentions'
+import { BUILTIN_CATEGORY_RULES, categorySnapshot } from './lib/categoryRules'
 vi.mock('./lib/db', () => {
   const tasks = new Map<string, TaskRecord>()
   const amazonPlannerSessions = new Map<string, AmazonPlannerSession>()
@@ -15,10 +16,15 @@ vi.mock('./lib/db', () => {
   const library = new Map<string, import('./types').ReferenceLibraryItem>()
   const queue = new Map<string, import('./types').GenerationQueueItem>()
   const themes = new Map<string, import('./types').PlannerThemePreset>()
+  const categoryRules = new Map<string, import('./types').CategoryRulePreset>()
   const finalSets = new Map<string, { id: string; scope: string; slot: string; selection: import('./types').FinalSetSelection }>()
 
   return {
     CURRENT_THUMBNAIL_VERSION: 2,
+    categoryRulePresetsDb: {
+      getAll: async () => [...categoryRules.values()], put: async (item: import('./types').CategoryRulePreset) => { categoryRules.set(item.id, item) },
+      remove: async (id: string) => { categoryRules.delete(id) }, clear: async () => { categoryRules.clear() },
+    },
     plannerThemePresetsDb: {
       getAll: async () => [...themes.values()], put: async (item: import('./types').PlannerThemePreset) => { themes.set(item.id, item) },
       remove: async (id: string) => { themes.delete(id) }, clear: async () => { themes.clear() },
@@ -127,7 +133,7 @@ vi.mock('./lib/agentApi', () => ({
     }
   }),
 }))
-import { clearAmazonPlannerSessions, clearMaterialCollections, clearImages, clearTasks as clearStoredTasks, getAllAmazonPlannerSessions, getImage, putAmazonPlannerSession, putImage, putTask, referenceLibraryDb, generationQueueDb, plannerThemePresetsDb, finalSetSelectionsDb } from './lib/db'
+import { clearAmazonPlannerSessions, clearMaterialCollections, clearImages, clearTasks as clearStoredTasks, getAllAmazonPlannerSessions, getImage, putAmazonPlannerSession, putImage, putTask, referenceLibraryDb, generationQueueDb, plannerThemePresetsDb, categoryRulePresetsDb, finalSetSelectionsDb } from './lib/db'
 import { materialItemFromTask } from './lib/materialCollections'
 import { confirmProductFacts, emptyProductFactsState } from './lib/productFacts'
 import { normalizeReferenceAnalysis } from './lib/referenceAnalysis'
@@ -150,8 +156,8 @@ const imageA = { id: 'image-a', dataUrl: 'data:image/png;base64,a' }
 const imageB = { id: 'image-b', dataUrl: 'data:image/png;base64,b' }
 
 beforeEach(async () => {
-  await plannerThemePresetsDb.clear(); await finalSetSelectionsDb.clear()
-  useStore.setState({ plannerThemePresets: [], finalSetSelections: {}, referenceLibrarySeed: null })
+  await plannerThemePresetsDb.clear(); await categoryRulePresetsDb.clear(); await finalSetSelectionsDb.clear()
+  useStore.setState({ plannerThemePresets: [], categoryRulePresets: [], finalSetSelections: {}, referenceLibrarySeed: null })
   await clearMaterialCollections()
   await referenceLibraryDb.clear(); await generationQueueDb.clear()
   useStore.setState({ referenceLibrary: [], generationQueue: [], generationQueuePaused: true, generationQueueReady: false, generationQueueOpen: false, generationQueueMessage: '' })
@@ -189,6 +195,30 @@ describe('local material and review persistence', () => {
     expect(useStore.getState().tasks[0].localEditProtection).toEqual(result.localEditProtection)
     openSeedreamTaskInEditor(result)
     expect(useStore.getState().seedreamEditorDraft).toMatchObject({ sourceImageId: original.id, localEditMaskId: mask.id, protectUneditedArea: true })
+  })
+
+  it('retains exact artwork and independent product snapshots when editing, retrying and restoring a workspace', async () => {
+    const { original, mask, request } = await protectedInput()
+    for (const id of ['unmodified-photo', 'artwork']) await putImage({ id, dataUrl: `data:image/png;base64,${id}` })
+    const patchTransfer = { sourceImageId: 'artwork', sourceFrame: { x: 0, y: 0, width: 1, height: 1 }, targetFrame: { x: 0.1, y: 0.1, width: 0.3, height: 0.2 }, fit: 'contain' as const, edgePx: 24, coreInsetPx: 12, compositeImageId: original.id, maskImageId: mask.id }
+    const categoryRuleSnapshot = categorySnapshot(BUILTIN_CATEGORY_RULES[0], { field1: '3000 K' })
+    const context = { sourceImageId: 'unmodified-photo', referenceImageIds: [], userInstruction: 'Blend the edges only', patchTransfer }
+    const id = await submitTaskWithInput({ ...request, imageEditContext: context, categoryRuleSnapshot })
+    await vi.advanceTimersByTimeAsync(0)
+    const submitted = useStore.getState().tasks.find((row) => row.id === id)!
+    context.patchTransfer.targetFrame.x = 0.7; categoryRuleSnapshot.values.field1 = '5000 K'
+    expect(submitted.imageEditContext?.patchTransfer?.targetFrame.x).toBe(0.1)
+    expect(submitted.categoryRuleSnapshot?.values.field1).toBe('3000 K')
+    openSeedreamTaskInEditor(submitted)
+    expect(useStore.getState().seedreamEditorDraft).toMatchObject({ sourceImageId: 'unmodified-photo', patchTransfer: { compositeImageId: original.id, maskImageId: mask.id } })
+    await deleteImageIfUnreferenced('artwork'); expect(await getImage('artwork')).toBeDefined()
+    await retryTask(submitted); await vi.advanceTimersByTimeAsync(0)
+    expect(useStore.getState().tasks[0].imageEditContext?.patchTransfer?.targetFrame.x).toBe(0.1)
+    const { reuseMaterialItem } = await import('./store')
+    await reuseMaterialItem({ id: 'saved-edit', imageId: 'result', slot: 'MAIN', label: 'Artwork edit', prompt: submitted.prompt, params: submitted.params, referenceImageIds: submitted.inputImageIds, localEditProtection: submitted.localEditProtection, imageEditContext: submitted.imageEditContext, categoryRuleSnapshot: submitted.categoryRuleSnapshot })
+    expect(useStore.getState().pendingTaskCategory?.imageEditContext).toMatchObject({ engine: 'home', sourceImageId: 'unmodified-photo', patchTransfer: { sourceImageId: 'artwork' } })
+    useStore.getState().setSeedreamEditorDraft({ sourceImageId: 'different-photo' })
+    expect(useStore.getState().seedreamEditorDraft.patchTransfer).toBeUndefined()
   })
 
   it('rejects an incompatible mask or wrong first image before making a paid request', async () => {
@@ -479,7 +509,7 @@ describe('local material and review persistence', () => {
     expect(manifest.finalSetSelections?.['planner:portable:listing'].MAIN.imageId).toBe('backup-output')
     expect(manifest.referenceLibrary?.[0].title).toBe('Portable input'); expect(manifest.generationQueue?.[0].id).toBe(queue[0].id)
     expect(JSON.stringify(manifest)).not.toContain(profile.apiKey)
-    await clearMaterialCollections(); await clearImages(); await referenceLibraryDb.clear(); await generationQueueDb.clear(); await plannerThemePresetsDb.clear(); await finalSetSelectionsDb.clear()
+    await clearMaterialCollections(); await clearImages(); await referenceLibraryDb.clear(); await generationQueueDb.clear(); await plannerThemePresetsDb.clear(); await categoryRulePresetsDb.clear(); await finalSetSelectionsDb.clear()
     useStore.setState({ materialCollections: [], imageResultReviews: {}, imageFinalSelections: {} })
     expect(await importData({ arrayBuffer: async () => bytes } as File, { importConfig: false, importTasks: true })).toBe(true)
     expect(useStore.getState().materialCollections[0].versions[0].plannerSession?.referenceImageIds).toEqual(['backup-ref'])
@@ -1707,6 +1737,10 @@ describe('data export and clearing', () => {
   })
 
   it('exports Amazon planner session history in the backup manifest', async () => {
+    const rule = BUILTIN_CATEGORY_RULES[0]
+    const theme = createPlannerThemePreset({ title: 'Versioned theme', scene: 'Desk' })
+    const revisedTheme = createPlannerThemePreset({ ...theme, scene: 'Reading desk' }, theme)
+    await categoryRulePresetsDb.put(rule); await plannerThemePresetsDb.put(revisedTheme)
     const session = amazonPlannerSession({
       id: 'exported-planner-session',
       referenceImageIds: ['image-a'],
@@ -1744,6 +1778,14 @@ describe('data export and clearing', () => {
     const manifest = JSON.parse(strFromU8(unzipped['manifest.json'])) as ExportData
     expect(manifest.version).toBe(4)
     expect(manifest.amazonPlannerSessions).toEqual([session])
+    expect(manifest.categoryRulePresets?.[0].title).toBe(rule.title)
+    expect(manifest.plannerThemePresets?.[0].versions?.map((row) => row.versionNumber)).toEqual([1, 2])
+    await categoryRulePresetsDb.clear(); await plannerThemePresetsDb.clear()
+    const revision = useStore.getState().plannerHistoryRevision
+    expect(await importData(importFile({ version: 4, exportedAt: new Date().toISOString(), tasks: [], imageFiles: {}, categoryRulePresets: manifest.categoryRulePresets, plannerThemePresets: manifest.plannerThemePresets }), { importConfig: false, importTasks: true })).toBe(true)
+    expect(useStore.getState().plannerHistoryRevision).toBe(revision + 1)
+    expect((await categoryRulePresetsDb.getAll())[0].instructions.image).toBe(rule.instructions.image)
+    expect((await plannerThemePresetsDb.getAll())[0].versions?.[0].content.scene).toBe('Desk')
     expect(manifest.imageFiles).toHaveProperty('image-a')
     expect(manifest.imageFiles).toHaveProperty('preset-style-image')
     expect(manifest.imageFiles).toHaveProperty('style-image-a')

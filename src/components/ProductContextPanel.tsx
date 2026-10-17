@@ -23,6 +23,7 @@ const INPUT = 'mt-1.5 w-full rounded-lg border border-gray-200 bg-white px-2.5 p
 
 export default function ProductContextPanel(props: {
   sessionKey: string; listingText: string; draft: AmazonPlannerSessionDraft; images: InputImage[]; usages: Record<string, ReferenceImageUsage>
+  categoryRule?: import('../types').CategoryRuleSnapshot; primaryProductImageIds?: string[]
   facts: ProductFactsState; analyses: Record<string, ReferenceAnalysisSnapshot>; profile?: ApiProfile | null; disabled: boolean
   analysisTarget: string | null; onCloseAnalysis: () => void; onBusy: (value: boolean) => void
   onFacts: (value: ProductFactsState, persist?: boolean) => Promise<void>; onAnalyses: (value: Record<string, ReferenceAnalysisSnapshot>, persist?: boolean) => Promise<void>
@@ -35,10 +36,10 @@ export default function ProductContextPanel(props: {
   const latest = useRef(props); latest.current = props
   const log = usePlannerRunLog('analysis')
   const current = confirmedProductFacts(props.facts)
-  const productImages = props.images.filter((image) => normalizeReferenceUsage(props.usages[image.id]).purpose === 'product')
-  const sourceFingerprint = contextFingerprint([props.listingText.trim(), productImages.map((image) => image.id)])
+  const productImages = props.images.filter((image) => normalizeReferenceUsage(props.usages[image.id]).purpose === 'product' && (!props.primaryProductImageIds || props.primaryProductImageIds.includes(image.id)))
+  const sourceFingerprint = contextFingerprint([props.listingText.trim(), productImages.map((image) => image.id), props.categoryRule ?? null])
   const referenceKey = contextFingerprint([props.sessionKey, props.images.map((image) => [image.id, normalizeReferenceUsage(props.usages[image.id])]), props.profile ? referenceProfileIdentity(props.profile) : ''])
-  const sourceKey = contextFingerprint([referenceKey, props.listingText])
+  const sourceKey = contextFingerprint([referenceKey, props.listingText, props.categoryRule ?? null, props.primaryProductImageIds ?? null])
   const target = props.images.find((image) => image.id === props.analysisTarget)
   const analysis = target ? props.analyses[target.id] : undefined
   const close = () => { if (operation === 'reference') stop(); props.onCloseAnalysis() }
@@ -114,7 +115,7 @@ export default function ProductContextPanel(props: {
       } else {
         const payload = await prepareReferenceImagePayload(resolved.map((image) => image.dataUrl), { signal: controller.signal })
         log.add('仅使用商品实物图和文字资料提取事实；风格图、构图图不作为商品事实来源')
-        const result = await extractProductFacts({ profile, listingText: props.listingText, manualFacts: props.facts.draft, productImages: payload.dataUrls, signal: controller.signal, onProgress: log.progress })
+        const result = await extractProductFacts({ profile, listingText: props.listingText, manualFacts: props.facts.draft, productImages: payload.dataUrls, categoryRule: props.categoryRule, signal: controller.signal, onProgress: log.progress })
         controller.signal.throwIfAborted()
         await latest.current.onFacts({ ...latest.current.facts, draft: result, draftSource: 'ai' }, true)
         log.finish('success', '商品事实草稿已提取，请逐项核实后点击“确认并保存新版本”；当前已确认版本未被替换')

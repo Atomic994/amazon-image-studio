@@ -27,6 +27,7 @@ import type {
   ReferenceLibraryItem,
   ReferenceLibrarySeed,
   PlannerThemePreset,
+  CategoryRulePreset,
   FinalSetSelection,
   FinalSetSelections,
   GenerationQueueItem,
@@ -91,6 +92,9 @@ import { collectWorkflowImageIds } from './lib/workflowReferences'
 import { collectFinalSetImageIds, finalImageRoot, normalizeFinalSetSelections } from './lib/finalSets'
 import { referenceSeedFromOutput } from './lib/referenceLibrary'
 import { normalizePlannerThemePreset } from './lib/plannerThemes'
+import { normalizeCategoryRule } from './lib/categoryRules'
+import { categoryRulePresetsDb } from './lib/db'
+import { normalizePatchTransfer, patchImageIds } from './lib/patchTransfer'
 import { queueSubmissionRef, restoreGenerationQueue } from './lib/generationQueueModel'
 import { withGenerationQueueRecovery } from './lib/generationQueueLock'
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate'
@@ -141,7 +145,7 @@ const DEFAULT_SEEDREAM_EDITOR_DRAFT: SeedreamEditorDraft = {
   updatedAt: 0,
 }
 
-type PendingTaskCategory = Pick<TaskRecord, 'productFactsSnapshot' | 'referenceAnalysisSnapshots' | 'localEditProtection'> & (
+type PendingTaskCategory = Pick<TaskRecord, 'productFactsSnapshot' | 'categoryRuleSnapshot' | 'productCompositionSnapshot' | 'referenceAnalysisSnapshots' | 'localEditProtection' | 'imageEditContext'> & (
   | {
       mode: 'prompt-match'
       prompt: string
@@ -722,7 +726,7 @@ export async function reuseMaterialItem(item: MaterialCollectionItem) {
   state.setInputImages(images)
   state.setParams(item.params)
   state.setPrompt(item.prompt)
-  state.setPendingTaskCategory({ mode: 'prompt-match', prompt: item.prompt, category: item.category ?? {}, productFactsSnapshot: item.productFactsSnapshot, referenceAnalysisSnapshots: item.referenceAnalysisSnapshots, localEditProtection: item.localEditProtection })
+  state.setPendingTaskCategory({ mode: 'prompt-match', prompt: item.prompt, category: item.category ?? {}, productFactsSnapshot: item.productFactsSnapshot, categoryRuleSnapshot: item.categoryRuleSnapshot, productCompositionSnapshot: item.productCompositionSnapshot, referenceAnalysisSnapshots: item.referenceAnalysisSnapshots, localEditProtection: item.localEditProtection, imageEditContext: item.imageEditContext ? { ...structuredClone(item.imageEditContext), engine: 'home' } : undefined })
   useStore.setState({ referenceImageUsages: { ...state.referenceImageUsages, ...Object.fromEntries(images.map((image) => [image.id, normalizeReferenceUsage(item.referenceImageUsages?.[image.id])])) } })
 }
 
@@ -849,6 +853,8 @@ interface AppState {
   referenceLibrary: ReferenceLibraryItem[]
   referenceLibrarySeed: ReferenceLibrarySeed | null
   plannerThemePresets: PlannerThemePreset[]
+  categoryRulePresets: CategoryRulePreset[]
+  plannerHistoryRevision: number
   finalSetSelections: FinalSetSelections
   generationQueue: GenerationQueueItem[]
   generationQueuePaused: boolean
@@ -978,8 +984,8 @@ function isImageReferencedByState(state: AppState, imageId: string) {
   if (state.imageFinalSelections[imageId] || Object.values(state.imageFinalSelections).includes(imageId)) return true
   if (state.inputImages.some((img) => img.id === imageId)) return true
   if (state.galleryInputDraft?.inputImages.some((img) => img.id === imageId)) return true
-  if (state.seedreamEditorDraft.sourceImageId === imageId || state.seedreamEditorDraft.localEditMaskId === imageId || state.seedreamEditorDraft.referenceImageIds.includes(imageId)) return true
-  if (Object.values(state.imageEditorDrafts).some((draft) => draft.sourceImageId === imageId || draft.localEditMaskId === imageId || draft.referenceImageIds.includes(imageId))) return true
+  if (state.seedreamEditorDraft.sourceImageId === imageId || state.seedreamEditorDraft.localEditMaskId === imageId || state.seedreamEditorDraft.referenceImageIds.includes(imageId) || patchImageIds(state.seedreamEditorDraft.patchTransfer).includes(imageId)) return true
+  if (Object.values(state.imageEditorDrafts).some((draft) => draft.sourceImageId === imageId || draft.localEditMaskId === imageId || draft.referenceImageIds.includes(imageId) || patchImageIds(draft.patchTransfer).includes(imageId))) return true
   if (collectPlannerImageReferences([], state.settings).has(imageId)) return true
   if (Object.values(state.agentInputDrafts).some((draft) => draft.inputImages.some((img) => img.id === imageId))) return true
   if (state.tasks.some((task) =>
@@ -990,6 +996,8 @@ function isImageReferencedByState(state: AppState, imageId: string) {
     task.maskImageId === imageId ||
     task.localEditProtection?.baseImageId === imageId ||
     task.localEditProtection?.maskImageId === imageId ||
+    patchImageIds(task.imageEditContext?.patchTransfer).includes(imageId) ||
+    task.productCompositionSnapshot?.products.some((product) => product.imageIds.includes(imageId)) ||
     task.imageEditContext?.sourceImageId === imageId ||
     task.imageEditContext?.visualGuideImageId === imageId ||
     task.productFactsSnapshot?.sourceImageIds.includes(imageId) ||
@@ -1376,6 +1384,8 @@ export const useStore = create<AppState>()(
       referenceLibrary: [],
       referenceLibrarySeed: null,
       plannerThemePresets: [],
+      categoryRulePresets: [],
+      plannerHistoryRevision: 0,
       finalSetSelections: {},
       generationQueue: [],
       generationQueuePaused: true,
@@ -1394,7 +1404,7 @@ export const useStore = create<AppState>()(
         const next = normalizeSeedreamEditorDraft({
           ...state.seedreamEditorDraft,
           ...patch,
-          ...(patch.sourceImageId !== undefined && patch.sourceImageId !== state.seedreamEditorDraft.sourceImageId && patch.localEditMaskId === undefined ? { localEditMaskId: null, protectUneditedArea: true } : {}),
+          ...(patch.sourceImageId !== undefined && patch.sourceImageId !== state.seedreamEditorDraft.sourceImageId && patch.localEditMaskId === undefined ? { localEditMaskId: null, patchTransfer: undefined, protectUneditedArea: true } : {}),
           updatedAt: Date.now(),
         })
         const imageEditorDrafts = { ...state.imageEditorDrafts }
@@ -1818,6 +1828,7 @@ export function normalizeSeedreamEditorDraft(value: unknown): SeedreamEditorDraf
     ...(draft.preserveProductFacts === false ? { preserveProductFacts: false } : {}),
     localEditMaskId: sourceImageId && typeof draft.localEditMaskId === 'string' ? draft.localEditMaskId : null,
     protectUneditedArea: draft.protectUneditedArea !== false,
+    patchTransfer: sourceImageId ? normalizePatchTransfer(draft.patchTransfer) : undefined,
     annotations: Array.isArray(draft.annotations)
       ? draft.annotations.map(normalizeSeedreamAnnotation).filter((item): item is SeedreamAnnotation => item != null)
       : [],
@@ -2112,7 +2123,8 @@ export async function initStore() {
   const plannerThemePresets = (await plannerThemePresetsDb.getAll()).map(normalizePlannerThemePreset).filter((row): row is PlannerThemePreset => !!row)
   const finalSetSelections = await readFinalSetSelections()
   void referenceAnalysisCache.prune().catch(() => { /* Cache cleanup must not block existing local work. */ })
-  useStore.setState({ materialCollections, referenceLibrary, plannerThemePresets, finalSetSelections, generationQueue, generationQueuePaused: true })
+  const categoryRulePresets = (await categoryRulePresetsDb.getAll()).map(normalizeCategoryRule).filter((row): row is CategoryRulePreset => !!row)
+  useStore.setState({ materialCollections, referenceLibrary, plannerThemePresets, categoryRulePresets, finalSetSelections, generationQueue, generationQueuePaused: true })
   const { tasks, restoredQueue } = await withGenerationQueueRecovery(async () => {
     const fresh = await getAllTasks()
     const { tasks, interruptedTasks } = markInterruptedOpenAIRunningTasks(fresh)
@@ -2313,6 +2325,8 @@ export interface SubmitTaskWithInputRequest {
   maskImageId?: string | null
   localEditProtection?: Pick<LocalEditProtection, 'baseImageId' | 'maskImageId'> & Partial<Pick<LocalEditProtection, 'baseHash' | 'maskHash'>>
   productFactsSnapshot?: TaskRecord['productFactsSnapshot']
+  categoryRuleSnapshot?: TaskRecord['categoryRuleSnapshot']
+  productCompositionSnapshot?: TaskRecord['productCompositionSnapshot']
   referenceAnalysisSnapshots?: TaskRecord['referenceAnalysisSnapshots']
   referenceImageUsages?: Record<string, ReferenceImageUsage>
   generationQueueRef?: string
@@ -2406,7 +2420,7 @@ export async function submitTaskWithInput(request: SubmitTaskWithInputRequest): 
   const mapImageId = (id: string | null | undefined) => id ? imageIdMap.get(id) ?? id : id
   const imageEditContext = request.imageEditContext
     ? {
-        ...request.imageEditContext,
+        ...structuredClone(request.imageEditContext),
         sourceImageId: mapImageId(request.imageEditContext.sourceImageId)!,
         visualGuideImageId: mapImageId(request.imageEditContext.visualGuideImageId),
         referenceImageIds: request.imageEditContext.referenceImageIds.map((id) => mapImageId(id)!),
@@ -2441,6 +2455,8 @@ export async function submitTaskWithInput(request: SubmitTaskWithInputRequest): 
     elapsed: null,
     category: request.productFactsSnapshot ? { ...request.category, productFactsVersionId: request.productFactsSnapshot.id } : request.category,
     productFactsSnapshot: request.productFactsSnapshot ? JSON.parse(JSON.stringify(request.productFactsSnapshot)) : undefined,
+    categoryRuleSnapshot: request.categoryRuleSnapshot ? structuredClone(request.categoryRuleSnapshot) : undefined,
+    productCompositionSnapshot: request.productCompositionSnapshot ? structuredClone(request.productCompositionSnapshot) : undefined,
     referenceAnalysisSnapshots: referenceAnalysisSnapshots.length ? JSON.parse(JSON.stringify(referenceAnalysisSnapshots)) : undefined,
     imageEditContext,
     referenceImageUsages,
@@ -2583,6 +2599,9 @@ export async function submitTask(options: { allowFullMask?: boolean; useCurrentA
     inputImages: orderedInputImages,
     params: normalizedParams,
     category,
+    imageEditContext: pendingTaskCategory && (pendingTaskCategory.mode === 'next-submit' || pendingTaskCategory.prompt.trim() === trimmedPrompt) ? pendingTaskCategory.imageEditContext : undefined,
+    categoryRuleSnapshot: pendingTaskCategory && (pendingTaskCategory.mode === 'next-submit' || pendingTaskCategory.prompt.trim() === trimmedPrompt) ? pendingTaskCategory.categoryRuleSnapshot : undefined,
+    productCompositionSnapshot: pendingTaskCategory && (pendingTaskCategory.mode === 'next-submit' || pendingTaskCategory.prompt.trim() === trimmedPrompt) ? pendingTaskCategory.productCompositionSnapshot : undefined,
     productFactsSnapshot: pendingTaskCategory && (pendingTaskCategory.mode === 'next-submit' || pendingTaskCategory.prompt.trim() === trimmedPrompt) ? pendingTaskCategory.productFactsSnapshot : undefined,
     referenceAnalysisSnapshots: pendingTaskCategory && (pendingTaskCategory.mode === 'next-submit' || pendingTaskCategory.prompt.trim() === trimmedPrompt) ? pendingTaskCategory.referenceAnalysisSnapshots : undefined,
     maskTargetImageId,
@@ -2852,10 +2871,12 @@ function addInputDraftReferencedImageIds(target: Set<string>, draft: AgentInputD
 function addSeedreamEditorDraftReferencedImageIds(target: Set<string>, draft = useStore.getState().seedreamEditorDraft) {
   if (draft.sourceImageId) target.add(draft.sourceImageId)
   if (draft.localEditMaskId) target.add(draft.localEditMaskId)
+  for (const id of patchImageIds(draft.patchTransfer)) target.add(id)
   for (const id of draft.referenceImageIds) target.add(id)
   for (const saved of Object.values(useStore.getState().imageEditorDrafts)) {
     if (saved.sourceImageId) target.add(saved.sourceImageId)
     if (saved.localEditMaskId) target.add(saved.localEditMaskId)
+    for (const id of patchImageIds(saved.patchTransfer)) target.add(id)
     for (const id of saved.referenceImageIds) target.add(id)
   }
 }
@@ -2875,6 +2896,8 @@ function addTaskReferencedImageIds(target: Set<string>, task: TaskRecord) {
   for (const id of task.inputImageIds || []) target.add(id)
   if (task.maskImageId) target.add(task.maskImageId)
   if (task.localEditProtection) { target.add(task.localEditProtection.baseImageId); target.add(task.localEditProtection.maskImageId) }
+  for (const id of patchImageIds(task.imageEditContext?.patchTransfer)) target.add(id)
+  for (const product of task.productCompositionSnapshot?.products ?? []) for (const id of product.imageIds) target.add(id)
   if (task.imageEditContext?.sourceImageId) target.add(task.imageEditContext.sourceImageId)
   if (task.imageEditContext?.visualGuideImageId) target.add(task.imageEditContext.visualGuideImageId)
   for (const id of task.imageEditContext?.referenceImageIds || []) target.add(id)
@@ -4415,10 +4438,12 @@ export async function retryTask(task: TaskRecord) {
     elapsed: null,
     category: task.category,
     productFactsSnapshot: task.productFactsSnapshot ? JSON.parse(JSON.stringify(task.productFactsSnapshot)) : undefined,
+    categoryRuleSnapshot: task.categoryRuleSnapshot ? structuredClone(task.categoryRuleSnapshot) : undefined,
+    productCompositionSnapshot: task.productCompositionSnapshot ? structuredClone(task.productCompositionSnapshot) : undefined,
     referenceAnalysisSnapshots: task.referenceAnalysisSnapshots ? JSON.parse(JSON.stringify(task.referenceAnalysisSnapshots)) : undefined,
     referenceImageUsages: task.referenceImageUsages ? JSON.parse(JSON.stringify(task.referenceImageUsages)) : undefined,
     imageEditContext: task.imageEditContext ? {
-      ...task.imageEditContext,
+      ...structuredClone(task.imageEditContext),
       referenceImageIds: [...task.imageEditContext.referenceImageIds],
     } : undefined,
   }
@@ -4436,6 +4461,7 @@ export async function retryTask(task: TaskRecord) {
           ...DEFAULT_SEEDREAM_EDITOR_DRAFT, sourceImageId, engine: editorEngine,
           instruction: task.imageEditContext?.userInstruction ?? task.prompt,
           referenceImageIds: task.imageEditContext?.referenceImageIds ?? [],
+          patchTransfer: task.imageEditContext?.patchTransfer,
           localEditMaskId: task.localEditProtection?.maskImageId,
           protectUneditedArea: Boolean(task.localEditProtection),
         }) } })
@@ -4490,6 +4516,7 @@ export function openSeedreamTaskInEditor(task: TaskRecord) {
     referenceImageIds: (context?.referenceImageIds ?? []).filter((id) => id !== sourceImageId).slice(0, MAX_SEEDREAM_REFERENCE_IMAGES),
     instruction: context?.userInstruction ?? task.prompt,
     annotations: keepAnnotations ? remembered!.annotations : [],
+    patchTransfer: context?.patchTransfer,
     localEditMaskId: task.localEditProtection?.maskImageId ?? null,
     protectUneditedArea: Boolean(task.localEditProtection),
     resolution: getSeedreamEditorResolutionFromSize(task.params.size),
@@ -4540,6 +4567,8 @@ export async function reuseConfig(task: TaskRecord) {
     mode: 'next-submit',
     category: createNextSubmitTaskCategory(task),
     productFactsSnapshot: task.productFactsSnapshot,
+    categoryRuleSnapshot: task.categoryRuleSnapshot,
+    productCompositionSnapshot: task.productCompositionSnapshot,
     referenceAnalysisSnapshots: task.referenceAnalysisSnapshots,
     localEditProtection: task.localEditProtection,
   })
@@ -4708,9 +4737,10 @@ export async function clearData(options: ClearOptions = { clearConfig: true, cle
     await dbClearMaterialCollections()
     await referenceLibraryDb.clear()
     await plannerThemePresetsDb.clear()
+    await categoryRulePresetsDb.clear()
     await finalSetSelectionsDb.clear()
     await generationQueueDb.clear()
-    useStore.setState({ referenceLibrary: [], referenceLibrarySeed: null, plannerThemePresets: [], finalSetSelections: {}, generationQueue: [], generationQueueReady: true })
+    useStore.setState({ referenceLibrary: [], referenceLibrarySeed: null, plannerThemePresets: [], categoryRulePresets: [], finalSetSelections: {}, generationQueue: [], generationQueueReady: true })
     useStore.setState({ materialCollections: [], imageResultReviews: {}, imageFinalSelections: {}, referenceImageUsages: {}, reviewImageId: null, materialCollectionDraft: null })
     await dbClearTasks()
     await dbClearAmazonPlannerSessions()
@@ -4929,6 +4959,7 @@ export async function exportData(options: ExportOptions = { exportConfig: true, 
       manifest.materialCollections = materialCollections
       manifest.referenceLibrary = referenceLibrary
       manifest.plannerThemePresets = (await plannerThemePresetsDb.getAll()).map(normalizePlannerThemePreset).filter((row): row is PlannerThemePreset => !!row)
+      manifest.categoryRulePresets = (await categoryRulePresetsDb.getAll()).map(normalizeCategoryRule).filter((row): row is CategoryRulePreset => !!row)
       manifest.finalSetSelections = await readFinalSetSelections()
       manifest.generationQueue = generationQueue
       manifest.imageResultReviews = useStore.getState().imageResultReviews
@@ -5024,15 +5055,17 @@ export async function importData(file: File, options: ImportOptions = { importCo
       }
       for (const item of data.referenceLibrary ?? []) if (item?.id && item.imageId && Array.isArray(item.analyses)) await referenceLibraryDb.put(item)
       for (const raw of Array.isArray(data.plannerThemePresets) ? data.plannerThemePresets : []) { const item = normalizePlannerThemePreset(raw); if (item) await plannerThemePresetsDb.put(item) }
+      for (const raw of Array.isArray(data.categoryRulePresets) ? data.categoryRulePresets : []) { const item = normalizeCategoryRule(raw); if (item) await categoryRulePresetsDb.put(item) }
       for (const [scope, rows] of Object.entries(normalizeFinalSetSelections(data.finalSetSelections))) for (const [slot, selection] of Object.entries(rows)) await finalSetSelectionsDb.put(scope, slot, selection)
       for (const item of data.generationQueue ?? []) if (item?.id && item.request?.prompt && Array.isArray(item.request.inputImageIds)) {
         await generationQueueDb.put({ ...item, status: item.status === 'running' ? 'interrupted' : item.status, error: item.status === 'running' ? '备份中的任务执行状态未知，请核对后重试' : item.error })
       }
       useStore.setState((state) => ({
+        plannerHistoryRevision: state.plannerHistoryRevision + 1,
         imageResultReviews: { ...state.imageResultReviews, ...normalizeImageResultReviews(data.imageResultReviews) },
         imageFinalSelections: { ...state.imageFinalSelections, ...normalizeImageSelections(data.imageFinalSelections) },
       }))
-      useStore.setState({ materialCollections: await getAllMaterialCollections(), referenceLibrary: await referenceLibraryDb.getAll(), plannerThemePresets: await plannerThemePresetsDb.getAll(), finalSetSelections: await readFinalSetSelections(), generationQueue: await generationQueueDb.getAll(), generationQueuePaused: true })
+      useStore.setState({ materialCollections: await getAllMaterialCollections(), referenceLibrary: await referenceLibraryDb.getAll(), plannerThemePresets: await plannerThemePresetsDb.getAll(), categoryRulePresets: await categoryRulePresetsDb.getAll(), finalSetSelections: await readFinalSetSelections(), generationQueue: await generationQueueDb.getAll(), generationQueuePaused: true })
 
       const tasks = await getAllTasks()
       useStore.getState().setTasks(tasks)
