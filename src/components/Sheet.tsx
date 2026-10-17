@@ -75,7 +75,7 @@ export function Sheet({
         onClick={closeOnBackdrop ? onClose : undefined}
         aria-hidden="true"
       />
-      <div ref={panelRef} className={`ios-sheet-panel ${className}`} style={panelStyle}>
+      <div ref={panelRef} tabIndex={-1} className={`ios-sheet-panel ${className}`} style={panelStyle}>
         <div
           className="ios-sheet-grabber-zone"
           {...dragHandleProps}

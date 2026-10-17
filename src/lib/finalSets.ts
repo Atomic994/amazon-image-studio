@@ -5,7 +5,7 @@ import { patchImageIds } from './patchTransfer'
 import { plannerContextForSlot } from './plannerContext'
 import { plannerContextChangeReasons } from './referenceAnalysis'
 import { contextFingerprint } from './productFacts'
-import { buildImageVersionHistory } from './imageVersions'
+import { buildImageVersionHistory, normalizeImageResultReviews } from './imageVersions'
 import { localId } from './localId'
 
 export type FinalSetStatus = 'missing' | 'running' | 'error' | 'pending' | 'changes-requested' | 'needs-review' | 'approved'
@@ -25,6 +25,8 @@ export function normalizeFinalSetSelections(value: unknown): FinalSetSelections 
       const row = raw as FinalSetSelections[string][string]
       if (typeof row.imageId !== 'string' || !row.imageId || typeof row.contextFingerprint !== 'string' || !Number.isFinite(row.confirmedAt)) continue
       ;(output[scope] ??= {})[slot] = { imageId: row.imageId, contextFingerprint: row.contextFingerprint, confirmedAt: row.confirmedAt, plannerModuleVersionId: typeof row.plannerModuleVersionId === 'string' ? row.plannerModuleVersionId : undefined,
+        ...(['approved', 'pending', 'changes-requested'].includes(row.reviewStatus ?? '') ? { reviewStatus: row.reviewStatus } : {}),
+        ...(row.candidateReviews ? { candidateReviews: normalizeImageResultReviews(row.candidateReviews) } : {}),
         ...(row.item?.imageId === row.imageId && Array.isArray(row.item.referenceImageIds) ? { item: structuredClone(row.item) } : {}) }
     }
   }
@@ -60,9 +62,9 @@ export function buildFinalSetRows(options: { session?: AmazonPlannerSession; tas
   const imagesBySlot = new Map<string, Set<string>>()
   for (const item of items) { const slots = imagesBySlot.get(item.imageId) ?? new Set<string>(); slots.add(item.slot); imagesBySlot.set(item.imageId, slots) }
   const unique = [...new Map(items.map((item) => {
-    const selected = options.selections[scope]?.[item.slot]
+    const selected = options.selections[scope]?.[item.slot || `image:${item.imageId}`]
     const shared = (imagesBySlot.get(item.imageId)?.size ?? 0) > 1
-    const note = selected?.imageId === item.imageId ? selected.item?.reviewNote ?? (shared ? undefined : options.reviews[item.imageId]?.note) : shared ? undefined : options.reviews[item.imageId]?.note
+    const note = selected?.candidateReviews?.[item.imageId]?.note ?? (selected?.imageId === item.imageId ? selected.item?.reviewNote ?? (shared ? undefined : options.reviews[item.imageId]?.note) : shared ? undefined : options.reviews[item.imageId]?.note)
     return [`${item.slot}:${item.imageId}`, { ...item, id: `final:${item.slot}:${item.imageId}`, reviewNote: note ?? item.reviewNote }]
   })).values()]
   const expected = session ? mode === 'listing' ? getAmazonListingImageSlots(session.listingImageCount).map((slot) => ({ slot, label: session.imagePlans.find((plan) => plan.slot === slot)?.label ?? slot }))
@@ -105,8 +107,9 @@ export function buildFinalSetRows(options: { session?: AmazonPlannerSession; tas
       return { ...base, status, reason: status === 'error' ? attempts[0].error || '请检查生成记录并重试' : status === 'running' ? '结果完成后会出现在这里' : '尚无此图片位的生成结果' }
     }
     if (!chosen) return { ...base, status: selected && options.reviews[selected.imageId]?.status === 'changes-requested' ? 'changes-requested' : 'pending', reason: approved.length > 1 ? '存在多个已通过版本，请明确选定一个最终稿' : selected && options.reviews[selected.imageId]?.status === 'changes-requested' ? options.reviews[selected.imageId].note || '此图已标记为需要修改' : '选择一个版本并确认最终稿' }
-    if (options.reviews[chosen.imageId]?.status === 'changes-requested') return { ...base, status: 'changes-requested', reason: options.reviews[chosen.imageId].note || '此图已被标记为需要修改' }
-    if (explicit && options.reviews[chosen.imageId]?.status === 'approved' && explicit.contextFingerprint === fingerprint) return { ...base, final: chosen, status: 'approved', reason: '已人工确认当前策划与参考上下文' }
+    if (explicit?.reviewStatus === 'changes-requested' || (!explicit?.reviewStatus && options.reviews[chosen.imageId]?.status === 'changes-requested')) return { ...base, status: 'changes-requested', reason: explicit?.reviewStatus ? explicit.item?.reviewNote || '此图片位已标记为需要修改' : options.reviews[chosen.imageId].note || '此图已被标记为需要修改' }
+    if (explicit?.reviewStatus === 'pending' && explicit.contextFingerprint === fingerprint) return { ...base, status: 'pending', reason: '已保存此图片位意见，尚未确认最终稿' }
+    if (explicit && (explicit.reviewStatus === 'approved' || (!explicit.reviewStatus && options.reviews[chosen.imageId]?.status === 'approved')) && explicit.contextFingerprint === fingerprint) return { ...base, final: chosen, status: 'approved', reason: '已人工确认当前策划与参考上下文' }
     if (frozen && !explicit) {
       const oldSession = frozenVersion?.plannerSession, oldKey = `${oldSession?.mode ?? mode}:${slot}`, review = options.reviews[chosen.imageId]
       const sameContext = !session || !oldSession || (contextFingerprint(context) === contextFingerprint(plannerContextForSlot(oldSession, slot)) && currentVersionId === oldSession.selectedModuleVersions?.[oldKey])

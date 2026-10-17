@@ -457,6 +457,28 @@ describe('local material and review persistence', () => {
     await expect(saveFinalSetSelection('planner:one:listing', 'PT01', { imageId: 'not-present', contextFingerprint: 'context', confirmedAt: 2 }, '')).rejects.toThrow('已不存在')
   })
 
+  it('persists scoped review notes without replacing another candidate final or bleeding across slots', async () => {
+    for (const id of ['review-final', 'review-alternative']) await putImage({ id, dataUrl: `data:image/png;base64,${id}`, createdAt: 1 })
+    const scope = 'planner:continuous:listing', selected = (imageId: string) => ({ imageId, contextFingerprint: 'context', confirmedAt: 10, item: materialItemFromTask(task({ outputImages: [imageId] }), imageId) })
+    await saveFinalSetSelection(scope, 'MAIN', selected('review-final'), 'Approved MAIN')
+    await saveFinalSetSelection(scope, 'MAIN', selected('review-alternative'), 'Alternative needs work', 'changes-requested')
+    await saveFinalSetSelection(scope, 'PT01', selected('review-final'), 'Separate detail note', 'pending')
+    let rows = useStore.getState().finalSetSelections[scope]
+    expect(rows.MAIN).toMatchObject({ imageId: 'review-final', reviewStatus: 'approved', item: { reviewNote: 'Approved MAIN' }, candidateReviews: { 'review-alternative': { status: 'changes-requested', note: 'Alternative needs work' } } })
+    expect(rows.PT01).toMatchObject({ reviewStatus: 'pending', item: { reviewNote: 'Separate detail note' } })
+    await initStore(); rows = useStore.getState().finalSetSelections[scope]
+    expect(rows.MAIN.candidateReviews?.['review-alternative'].note).toBe('Alternative needs work'); expect(rows.PT01.item?.reviewNote).toBe('Separate detail note')
+    const global = useStore.getState().imageResultReviews['review-final']
+    expect(global).toMatchObject({ status: 'approved', note: 'Approved MAIN' })
+  })
+
+  it('rejects an approval when the displayed context changes during original image verification', async () => {
+    await putImage({ id: 'review-stale', dataUrl: 'data:image/png;base64,test', createdAt: 1 })
+    const guard = () => { throw new Error('策划已变化') }
+    await expect(saveFinalSetSelection('planner:stale:listing', 'MAIN', { imageId: 'review-stale', confirmedAt: 1, contextFingerprint: 'old' }, '', 'approved', guard)).rejects.toThrow('策划已变化')
+    expect(useStore.getState().finalSetSelections['planner:stale:listing']).toBeUndefined()
+  })
+
   it('keeps the selected slot as reference provenance when identical pixels were generated for different slots', () => {
     const main = task({ id: 'main', outputImages: ['same-image'], category: { plannerSessionId: 'suite', amazonSlot: 'MAIN', plannerModuleVersionId: 'main-plan' } })
     const detail = task({ id: 'detail', outputImages: ['same-image'], category: { plannerSessionId: 'suite', amazonSlot: 'PT01', plannerModuleVersionId: 'detail-plan' } })

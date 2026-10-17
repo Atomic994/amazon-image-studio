@@ -46,6 +46,7 @@ import Select from './Select'
 import { Sheet, useSheetDrag } from './Sheet'
 import { Checkbox } from './Checkbox'
 import ViewportTooltip from './ViewportTooltip'
+import ApiDiagnosticModal from './ApiDiagnosticModal'
 import { ChevronDownIcon, CloseIcon, CopyIcon, EditIcon, PlusIcon, TrashIcon, ExportIcon, ImportIcon, LinkIcon, PhotoIcon, GithubIcon } from './icons'
 
 function newId(prefix: string) {
@@ -401,6 +402,7 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
   const [customProviderImportError, setCustomProviderImportError] = useState<string | null>(null)
   const [llmPromptTooltipVisible, setLlmPromptTooltipVisible] = useState(false)
   const [activeTab, setActiveTab] = useState<SettingsTab>('api')
+  const [diagnosticRole, setDiagnosticRole] = useState<'image' | 'planner' | 'editor' | null>(null)
   const [exportConfig, setExportConfig] = useState(true)
   const [exportTasks, setExportTasks] = useState(true)
   const [importConfig, setImportConfig] = useState(true)
@@ -503,6 +505,7 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
   useEffect(() => {
     if (!showSettings) {
       wasSettingsOpenRef.current = false
+      setDiagnosticRole(null)
       return
     }
     if (wasSettingsOpenRef.current) return
@@ -1155,6 +1158,10 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
           aria-modal="true"
           aria-labelledby="settings-sheet-title"
         >
+      {diagnosticRole && (diagnosticRole === 'planner' ? effectiveAmazonPlannerProfile : diagnosticRole === 'editor' ? seedreamEditorProfile : activeProfile) && <ApiDiagnosticModal
+        profile={(diagnosticRole === 'planner' ? effectiveAmazonPlannerProfile : diagnosticRole === 'editor' ? seedreamEditorProfile : activeProfile)!}
+        settings={draft} role={diagnosticRole === 'planner' ? 'planner' : 'image'} onClose={() => setDiagnosticRole(null)}
+      />}
       <div
         className="ios-sheet-backdrop absolute inset-0"
         onClick={handleClose}
@@ -1384,6 +1391,7 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
                               <h4 id="image-api-card-title" className="text-sm font-semibold tracking-[-0.01em] text-gray-900 dark:text-gray-100">图片生成</h4>
+                              <button type="button" onClick={() => setDiagnosticRole('image')} className="rounded-lg border border-blue-200 px-2 py-1 text-xs text-blue-600 dark:border-blue-400/30 dark:text-blue-300">生图接口自检</button>
                               <span
                                 className={imageProfileStatus.complete
                                   ? 'rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-200'
@@ -1633,6 +1641,7 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
                               <h4 id="planner-api-card-title" className="text-sm font-semibold tracking-[-0.01em] text-gray-900 dark:text-gray-100">AI 策划</h4>
+                              <button type="button" disabled={!effectiveAmazonPlannerProfile} onClick={() => setDiagnosticRole('planner')} className="rounded-lg border border-blue-200 px-2 py-1 text-xs text-blue-600 disabled:opacity-40 dark:border-blue-400/30 dark:text-blue-300">策划接口自检</button>
                               <span
                                 className={plannerUsesActiveConnection && plannerProfileStatus.complete
                                   ? 'rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700 dark:bg-blue-500/10 dark:text-blue-200'
@@ -1913,6 +1922,7 @@ export default function SettingsModal({ scope = 'home' }: SettingsModalProps) {
                       <div>
                         <div className="flex flex-wrap items-center gap-2">
                           <h4 id="seedream-api-card-title" className="text-sm font-semibold text-gray-900 dark:text-gray-100">Seedream 图片编辑</h4>
+                          <button type="button" disabled={!seedreamEditorProfile} onClick={() => setDiagnosticRole('editor')} className="rounded-lg border border-blue-200 px-2 py-1 text-xs text-blue-600 disabled:opacity-40 dark:border-blue-400/30 dark:text-blue-300">编辑接口自检</button>
                           <span className={seedreamEditorProfile && isVolcengineSeedreamProModel(seedreamEditorProfile.model)
                             ? 'rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-400/10 dark:text-emerald-200'
                             : 'rounded-md bg-gray-100 px-1.5 py-0.5 text-[10px] font-semibold text-gray-500 dark:bg-white/[0.06] dark:text-gray-400'}>

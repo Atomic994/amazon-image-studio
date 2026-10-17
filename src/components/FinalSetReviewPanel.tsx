@@ -1,0 +1,29 @@
+import { useEffect, useState } from 'react'
+import type { MaterialCollectionItem } from '../types'
+import type { FinalSetRow } from '../lib/finalSets'
+import { FINAL_SET_STATUS_LABELS } from '../lib/finalSets'
+import StoredImage from './StoredImage'
+
+const BUTTON = 'rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs text-gray-700 disabled:opacity-40 dark:border-white/10 dark:bg-gray-900 dark:text-gray-200'
+export default function FinalSetReviewPanel({ row, item, note, candidateStatus, position, total, remaining, available, dimensions, busy, message, canPrevious, canNext, canNextPending, onNote, onCandidate, onNavigate, onSave, onBack, versionLabel }: {
+  row: FinalSetRow; item: MaterialCollectionItem; note: string; position: number; total: number; remaining: number; available: boolean; dimensions?: string
+  busy: boolean; message: string; canPrevious: boolean; canNext: boolean; canNextPending: boolean
+  candidateStatus: 'approved' | 'changes-requested' | 'pending'
+  onNote: (note: string) => void; onCandidate: (imageId: string) => void; onNavigate: (direction: 'previous' | 'next' | 'pending') => void
+  onSave: (status: 'approved' | 'changes-requested' | 'note', advance: boolean) => void; onBack: () => void; versionLabel: (item: MaterialCollectionItem) => string
+}) {
+  const [zoom, setZoom] = useState(100), [compareId, setCompareId] = useState('')
+  useEffect(() => { setZoom(100); setCompareId('') }, [row.slot, item.imageId])
+  return <div className="min-w-0" aria-label="连续审核工作区">
+    <div className="mb-3 flex flex-wrap items-center gap-2"><button type="button" className={BUTTON} disabled={busy} onClick={onBack}>返回总览</button><strong className="text-sm text-gray-900 dark:text-gray-100">{row.slot.startsWith('image:') ? row.label : `${row.slot} · ${row.label}`}</strong><span className="text-xs text-gray-500">{position} / {total} · {FINAL_SET_STATUS_LABELS[row.status]} · 本轮尚未确认 {remaining} 项</span></div>
+    <div className="mb-3 flex flex-wrap items-center gap-2"><button type="button" disabled={busy || !canPrevious} className={BUTTON} onClick={() => onNavigate('previous')}>← 上一项</button><button type="button" disabled={busy || !canNext} className={BUTTON} onClick={() => onNavigate('next')}>下一项 →</button><button type="button" disabled={busy || !canNextPending} className={BUTTON} onClick={() => onNavigate('pending')}>下一未确认项（N）</button><label className="ml-auto flex items-center gap-2 text-xs text-gray-500">缩放<input aria-label="连续审核图片缩放" type="range" min={100} max={300} step={25} value={zoom} onChange={(event) => setZoom(Number(event.target.value))} className="w-24" />{zoom}%</label></div>
+    <div className={`grid gap-3 ${compareId ? 'sm:grid-cols-2' : ''}`}>{[...(compareId ? [{ id: compareId, label: '对照候选' }] : []), { id: item.imageId, label: '当前审核候选' }].map((image) => <section key={image.label} className="overflow-hidden rounded-xl border border-gray-200 dark:border-white/10"><p className="px-3 py-2 text-xs font-medium text-gray-500">{image.label}</p><div className="h-[35dvh] overflow-auto bg-gray-100 sm:h-[43dvh] dark:bg-gray-950"><div style={{ width: `${zoom}%`, height: `${zoom}%`, minWidth: '100%', minHeight: '100%' }}><StoredImage imageId={image.id} alt={`${row.slot} ${image.label}`} className="h-full w-full object-contain" /></div></div></section>)}</div>
+    <div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-xs text-gray-600 dark:text-gray-300">当前候选（{row.candidates.length}）<select aria-label="连续审核当前候选" value={item.imageId} disabled={busy} onChange={(event) => onCandidate(event.target.value)} className={`${BUTTON} mt-1 w-full`}>{row.candidates.map((candidate, index) => <option key={candidate.imageId} value={candidate.imageId}>结果 {index + 1} · {versionLabel(candidate)}{row.final?.imageId === candidate.imageId ? ' · 当前最终稿' : ''}</option>)}</select></label><label className="text-xs text-gray-600 dark:text-gray-300">对照候选<select aria-label="连续审核对照候选" value={compareId} onChange={(event) => setCompareId(event.target.value)} className={`${BUTTON} mt-1 w-full`}><option value="">不显示对照</option>{row.candidates.filter((candidate) => candidate.imageId !== item.imageId).map((candidate, index) => <option key={candidate.imageId} value={candidate.imageId}>对照 {index + 1} · {versionLabel(candidate)}</option>)}</select></label></div>
+    <p className="mt-2 text-xs text-gray-500">{row.reason} · {available ? `实际 ${dimensions ?? ''} px` : '原图正在核对或不可用，暂不能确认'}</p>
+    <p className="mt-1 text-xs text-gray-500">当前候选：{candidateStatus === 'approved' ? '此图片位最终稿' : candidateStatus === 'changes-requested' ? '需要修改' : '尚未确认'}{row.final && row.final.imageId !== item.imageId ? '。此图片位已有其他最终稿；保存意见不会替换，点击通过才会采用当前候选。' : ''}</p>
+    <label className="mt-3 block text-xs text-gray-600 dark:text-gray-300">此图片位的审核意见<textarea aria-label="连续审核意见" rows={2} maxLength={4000} disabled={busy} value={note} onChange={(event) => onNote(event.target.value)} placeholder="切换图片位或返回时，会先保存已修改的意见。" className="mt-1 w-full rounded-lg border border-gray-200 bg-white p-2 text-sm dark:border-white/10 dark:bg-gray-950" /></label>
+    <div className="mt-3 flex flex-wrap gap-2"><button type="button" disabled={busy || !available} onClick={() => onSave('approved', true)} className="rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white disabled:opacity-40">通过并下一项（Enter）</button><button type="button" disabled={busy || !available} onClick={() => onSave('changes-requested', true)} className={BUTTON}>需修改并下一项（R）</button><button type="button" disabled={busy || !available} onClick={() => onSave('note', false)} className={BUTTON}>保存意见</button></div>
+    <p role="status" className="mt-2 text-xs text-blue-600 dark:text-blue-300">{message || (busy ? '正在保存…' : '← / → 切换；N 跳到下一未确认项；Enter 通过；R 标记需修改；Esc 返回总览。输入文字或操作表单时不触发审核快捷键。')}</p>
+    <p className="mt-2 text-[11px] text-gray-500">“通过 / 需修改”成功保存后会跳到其他未确认项。未确认项全部处理完后留在当前图片；不会自动重生成、删除或发送模型请求。</p>
+  </div>
+}

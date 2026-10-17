@@ -609,6 +609,9 @@ export interface FinalSetSelection {
   contextFingerprint: string
   plannerModuleVersionId?: string
   item?: MaterialCollectionItem
+  /** Scoped to this set and slot; legacy entries fall back to the image-level review. */
+  reviewStatus?: ImageResultReview['status']
+  candidateReviews?: Record<string, ImageResultReview>
 }
 
 export type FinalSetSelections = Record<string, Record<string, FinalSetSelection>>

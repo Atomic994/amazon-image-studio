@@ -431,9 +431,10 @@ async function readPlannerResponseText(
   response: Response,
   signal: AbortSignal,
   field: 'imagePlans' | 'aPlusPlans',
-  callbacks: { onReceiving: (stats: { receivedChars: number; completedPlans: number }) => void; onThinking: () => void; onActivity: () => void },
+  callbacks: { onReceiving: (stats: { receivedChars: number; completedPlans: number }) => void; onThinking: () => void; onActivity: () => void; onTransport?: (transport: 'sse' | 'buffered-sse' | 'json') => void },
 ): Promise<string> {
   if (isEventStreamResponse(response)) {
+    callbacks.onTransport?.('sse')
     const collector = createPlannerStreamCollector(field, callbacks.onReceiving, callbacks.onThinking)
     await readJsonServerSentEvents(response, collector.onEvent, { signal, onDone: collector.onDone, onActivity: callbacks.onActivity })
     return collector.getText()
@@ -443,6 +444,7 @@ async function readPlannerResponseText(
   if (!rawText.trim()) throw new Error('AI 策划接口返回空内容')
 
   if (looksLikeServerSentEvents(rawText)) {
+    callbacks.onTransport?.('buffered-sse')
     const collector = createPlannerStreamCollector(field, callbacks.onReceiving, callbacks.onThinking)
     await readJsonServerSentEventText(rawText, collector.onEvent, { signal, onDone: collector.onDone, onActivity: callbacks.onActivity })
     return collector.getText()
@@ -453,6 +455,7 @@ async function readPlannerResponseText(
     throw new Error(`AI 策划接口返回了非 JSON 内容：${truncateForError(rawText)}`)
   }
 
+  callbacks.onTransport?.('json')
   let payload: unknown
   try {
     payload = JSON.parse(rawText)
@@ -928,6 +931,7 @@ export async function translatePlannerPreviewText(options: {
 export async function callPlannerStructuredAnalysis<T>(options: {
   profile: ApiProfile; instructions: string; text: string; images: string[]; schema: Record<string, unknown>; schemaName: string
   parse: (value: unknown) => T; signal?: AbortSignal; onProgress?: (progress: PlannerApiProgress) => void
+  maxAttempts?: 1 | 3; onTransport?: (transport: 'sse' | 'buffered-sse' | 'json') => void
 }): Promise<T> {
   const { profile } = options
   if (profile.apiMode !== 'chat' && profile.apiMode !== 'responses') throw new Error('分析需要 Chat Completions 或 Responses 策划配置')
@@ -947,10 +951,11 @@ export async function callPlannerStructuredAnalysis<T>(options: {
   const timeout = Number.isFinite(profile.timeout) && profile.timeout > 0 ? profile.timeout : DEFAULT_API_TIMEOUT
   const linked = createLinkedAbortController(timeout, options.signal)
   const signal = linked.controller.signal
+  const maxAttempts = options.maxAttempts === 1 ? 1 : MAX_PLANNER_ATTEMPTS
   try {
-    for (let attempt = 1; attempt <= MAX_PLANNER_ATTEMPTS; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       signal.throwIfAborted()
-      const emit = (progress: Omit<PlannerApiProgress, 'attempt' | 'maxAttempts'>) => options.onProgress?.({ ...progress, attempt, maxAttempts: MAX_PLANNER_ATTEMPTS })
+      const emit = (progress: Omit<PlannerApiProgress, 'attempt' | 'maxAttempts'>) => options.onProgress?.({ ...progress, attempt, maxAttempts })
       emit({ phase: 'connecting', receivedChars: 0 })
       try {
         const response = await fetch(url, { method: 'POST', signal, cache: 'no-store', headers: { Authorization: `Bearer ${profile.apiKey}`, 'Content-Type': 'application/json', Accept: 'text/event-stream, application/json' }, body: JSON.stringify(body) })
@@ -963,6 +968,7 @@ export async function callPlannerStructuredAnalysis<T>(options: {
           lastPhase = phase; lastEmissionAt = at; emit({ phase, receivedChars })
         }
         const text = await readPlannerResponseText(response, signal, 'aPlusPlans', {
+          onTransport: options.onTransport,
           onReceiving: (stats) => report('receiving', stats.receivedChars), onThinking: () => report('thinking'),
           onActivity: () => { const at = Date.now(); if (at - lastActivityAt >= 1000) { lastActivityAt = at; emit({ phase: 'activity' }) } },
         })
@@ -974,9 +980,9 @@ export async function callPlannerStructuredAnalysis<T>(options: {
       } catch (err) {
         signal.throwIfAborted()
         const fallback = body.stream && err instanceof PlannerHttpError && [400, 422].includes(err.status) && /stream/i.test(err.message) && /not support|unsupported|not allowed|must be false/i.test(err.message)
-        if (attempt === MAX_PLANNER_ATTEMPTS || (!fallback && !isRetryablePlannerError(err))) throw err
+        if (attempt === maxAttempts || (!fallback && !isRetryablePlannerError(err))) throw err
         const retryDelayMs = fallback ? 0 : err instanceof PlannerHttpError ? err.retryAfterMs ?? 1000 * 2 ** (attempt - 1) : 1000 * 2 ** (attempt - 1)
-        options.onProgress?.({ phase: fallback ? 'fallback' : 'retrying', attempt: attempt + 1, maxAttempts: MAX_PLANNER_ATTEMPTS, retryDelayMs, message: err instanceof Error ? err.message : String(err) })
+        options.onProgress?.({ phase: fallback ? 'fallback' : 'retrying', attempt: attempt + 1, maxAttempts, retryDelayMs, message: err instanceof Error ? err.message : String(err) })
         if (fallback) body.stream = false
         else await waitForPlannerRetry(retryDelayMs, signal)
       }

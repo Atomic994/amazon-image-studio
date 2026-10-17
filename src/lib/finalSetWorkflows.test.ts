@@ -79,6 +79,39 @@ describe('reusable planner theme presets', () => {
 })
 
 describe('final set selection and delivery', () => {
+  it('isolates scoped approval and change requests when two slots use the same bitmap', () => {
+    const s = session(), tasks = [task(s, 'shared', 'MAIN'), task(s, 'detail', 'PT01', { outputImages: ['shared'] })]
+    const input = options(s, tasks), rows = buildFinalSetRows(input)
+    const selections: FinalSetSelections = { [input.scope]: {
+      MAIN: { imageId: 'shared', confirmedAt: 10, contextFingerprint: rows[0].contextFingerprint, reviewStatus: 'approved', item: { ...rows[0].selected!, reviewNote: 'MAIN checked' }, candidateReviews: { shared: { status: 'approved', note: 'MAIN checked', updatedAt: 10 } } },
+      PT01: { imageId: 'shared', confirmedAt: 10, contextFingerprint: rows[1].contextFingerprint, reviewStatus: 'changes-requested', item: { ...rows[1].selected!, reviewNote: 'PT01 needs copy' }, candidateReviews: { shared: { status: 'changes-requested', note: 'PT01 needs copy', updatedAt: 10 } } },
+    } }
+    const result = buildFinalSetRows({ ...input, selections, reviews: { shared: { status: 'changes-requested', note: 'unrelated global note', updatedAt: 20 } } })
+    expect(result[0]).toMatchObject({ status: 'approved', final: { reviewNote: 'MAIN checked' } })
+    expect(result[1]).toMatchObject({ status: 'changes-requested', selected: { reviewNote: 'PT01 needs copy' } }); expect(result[1].final).toBeUndefined()
+  })
+  it('does not turn saved notes into approval and still expires scoped approvals after context changes', () => {
+    const s = session(), input = options(s, [task(s, 'photo')]), row = buildFinalSetRows(input)[0]
+    const selection: FinalSetSelections[string][string] = { imageId: 'photo', confirmedAt: 10, contextFingerprint: row.contextFingerprint, item: row.selected, reviewStatus: 'pending' }
+    expect(buildFinalSetRows({ ...input, selections: { [input.scope]: { MAIN: selection } } })[0].status).toBe('pending')
+    selection.reviewStatus = 'approved'
+    expect(buildFinalSetRows({ ...input, selections: { [input.scope]: { MAIN: selection } } })[0].status).toBe('approved')
+    s.listingText += ' changed claims'
+    expect(buildFinalSetRows({ ...input, selections: { [input.scope]: { MAIN: selection } } })[0].status).toBe('needs-review')
+  })
+  it('normalizes scoped candidate notes for backup without discarding old-style selections', () => {
+    const selection = { imageId: 'photo', confirmedAt: 1, contextFingerprint: 'context', reviewStatus: 'approved', candidateReviews: { a: { status: 'changes-requested', note: 'first', updatedAt: 2 }, b: { status: 'bad', note: 7, updatedAt: 3 } } }
+    const normalized = normalizeFinalSetSelections({ 'planner:s:listing': { MAIN: selection, PT01: { imageId: 'old', confirmedAt: 1, contextFingerprint: 'old' } } })
+    expect(normalized['planner:s:listing'].MAIN).toMatchObject({ reviewStatus: 'approved', candidateReviews: { a: { note: 'first', status: 'changes-requested' }, b: { note: '', status: 'pending' } } })
+    expect(normalized['planner:s:listing'].PT01.reviewStatus).toBeUndefined()
+  })
+  it('restores scoped notes for a non-planner collection with image-based slots', () => {
+    const item: MaterialCollectionItem = { id: 'material', imageId: 'standalone', slot: '', label: 'Standalone', prompt: 'Photo', params: { ...DEFAULT_PARAMS }, referenceImageIds: [] }
+    const input = { tasks: [], reviews: {}, finals: {}, scope: 'collection:generic:v1', version: { id: 'v1', versionNumber: 1, createdAt: 1, note: '', items: [item] }, selections: {} }
+    const row = buildFinalSetRows(input)[0]
+    const selections: FinalSetSelections = { [input.scope]: { [row.slot]: { imageId: item.imageId, confirmedAt: 2, contextFingerprint: row.contextFingerprint, reviewStatus: 'pending', item, candidateReviews: { standalone: { status: 'pending', note: 'Generic collection note', updatedAt: 2 } } } } }
+    expect(buildFinalSetRows({ ...input, selections })[0]).toMatchObject({ slot: 'image:standalone', status: 'pending', selected: { reviewNote: 'Generic collection note' } })
+  })
   it('retains frozen final confirmations in a saved or restored set, and rechecks changed contexts', () => {
     const original = session(), item = materialItemFromTask(task(original, 'snapshot-main'), 'snapshot-main')
     const collection = appendMaterialCollectionVersion({ title: original.title, items: [item], plannerSession: original, finalSet: { scope: finalSetScope(original), expectedSlots: ['MAIN'], missingSlots: [], confirmedAt: 2 } })

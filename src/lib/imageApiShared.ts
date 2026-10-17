@@ -242,22 +242,18 @@ export async function fetchImageUrlAsDataUrl(
 }
 
 export async function getApiErrorMessage(response: Response): Promise<string> {
-  let errorMsg = `HTTP ${response.status}`
+  // Read once: json() consumes plain-text gateway responses even when parsing fails.
+  const raw = await response.text()
+  let errorMsg = raw.slice(0, 1600) || response.statusText
   try {
-    const errJson = await response.json()
+    const errJson = JSON.parse(raw)
     if (errJson.error?.message) errorMsg = errJson.error.message
     else if (typeof errJson.detail === 'string') errorMsg = errJson.detail
     else if (Array.isArray(errJson.detail)) errorMsg = errJson.detail.map((item: unknown) => typeof item === 'string' ? item : JSON.stringify(item)).join('\n')
     else if (typeof errJson.error === 'string') errorMsg = errJson.error
     else if (errJson.message) errorMsg = errJson.message
-  } catch {
-    try {
-      errorMsg = await response.text()
-    } catch {
-      /* ignore */
-    }
-  }
-  return errorMsg
+  } catch { /* Plain text / HTML gateway errors still retain their HTTP status. */ }
+  return `HTTP ${response.status}${errorMsg ? `: ${String(errorMsg).slice(0, 1600)}` : ''}`
 }
 
 export function pickActualParams(source: unknown): Partial<TaskParams> {

@@ -737,13 +737,20 @@ export function openOutputInReferenceLibrary(imageId: string, category?: TaskRec
   useStore.setState({ referenceLibrarySeed: seed })
 }
 
-export async function saveFinalSetSelection(scope: string, slot: string, selection: FinalSetSelection, note: string) {
+export async function saveFinalSetSelection(scope: string, slot: string, selection: FinalSetSelection, note: string, reviewStatus: ImageResultReview['status'] = 'approved', assertCurrent?: () => void) {
   if (!await getImage(selection.imageId)) throw new Error('最终稿原图已不存在，请恢复本地数据备份')
-  const normalized = normalizeFinalSetSelections({ [scope]: { [slot]: selection } })[scope]?.[slot]
+  assertCurrent?.()
+  const previous = useStore.getState().finalSetSelections[scope]?.[slot]
+  const candidateReviews = { ...previous?.candidateReviews, [selection.imageId]: { status: reviewStatus, note: note.trim().slice(0, 4000), updatedAt: Date.now() } }
+  // A note on another candidate must not replace this slot's confirmed selection.
+  const next = reviewStatus !== 'approved' && previous && previous.imageId !== selection.imageId
+    ? { ...previous, candidateReviews }
+    : { ...selection, reviewStatus, candidateReviews, item: selection.item ? { ...selection.item, reviewNote: note.trim().slice(0, 4000) } : undefined }
+  const normalized = normalizeFinalSetSelections({ [scope]: { [slot]: next } })[scope]?.[slot]
   if (!normalized) throw new Error('最终稿来源记录不完整，请重新选择')
   await finalSetSelectionsDb.put(scope, slot, normalized)
   const state = useStore.getState()
-  state.saveImageReview(finalImageRoot(state.tasks, normalized.imageId), normalized.imageId, 'approved', note)
+  if (reviewStatus === 'approved') state.saveImageReview(finalImageRoot(state.tasks, selection.imageId), selection.imageId, 'approved', note)
   useStore.setState((current) => ({ finalSetSelections: { ...current.finalSetSelections, [scope]: { ...current.finalSetSelections[scope], [slot]: normalized } } }))
 }
 
